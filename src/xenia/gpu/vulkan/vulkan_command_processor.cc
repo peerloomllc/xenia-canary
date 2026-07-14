@@ -2236,9 +2236,10 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       current_framebuffer_ == framebuffer) {
     return;
   }
-  if (current_render_pass_ != VK_NULL_HANDLE) {
-    deferred_command_buffer_.CmdVkEndRenderPass();
-  }
+  // Go through EndRenderPass rather than ending the pass here: it closes any
+  // open occlusion query segment first, and a query begun inside a pass must
+  // be ended before the pass is. (has207/xenia-edge@d649a01ca)
+  EndRenderPass();
   current_render_pass_ = render_pass;
   current_framebuffer_ = framebuffer;
   VkRenderPassBeginInfo render_pass_begin_info;
