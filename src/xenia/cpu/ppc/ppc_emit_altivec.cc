@@ -1441,15 +1441,17 @@ int InstrEmit_vsldoi_(PPCHIRBuilder& f, uint32_t vd, uint32_t va, uint32_t vb,
     f.StoreVR(vd, f.LoadVR(vb));
     return 0;
   }
+  // TODO(benvanik): optimize for the rotation case:
+  // vsldoi128 vr63,vr63,vr63,4
+  // (ABCD ABCD) << 4b = (BCDA)
+  // (VA << SH) OR (VB >> (16 - SH))
   Value* v;
   if (!(sh & 3)) {
-    // Word-aligned shifts can use the cheaper 32-bit permute.
+    // Word aligned, so a word permute does it. Source word sh/4 + i encodes as
+    // is: lane in bits 0-1, vb select in bit 2.
     uint32_t control = 0;
-    uint32_t source_word = sh >> 2;
-    for (uint32_t output_word = 0; output_word < 4;
-         ++output_word, ++source_word) {
-      control |= ((source_word & 3) | ((source_word & 4) ? 4 : 0))
-                 << (output_word * 8);
+    for (uint32_t i = 0; i < 4; ++i) {
+      control |= ((sh >> 2) + i) << (i * 8);
     }
     v = f.Permute(f.LoadConstantUint32(control), f.LoadVR(va), f.LoadVR(vb),
                   INT32_TYPE);
