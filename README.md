@@ -81,9 +81,10 @@ build/bin/Linux/Release/xenia_canary --gpu=vulkan --apu=sdl
 ```
 
 Other distributions: the same libraries under their own names; see
-[docs/building.md](docs/building.md) for the Ubuntu package list. Releases
-carry a binary built on Fedora 44 (glibc 2.43); it needs the GTK 3, SDL2,
-Vulkan loader, lz4, libunwind and ALSA runtime libraries.
+[docs/building.md](docs/building.md) for the Ubuntu package list.
+[Releases](https://github.com/peerloomllc/xenia-canary/releases) carry an
+AppImage built on Ubuntu 24.04 (needs glibc 2.39 or newer and a Vulkan
+driver) and a tarball built on Fedora 44 against its system libraries.
 
 **Support development**: https://peerloomllc.com/about/
 
