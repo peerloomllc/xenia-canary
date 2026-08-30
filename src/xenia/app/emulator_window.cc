@@ -4451,22 +4451,26 @@ void QrSection(const char* label, const char* id, const std::string& qr_text,
 void EmulatorWindow::SupportDialog::OnDraw(ImGuiIO& io) {
   ImGui::SetNextWindowPos(ImVec2(60, 60), ImGuiCond_FirstUseEver);
   bool dialog_open = true;
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowTitleAlign, ImVec2(0.5f, 0.5f));
   if (!ImGui::Begin("Support Development", &dialog_open,
                     ImGuiWindowFlags_NoCollapse |
                         ImGuiWindowFlags_AlwaysAutoResize)) {
     ImGui::End();
+    ImGui::PopStyleVar();
     return;
   }
   CenteredText("This build is free software by PeerLoom LLC.");
   CenteredText("If you receive value from it, please consider returning value.");
   ImGui::Spacing();
-  if (!cvars::support_page_url.empty() &&
-      ImGui::Button("Open the support page in the browser...")) {
-    LaunchWebBrowser(cvars::support_page_url);
-  }
-  if (!cvars::support_coffee_url.empty() &&
-      ImGui::Button("Tip with a card (Buy Me a Coffee)...")) {
-    LaunchWebBrowser(cvars::support_coffee_url);
+  if (!cvars::support_page_url.empty()) {
+    const char* button_label = "Open the support page in the browser...";
+    const float button_width = ImGui::CalcTextSize(button_label).x +
+                               ImGui::GetStyle().FramePadding.x * 2.0f;
+    ImGui::SetCursorPosX(
+        std::max(0.0f, (ImGui::GetWindowSize().x - button_width) * 0.5f));
+    if (ImGui::Button(button_label)) {
+      LaunchWebBrowser(cvars::support_page_url);
+    }
   }
   const float module_px = std::max(3.0f, 3.0f * io.FontGlobalScale);
   ImGui::Spacing();
@@ -4492,6 +4496,7 @@ void EmulatorWindow::SupportDialog::OnDraw(ImGuiIO& io) {
               module_px);
   }
   ImGui::End();
+  ImGui::PopStyleVar();
   if (!dialog_open) {
     emulator_window_.ToggleSupportDialog();
     return;
