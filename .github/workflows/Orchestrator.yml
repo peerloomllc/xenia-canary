@@ -2,6 +2,10 @@ name: Orchestrator
 
 on:
   push:
+    # peerloomllc fork: the native-Linux branch has its own workflow
+    # (Fork_Linux_AppImage.yml); the upstream checks run on PR branches.
+    branches-ignore:
+      - linux-native-work
     paths-ignore:
       - '*.md'
       - 'docs/**'
