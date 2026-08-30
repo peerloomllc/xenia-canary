@@ -51,8 +51,17 @@ X_STATUS XTimer::SetTimer(int64_t due_time, uint32_t period_ms,
     auto after = xe::chrono::hundrednanoseconds(-due_time);
     due_tp = date::clock_cast<WinSystemClock>(XSystemClock::now() + after);
   } else {
-    due_tp = date::clock_cast<WinSystemClock>(
-        XSystemClock::from_file_time(due_time));
+    // NT fires a timer whose absolute due time is already past at once.
+    // Clamp before the host clock conversion: a FILETIME of 0 is the year
+    // 1601, which overflows the steady clock and armed the timer about 200
+    // years out. Eternal Sonata sets its 5 ms audio tick with a due time
+    // of 0 and never got it on Linux (no sound).
+    auto due_guest = XSystemClock::from_file_time(due_time);
+    auto now_guest = XSystemClock::now();
+    if (due_guest < now_guest) {
+      due_guest = now_guest;
+    }
+    due_tp = date::clock_cast<WinSystemClock>(due_guest);
   }
 
   // Stash routine for callback.
