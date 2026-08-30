@@ -36,16 +36,34 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download the AppImage artifact
-        uses: actions/download-artifact@v7
-        with:
-          path: artifact
-      - name: Upload to the release
+      - name: Download the artifact and upload to the release
         env:
           GH_TOKEN: ${{ github.token }}
+        # The download-artifact action failed twice on transient blob errors
+        # with no retry that helped; the plain API download with retries has
+        # been reliable.
         run: |-
           set -e
-          file=$(find artifact -name '*.AppImage' | head -n1)
+          id=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" \
+                 --jq '.artifacts[] | select(.name=="xenia_canary_linux.AppImage") | .id' | head -n1)
+          test -n "$id"
+          ok=""
+          for i in 1 2 3 4 5; do
+            if gh api "repos/${{ github.repository }}/actions/artifacts/${id}/zip" > artifact.bin \
+               && [ "$(stat -c%s artifact.bin)" -gt 1000000 ]; then
+              ok=1; break
+            fi
+            echo "download attempt $i failed; retrying in 20 s"
+            sleep 20
+          done
+          test -n "$ok"
+          # The artifact was uploaded unarchived; the API may still wrap it.
+          if [ "$(head -c2 artifact.bin)" = "PK" ]; then
+            unzip -o artifact.bin -d extracted
+            file=$(find extracted -name '*.AppImage' -o -name 'xenia_canary_linux*' | head -n1)
+          else
+            file=artifact.bin
+          fi
           test -n "$file"
           name="xenia_canary_${{ github.ref_name }}-x86_64.AppImage"
           mv "$file" "$name"
