@@ -99,14 +99,6 @@ The upstream [Quickstart](https://github.com/xenia-canary/xenia-canary/wiki/Quic
 [wiki](https://github.com/xenia-canary/xenia-canary/wiki) apply to this
 fork too.
 
-## Contributing
-
-Pull requests to this fork are welcome. Fixes of general value to the
-emulator are best sent to
-[upstream xenia-canary](https://github.com/xenia-canary/xenia-canary),
-as this fork's own fixes are; code here follows the upstream
-[style guide](docs/style_guide.md).
-
 ## Relationship to upstream
 
 Based on xenia-canary `9d08d64b5`. General fixes from this fork are
