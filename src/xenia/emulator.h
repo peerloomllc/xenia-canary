@@ -205,6 +205,10 @@ class Emulator {
   kernel::KernelState* kernel_state() const { return kernel_state_.get(); }
 
   patcher::Patcher* patcher() const { return patcher_.get(); }
+  const std::optional<uint64_t>& title_module_hash() const {
+    return title_module_hash_;
+  }
+  void set_title_module_hash(uint64_t hash) { title_module_hash_ = hash; }
 
   patcher::PluginLoader* plugin_loader() const { return plugin_loader_.get(); }
 
@@ -442,6 +446,9 @@ class Emulator {
   kernel::object_ref<kernel::XThread> main_thread_;
   kernel::object_ref<kernel::XHostThread> plugin_loader_thread_;
   std::optional<uint32_t> title_id_;  // Currently running title ID
+  // The executable module's hash from its load, before any patch changed
+  // the code section; a save-state restore re-applies patches with it.
+  std::optional<uint64_t> title_module_hash_;
   std::unique_ptr<kernel::util::GameInfoDatabase> game_info_database_;
 
   bool paused_;

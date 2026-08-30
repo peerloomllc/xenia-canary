@@ -661,6 +661,12 @@ X_RESULT KernelState::FinishLoadingUserModule(
     return result;
   }
   module->Dump();
+  // The first module with a hash is the title's executable; its hash here
+  // is of the unpatched code, which a save-state restore needs again.
+  if (module->hash().has_value() &&
+      !emulator_->title_module_hash().has_value()) {
+    emulator_->set_title_module_hash(module->hash().value());
+  }
   emulator_->patcher()->ApplyPatchesForTitle(memory_, module->title_id(),
                                              module->hash());
   emulator_->on_patch_apply();
