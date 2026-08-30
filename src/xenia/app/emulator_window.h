@@ -122,6 +122,7 @@ class EmulatorWindow {
 
   void ToggleProfilesConfigDialog();
   void ToggleXMPConfigDialog();
+  void ToggleSupportDialog();
   void ToggleConsoleSettingsDialog();
   void ToggleContentListDialog();
 
@@ -351,6 +352,19 @@ class EmulatorWindow {
    public:
     KeyboardHotkeysDialog(ui::ImGuiDrawer* imgui_drawer,
                           EmulatorWindow& emulator_window)
+        : ui::ImGuiDialog(imgui_drawer), emulator_window_(emulator_window) {}
+
+   protected:
+    void OnDraw(ImGuiIO& io) override;
+
+   private:
+    EmulatorWindow& emulator_window_;
+  };
+
+  class SupportDialog final : public ui::ImGuiDialog {
+   public:
+    SupportDialog(ui::ImGuiDrawer* imgui_drawer,
+                  EmulatorWindow& emulator_window)
         : ui::ImGuiDialog(imgui_drawer), emulator_window_(emulator_window) {}
 
    protected:
@@ -724,6 +738,7 @@ class EmulatorWindow {
   std::unique_ptr<ProfileConfigDialog> profile_config_dialog_;
 
   std::unique_ptr<XMPConfigDialog> xmp_config_dialog_;
+  std::unique_ptr<SupportDialog> support_dialog_;
 
   std::vector<RecentTitleEntry> recently_launched_titles_;
 };
