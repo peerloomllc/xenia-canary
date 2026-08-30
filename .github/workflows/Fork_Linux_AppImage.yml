@@ -1,0 +1,51 @@
+name: Fork Linux AppImage
+
+# peerloomllc fork: build the native-Linux branch on Ubuntu 24.04 (glibc 2.39,
+# so the AppImage runs on most current distributions) and attach the AppImage
+# to the release of a linux-native-* tag. Reuses the upstream Linux_x86.yml
+# job as-is.
+
+on:
+  push:
+    branches: [linux-native-work]
+    tags: ['linux-native-*']
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-linux:
+    name: Linux (x86-64) AppImage
+    uses: ./.github/workflows/Linux_x86.yml
+    with:
+      runs-on: ubuntu-24.04
+      llvm_version: 20
+      ubuntu_base: noble
+
+  attach:
+    name: Attach AppImage to the release
+    needs: [build-linux]
+    if: ${{ startsWith(github.ref, 'refs/tags/linux-native-') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download the AppImage artifact
+        uses: actions/download-artifact@v7
+        with:
+          path: artifact
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |-
+          set -e
+          file=$(find artifact -name '*.AppImage' | head -n1)
+          test -n "$file"
+          name="xenia_canary_${{ github.ref_name }}-x86_64.AppImage"
+          mv "$file" "$name"
+          chmod +x "$name"
+          sha256sum "$name" > "$name.sha256"
+          gh release upload "${{ github.ref_name }}" "$name" "$name.sha256" \
+            --repo "${{ github.repository }}" --clobber
