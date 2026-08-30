@@ -31,8 +31,8 @@ General questions about Xenia are covered by the upstream
   and an in-game slot table. Guest memory, threads, kernel objects, the
   guest clock, GPU state and EDRAM, XMA audio decoder state, mounted DLC
   and the signed-in profile are all in the file. Single-player only.
-* **Pause, fast-forward, slow-motion**: F7 pauses (the game's clock stops
-  with it), numpad + - * change speed with time-stretched audio
+* **Pause, fast-forward, slow-motion**: Space pauses (the game's clock
+  stops with it), numpad + - * change speed with time-stretched audio
   (SoundTouch), Delete mutes, an FPS overlay; all keys reassignable
   in-app.
 * **Preferences window**: graphics (output, colour filters, accuracy,
@@ -63,19 +63,13 @@ is the changelog.
     <img src="assets/peerloom/preferences.png" width="720" alt="Preferences window" />
 </p>
 
-## Status
-
-CI | Releases
--- | --------
-[![Fork Linux AppImage](https://github.com/peerloomllc/xenia-canary/actions/workflows/Fork_Linux_AppImage.yml/badge.svg?branch=linux-native-work)](https://github.com/peerloomllc/xenia-canary/actions/workflows/Fork_Linux_AppImage.yml) | [Latest](https://github.com/peerloomllc/xenia-canary/releases/latest) &middot; [All](https://github.com/peerloomllc/xenia-canary/releases)
-
-Each release carries an **AppImage** built on Ubuntu 24.04 (needs glibc
-2.39 or newer and a Vulkan driver; `chmod +x` and run) and a **tarball**
-built on Fedora 44 against its system libraries.
-
 ## Building
 
-On Fedora (44):
+Each [release](https://github.com/peerloomllc/xenia-canary/releases)
+carries an **AppImage** built on Ubuntu 24.04 (needs glibc 2.39 or newer
+and a Vulkan driver; `chmod +x` and run) and a **tarball** built on
+Fedora 44 against its system libraries. To build from source on Fedora
+(44):
 
 ```sh
 sudo dnf install clang cmake ninja-build python3 gtk3-devel lz4-devel sdl2-compat-devel \
@@ -107,12 +101,11 @@ fork too.
 
 ## Contributing
 
-Pull requests to this fork are welcome, especially on the Linux side.
-Work of general value to the emulator should go to
+Pull requests to this fork are welcome. Fixes of general value to the
+emulator are best sent to
 [upstream xenia-canary](https://github.com/xenia-canary/xenia-canary),
-as this fork's own fixes do; upstream's
-[contributing guide](https://github.com/xenia-canary/xenia-canary/blob/canary_experimental/.github/CONTRIBUTING.md)
-and [style guide](docs/style_guide.md) apply here as well.
+as this fork's own fixes are; code here follows the upstream
+[style guide](docs/style_guide.md).
 
 ## Relationship to upstream
 
@@ -143,5 +136,5 @@ If you receive value from this project, please consider returning value:
 The goal of this project is to experiment, research, and educate on the topic
 of emulation of modern devices and operating systems. **It is not for enabling
 illegal activity**. All information is obtained via reverse engineering of
-legally purchased devices and games and information made public on the internet
-(you'd be surprised what's indexed on Google...).
+legally purchased devices and games and information made public on the
+internet.

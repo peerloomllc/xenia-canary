@@ -154,7 +154,7 @@ DEFINE_string(screenshot_burst_dir, "",
 DEFINE_int32(ui_experiment_seconds, 30,
              "Experiment: delay before --ui_experiment_dialog opens.",
              "General");
-DEFINE_string(pause_hotkey, "F7",
+DEFINE_string(pause_hotkey, "Space",
               "Key that pauses/resumes emulation (Emulator::Pause/Resume): "
               "F1-F24, A-Z, 0-9, Space, Delete, Insert, Home, End, PageUp, "
               "PageDown, Tab, or empty to disable.",
