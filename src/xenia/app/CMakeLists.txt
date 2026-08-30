@@ -76,7 +76,8 @@ target_link_libraries(xenia-app PRIVATE
   mspack
   snappy
   xxhash
-)
+
+  qrcodegen)
 
 # Vulkan/SPIR-V backends (not macOS)
 if(NOT APPLE)

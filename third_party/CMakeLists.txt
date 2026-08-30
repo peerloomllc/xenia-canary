@@ -193,6 +193,11 @@ add_library(pugixml STATIC
 target_include_directories(pugixml PUBLIC pugixml/src)
 
 # ==============================================================================
+# qrcodegen (QR codes for the Support Development dialog; MIT, Project Nayuki)
+add_library(qrcodegen STATIC ${CMAKE_CURRENT_SOURCE_DIR}/qrcodegen/qrcodegen.cpp)
+target_include_directories(qrcodegen PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
+set_target_properties(qrcodegen PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # soundtouch (time-stretching for fast-forward audio)
 # ==============================================================================
 file(GLOB _soundtouch_sources ${CMAKE_CURRENT_SOURCE_DIR}/soundtouch/source/SoundTouch/*.cpp)
