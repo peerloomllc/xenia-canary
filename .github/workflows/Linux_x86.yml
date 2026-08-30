@@ -119,6 +119,9 @@ jobs:
           # Copy any extra runtime data directories alongside the binary
           find build/bin/Linux/Release -maxdepth 1 -type d ! -name Release -exec cp -r {} ${APPDIR}/usr/bin/ \;
 
+          # BSD-3 asks binary distributions to carry the notice.
+          cp ${GITHUB_WORKSPACE}/LICENSE ${APPDIR}/LICENSE
+
           # Build AppImage with linuxdeploy (requires absolute paths)
           linuxdeploy --appdir $APPDIR \
             --executable $binary \
