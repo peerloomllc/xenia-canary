@@ -9,6 +9,10 @@ on:
   push:
     branches: [linux-native-work]
     tags: ['linux-native-*']
+    paths-ignore:
+      - '*.md'
+      - 'docs/**'
+      - 'LICENSE'
   workflow_dispatch:
 
 concurrency:
