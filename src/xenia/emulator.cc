@@ -122,6 +122,11 @@ DEFINE_bool(savestate_experiment_step_only, false,
             "step every guest thread to a safe point and Resume; write no "
             "file. The smallest reproduction of a save disturbing the game.",
             "General");
+DEFINE_bool(pause_rewinds_guest_clock, true,
+            "Resume() sets the guest clock back to where it was at Pause(), so "
+            "the game sees no time pass while paused (a paused cutscene "
+            "otherwise skips ahead on resume and its dialogue lines overlap).",
+            "General");
 DEFINE_int32(pause_experiment_pause_seconds, 0,
              "Experiment: N seconds after launch, call Emulator::Pause() "
              "from a host thread (what the pause hotkey does).",
@@ -1270,8 +1275,10 @@ void Emulator::Pause(bool capture_edram) {
     }
   }
 
-  XELOGI("! EMULATOR PAUSED ! ({} guest threads suspended)",
-         paused_threads_.size());
+  pause_guest_tick_count_ = Clock::QueryGuestTickCount();
+  XELOGI("! EMULATOR PAUSED ! ({} guest threads suspended, guest clock {:.3f} s)",
+         paused_threads_.size(),
+         double(pause_guest_tick_count_) / Clock::guest_tick_frequency());
   // Listeners may post to the UI thread; never do that while holding the
   // global critical region.
   lock.unlock();
@@ -1283,6 +1290,23 @@ void Emulator::Resume() {
     return;
   }
   paused_ = false;
+
+  // The guest clock ran on through the pause (it is derived from the host
+  // clock). Set it back, as a save-state restore does, before any guest
+  // thread runs again: otherwise a cutscene's timeline jumps ahead by the
+  // pause and queues its next lines over the ones still in the audio
+  // buffers (Lost Odyssey, notes/42).
+  const uint64_t now_ticks = Clock::QueryGuestTickCount();
+  if (cvars::pause_rewinds_guest_clock && pause_guest_tick_count_ &&
+      now_ticks > pause_guest_tick_count_) {
+    Clock::SetGuestTickCount(pause_guest_tick_count_);
+    kernel_state_->UpdateKeTimestampBundle();
+  }
+  XELOGI("! EMULATOR RESUMING ! guest clock {:.3f} s at pause, {:.3f} s now, {}",
+         double(pause_guest_tick_count_) / Clock::guest_tick_frequency(),
+         double(now_ticks) / Clock::guest_tick_frequency(),
+         cvars::pause_rewinds_guest_clock ? "set back" : "left running");
+  pause_guest_tick_count_ = 0;
 
   graphics_system_->Resume();
   audio_system_->Resume();
@@ -1560,8 +1584,11 @@ bool Emulator::SaveToFile(const std::filesystem::path& path,
         "a guest thread could not be stopped at a safe point (see the log)";
   }
   const uint64_t raw_size = stream.offset();
-  // The guest clock at the save, so a restore continues from it.
-  const uint64_t guest_tick_count = Clock::QueryGuestTickCount();
+  // The guest clock at the save, so a restore continues from it: the value
+  // at the pause, which Resume() sets the clock back to.
+  const uint64_t guest_tick_count = pause_guest_tick_count_
+                                        ? pause_guest_tick_count_
+                                        : Clock::QueryGuestTickCount();
   const uint64_t guest_system_time = Clock::QueryGuestSystemTime();
   Resume();
   const int64_t paused_ms = ElapsedMs(t0);
@@ -1848,6 +1875,9 @@ bool Emulator::RestoreFromFile(const std::filesystem::path& path) {
   if (header.version >= 6 && header.guest_tick_count) {
     uint64_t now = Clock::QueryGuestTickCount();
     Clock::SetGuestTickCount(header.guest_tick_count);
+    // The Resume() below sets the clock back to its value at the Pause()
+    // above unless told this is the value to keep.
+    pause_guest_tick_count_ = header.guest_tick_count;
     kernel_state_->set_timestamp_updates_paused(false);
     kernel_state_->UpdateKeTimestampBundle();
     XELOGI("RestoreFromFile: guest clock set to {:.3f} s from the header (was "
@@ -2518,9 +2548,12 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
                        std::chrono::steady_clock::now() - t0)
                        .count();
         XELOGI(
-            "STATS t={:.0f}s swaps +{} ({:.1f}/s) audio_frames +{} ({:.1f}/s, "
-            "{} silent) xma_packets +{} sdl_callbacks +{} starved +{}{}",
-            t, s - swaps, double(s - swaps) / period, a - audio,
+            "STATS t={:.0f}s guest={:.1f}s swaps +{} ({:.1f}/s) audio_frames "
+            "+{} ({:.1f}/s, {} silent) xma_packets +{} sdl_callbacks +{} "
+            "starved +{}{}",
+            t,
+            double(Clock::QueryGuestTickCount()) / Clock::guest_tick_frequency(),
+            s - swaps, double(s - swaps) / period, a - audio,
             double(a - audio) / period, q - silent, x - xma, c - cbs,
             st - starved, is_title_open() ? "" : " (no title)");
         swaps = s;

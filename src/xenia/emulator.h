@@ -445,6 +445,8 @@ class Emulator {
   std::unique_ptr<kernel::util::GameInfoDatabase> game_info_database_;
 
   bool paused_;
+  // The guest clock at Pause(); Resume() sets it back (pause_rewinds_guest_clock).
+  uint64_t pause_guest_tick_count_ = 0;
   // Guest threads Pause() suspended, so Resume() undoes exactly that.
   std::vector<kernel::object_ref<kernel::XThread>> paused_threads_;
   bool restoring_;
