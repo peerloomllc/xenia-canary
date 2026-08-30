@@ -1479,16 +1479,19 @@ uint32_t COMMAND_PROCESSOR::ExecutePrimaryBuffer(uint32_t read_index,
   // prefetch the wraparound range
   // it likely is already in L3 cache, but in a zen system it may be another
   // chiplets l3
-  reader_.BeginPrefetchedRead<swcache::PrefetchTag::Level2>(
-      GetCurrentRingReadCount());
-  // The guest polls the read pointer write-back to know how much ring space
-  // it has. Hardware advances it continuously; publishing it only after the
-  // whole burst (the caller does that) left the game waiting for the
-  // command processor to finish everything it had queued before it could
-  // submit more (Eternal Sonata's intro cutscene: 14-19 fps of a 30 fps
-  // scene, the main thread spinning on the pointer). Publish every few
-  // packets instead.
-  uint32_t packets_since_writeback = 0;
+  uint32_t remaining = GetCurrentRingReadCount();
+  reader_.BeginPrefetchedRead<swcache::PrefetchTag::Level2>(remaining);
+
+  // The guest polls the read pointer write-back to see how much ring space it
+  // has, and hardware advances it as the ring drains. Publishing only once the
+  // burst ends leaves the guest waiting on work already done (Eternal
+  // Sonata's intro cutscene, notes/29), so republish every RB_BLKSZ dwords on
+  // the way through, the guest's own cadence (has207/xenia-edge@29fcaeac;
+  // this replaced an every-8-packets version). A zero stride means the guest
+  // never armed the write-back.
+  const uint32_t writeback_stride =
+      read_ptr_update_freq_ * uint32_t(sizeof(uint32_t));
+  uint32_t remaining_at_writeback = remaining;
   do {
     if (!COMMAND_PROCESSOR::ExecutePacket()) {
       // This probably should be fatal - but we're going to continue anyways.
@@ -1496,12 +1499,25 @@ uint32_t COMMAND_PROCESSOR::ExecutePrimaryBuffer(uint32_t read_index,
       assert_always();
       break;
     }
-    if (read_ptr_writeback_ptr_ && (++packets_since_writeback & 7) == 0) {
-      xe::store_and_swap<uint32_t>(
-          memory_->TranslatePhysical(read_ptr_writeback_ptr_),
-          uint32_t(reader_.read_offset() / sizeof(uint32_t)));
+    remaining = GetCurrentRingReadCount();
+    // remaining only grows back if a malformed packet ran the read offset past
+    // the end of the burst, and then there is nothing honest to publish.
+    if (writeback_stride && remaining <= remaining_at_writeback &&
+        remaining_at_writeback - remaining >= writeback_stride) {
+      // Re-read the target: the guest can re-point or disable the write-back
+      // from its own thread while we are draining.
+      uint32_t writeback_ptr = read_ptr_writeback_ptr_;
+      if (writeback_ptr) {
+        // Publishing the read pointer hands that ring space back, so it has to
+        // land after our reads of it.
+        std::atomic_thread_fence(std::memory_order_release);
+        xe::store_and_swap<uint32_t>(
+            memory_->TranslatePhysical(writeback_ptr),
+            uint32_t(reader_.read_offset() / sizeof(uint32_t)));
+      }
+      remaining_at_writeback = remaining;
     }
-  } while (reader_.read_count());
+  } while (remaining);
 
   COMMAND_PROCESSOR::OnPrimaryBufferEnd();
 
