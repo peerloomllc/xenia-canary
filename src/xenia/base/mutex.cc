@@ -14,6 +14,7 @@
 #include "xenia/base/platform_win.h"
 #elif XE_PLATFORM_LINUX == 1
 #include <linux/futex.h>
+#include <pthread.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -92,11 +93,19 @@ inline int futex_wake(std::atomic<uint32_t>* addr, int count) {
                  0);
 }
 
-// The kernel thread id never changes for a thread, and every lock() asks for
-// it: cached per thread. Uncached this was ~39,000 gettid syscalls a second
-// on the GPU command processor thread (Eternal Sonata's intro cutscene) and
-// most of that thread's time in the kernel (Windows reads it from the TEB).
-inline pid_t gettid() {
+// Cheap, stable per-thread identity: pthread_self() is a thread-local read,
+// no syscall, and unique among live threads. It is only compared for
+// equality, to detect the owner re-entering. The former gettid() syscall on
+// every lock was ~39,000 syscalls a second on the GPU command processor
+// thread in Eternal Sonata's intro cutscene (upstream PR #1194).
+inline uint64_t xe_current_thread_id() {
+  return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pthread_self()));
+}
+
+// The kernel thread id, for the diagnostics that name a lock owner
+// (/proc/self/task/<tid>): cached per thread, never on the lock's fast path
+// comparison.
+inline pid_t current_tid() {
   static thread_local pid_t cached_tid = 0;
   if (!cached_tid) {
     cached_tid = static_cast<pid_t>(syscall(SYS_gettid));
@@ -108,7 +117,7 @@ inline pid_t gettid() {
 
 // xe_global_mutex implementation (recursive)
 void xe_global_mutex::lock() {
-  pid_t self = gettid();
+  uint64_t self = xe_current_thread_id();
 
   // Fast path: check if we already own it (recursive lock)
   if (owner_.load(std::memory_order_relaxed) == self) {
@@ -121,6 +130,7 @@ void xe_global_mutex::lock() {
   if (XE_LIKELY(state_.compare_exchange_strong(
           expected, 1, std::memory_order_acquire, std::memory_order_relaxed))) {
     owner_.store(self, std::memory_order_relaxed);
+    owner_tid_.store(current_tid(), std::memory_order_relaxed);
     recursion_count_ = 1;
   threading::BeginSuspendDeferral();
     return;
@@ -130,7 +140,7 @@ void xe_global_mutex::lock() {
 }
 
 void xe_global_mutex::lock_slow() {
-  pid_t self = gettid();
+  uint64_t self = xe_current_thread_id();
 
   // Spin phase
   for (int i = 0; i < XE_LINUX_MUTEX_SPINCOUNT; ++i) {
@@ -141,6 +151,8 @@ void xe_global_mutex::lock_slow() {
     if (state_.compare_exchange_strong(expected, 1, std::memory_order_acquire,
                                        std::memory_order_relaxed)) {
       owner_.store(self, std::memory_order_relaxed);
+      owner_tid_.store(current_tid(), std::memory_order_relaxed);
+    owner_tid_.store(current_tid(), std::memory_order_relaxed);
       recursion_count_ = 1;
   threading::BeginSuspendDeferral();
       return;
@@ -154,6 +166,8 @@ void xe_global_mutex::lock_slow() {
     if (state == 0) {
       // We got the lock while marking contended
       owner_.store(self, std::memory_order_relaxed);
+      owner_tid_.store(current_tid(), std::memory_order_relaxed);
+    owner_tid_.store(current_tid(), std::memory_order_relaxed);
       recursion_count_ = 1;
   threading::BeginSuspendDeferral();
       return;
@@ -167,6 +181,8 @@ void xe_global_mutex::lock_slow() {
     if (state_.compare_exchange_strong(expected, 2, std::memory_order_acquire,
                                        std::memory_order_relaxed)) {
       owner_.store(self, std::memory_order_relaxed);
+      owner_tid_.store(current_tid(), std::memory_order_relaxed);
+    owner_tid_.store(current_tid(), std::memory_order_relaxed);
       recursion_count_ = 1;
   threading::BeginSuspendDeferral();
       return;
@@ -180,6 +196,7 @@ void xe_global_mutex::unlock() {
   }
 
   owner_.store(0, std::memory_order_relaxed);
+  owner_tid_.store(0, std::memory_order_relaxed);
 
   // If state was 2 (contended), we need to wake a waiter
   if (state_.exchange(0, std::memory_order_release) == 2) {
@@ -192,7 +209,7 @@ void xe_global_mutex::unlock() {
 }
 
 bool xe_global_mutex::try_lock() {
-  pid_t self = gettid();
+  uint64_t self = xe_current_thread_id();
 
   // Check for recursive lock
   if (owner_.load(std::memory_order_relaxed) == self) {
@@ -204,6 +221,7 @@ bool xe_global_mutex::try_lock() {
   if (state_.compare_exchange_strong(expected, 1, std::memory_order_acquire,
                                      std::memory_order_relaxed)) {
     owner_.store(self, std::memory_order_relaxed);
+    owner_tid_.store(current_tid(), std::memory_order_relaxed);
     recursion_count_ = 1;
   threading::BeginSuspendDeferral();
     return true;

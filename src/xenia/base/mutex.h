@@ -91,7 +91,8 @@ using xe_mutex = xe_fast_mutex;
 // Mimics Windows CRITICAL_SECTION behavior: spin before blocking
 class alignas(4096) xe_global_mutex {
   std::atomic<uint32_t> state_{0};  // 0 = unlocked, 1 = locked, 2 = contended
-  std::atomic<pid_t> owner_{0};
+  std::atomic<uint64_t> owner_{0};  // pthread_self() of the owner, 0 = free
+  std::atomic<pid_t> owner_tid_{0};  // diagnostics only (see owner())
   uint32_t recursion_count_{0};
 
   void lock_slow();
@@ -104,7 +105,7 @@ class alignas(4096) xe_global_mutex {
   void unlock();
   bool try_lock();
   // Diagnostics only: the system thread id of the owner, 0 when free.
-  pid_t owner() const { return owner_.load(std::memory_order_relaxed); }
+  pid_t owner() const { return owner_tid_.load(std::memory_order_relaxed); }
 };
 using global_mutex_type = xe_global_mutex;
 
