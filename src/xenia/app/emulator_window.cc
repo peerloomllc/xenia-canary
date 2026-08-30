@@ -127,6 +127,10 @@ DEFINE_string(ui_experiment_dialog, "",
               "General");
 DEFINE_string(support_page_url, "https://peerloomllc.com/about/",
               "Help > Support Development: the page the button opens.", "UI");
+DEFINE_string(support_coffee_url, "https://buymeacoffee.com/peerloomllc",
+              "Help > Support Development: card tips page for the second "
+              "button (empty hides it).",
+              "UI");
 DEFINE_string(support_btc_address, "bc1q0kksenz3j4u9ppe6f4krclvzwxk7sjy00cc9cf",
               "Help > Support Development: Bitcoin on-chain donation address "
               "(empty hides its QR code).",
@@ -1208,8 +1212,9 @@ bool EmulatorWindow::Initialize() {
         std::bind(&EmulatorWindow::ShowBuildCommit, this)));
     help_menu->AddChild(MenuItem::Create(
         MenuItem::Type::kString, "Recent changes on GitHub...", []() {
+          // This fork's commits live on the fork, not upstream.
           LaunchWebBrowser(
-              "https://github.com/xenia-canary/xenia-canary/"
+              "https://github.com/peerloomllc/xenia-canary/"
               "compare/" XE_BUILD_COMMIT "..." XE_BUILD_BRANCH);
         }));
     help_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
@@ -4385,13 +4390,16 @@ void EmulatorWindow::ToggleProfilesConfigDialog() {
 }
 
 namespace {
-// One QR code as filled rectangles, with a quiet zone, on a white card.
-void DrawQrCode(const std::string& text, float module_px) {
+// One QR code as filled rectangles, with a quiet zone, on a white card,
+// centred in the window.
+void DrawQrCodeCentered(const std::string& text, float module_px) {
   using qrcodegen::QrCode;
   QrCode qr = QrCode::encodeText(text.c_str(), QrCode::Ecc::MEDIUM);
   const int n = qr.getSize();
   const float quiet = module_px * 4.0f;
   const float size = n * module_px + 2.0f * quiet;
+  ImGui::SetCursorPosX(
+      std::max(0.0f, (ImGui::GetWindowSize().x - size) * 0.5f));
   ImDrawList* draw_list = ImGui::GetWindowDrawList();
   const ImVec2 p = ImGui::GetCursorScreenPos();
   draw_list->AddRectFilled(p, ImVec2(p.x + size, p.y + size),
@@ -4410,13 +4418,33 @@ void DrawQrCode(const std::string& text, float module_px) {
   ImGui::Dummy(ImVec2(size, size));
 }
 
-// The address under its QR code, selectable for copying.
-void AddressField(const char* id, const std::string& text, float width) {
+void CenteredText(const char* text) {
+  ImGui::SetCursorPosX(std::max(
+      0.0f,
+      (ImGui::GetWindowSize().x - ImGui::CalcTextSize(text).x) * 0.5f));
+  ImGui::TextUnformatted(text);
+}
+
+// The string under its QR code, selectable for copying; wide enough for
+// the whole text, centred.
+void CenteredField(const char* id, const std::string& text) {
   std::string buffer = text;
+  const float width = ImGui::CalcTextSize(buffer.c_str()).x +
+                      ImGui::GetStyle().FramePadding.x * 2.0f + 10.0f;
+  ImGui::SetCursorPosX(
+      std::max(0.0f, (ImGui::GetWindowSize().x - width) * 0.5f));
   ImGui::SetNextItemWidth(width);
   ImGui::InputText(id, buffer.data(), buffer.size() + 1,
                    ImGuiInputTextFlags_ReadOnly |
                        ImGuiInputTextFlags_AutoSelectAll);
+}
+
+// Label + QR code + copyable string, as one centred block.
+void QrSection(const char* label, const char* id, const std::string& qr_text,
+               const std::string& shown_text, float module_px) {
+  CenteredText(label);
+  DrawQrCodeCentered(qr_text, module_px);
+  CenteredField(id, shown_text);
 }
 }  // namespace
 
@@ -4429,38 +4457,39 @@ void EmulatorWindow::SupportDialog::OnDraw(ImGuiIO& io) {
     ImGui::End();
     return;
   }
-  ImGui::TextUnformatted(
-      "This build is free software by PeerLoom LLC.\n"
-      "If you receive value from it, please consider returning value.");
+  CenteredText("This build is free software by PeerLoom LLC.");
+  CenteredText("If you receive value from it, please consider returning value.");
   ImGui::Spacing();
   if (!cvars::support_page_url.empty() &&
       ImGui::Button("Open the support page in the browser...")) {
     LaunchWebBrowser(cvars::support_page_url);
   }
+  if (!cvars::support_coffee_url.empty() &&
+      ImGui::Button("Tip with a card (Buy Me a Coffee)...")) {
+    LaunchWebBrowser(cvars::support_coffee_url);
+  }
   const float module_px = std::max(3.0f, 3.0f * io.FontGlobalScale);
-  const bool has_btc = !cvars::support_btc_address.empty();
-  const bool has_ln = !cvars::support_lightning_address.empty();
-  if (has_btc || has_ln) {
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+  if (!cvars::support_btc_address.empty()) {
+    QrSection("Bitcoin (on-chain)", "##support_btc",
+              "bitcoin:" + cvars::support_btc_address,
+              cvars::support_btc_address, module_px);
     ImGui::Spacing();
-    ImGui::Separator();
     ImGui::Spacing();
   }
-  if (has_btc) {
-    ImGui::BeginGroup();
-    ImGui::TextUnformatted("Bitcoin (on-chain)");
-    DrawQrCode("bitcoin:" + cvars::support_btc_address, module_px);
-    AddressField("##support_btc", cvars::support_btc_address, 320.0f);
-    ImGui::EndGroup();
+  if (!cvars::support_lightning_address.empty()) {
+    QrSection("Bitcoin (lightning)", "##support_ln",
+              cvars::support_lightning_address,
+              cvars::support_lightning_address, module_px);
+    ImGui::Spacing();
+    ImGui::Spacing();
   }
-  if (has_btc && has_ln) {
-    ImGui::SameLine(0.0f, 24.0f);
-  }
-  if (has_ln) {
-    ImGui::BeginGroup();
-    ImGui::TextUnformatted("Lightning");
-    DrawQrCode(cvars::support_lightning_address, module_px);
-    AddressField("##support_ln", cvars::support_lightning_address, 320.0f);
-    ImGui::EndGroup();
+  if (!cvars::support_coffee_url.empty()) {
+    QrSection("Buy Me a Coffee (card)", "##support_coffee",
+              cvars::support_coffee_url, cvars::support_coffee_url,
+              module_px);
   }
   ImGui::End();
   if (!dialog_open) {
@@ -4553,8 +4582,9 @@ void EmulatorWindow::ShowBuildCommit() {
   LaunchWebBrowser(
       "https://github.com/xenia-canary/xenia-canary/pull/" XE_BUILD_PR_NUMBER);
 #else
+  // This fork's commits live on the fork, not upstream.
   LaunchWebBrowser(
-      "https://github.com/xenia-canary/xenia-canary/commit/" XE_BUILD_COMMIT);
+      "https://github.com/peerloomllc/xenia-canary/commit/" XE_BUILD_COMMIT);
 #endif
 }
 
