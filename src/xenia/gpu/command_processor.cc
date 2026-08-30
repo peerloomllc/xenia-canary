@@ -535,9 +535,11 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr,
   read_ptr_writeback_ptr_ = ptr;
   XELOGI("CP: read pointer write-back at {:08X}", ptr);
   // CP_RB_CNTL Ring Buffer Control 0x704
-  // block_size = RB_BLKSZ, log2 of number of quadwords read between updates of
-  //              the read pointer.
-  read_ptr_update_freq_ = uint32_t(1) << block_size_log2 >> 2;
+  // block_size = RB_BLKSZ, log2 of the number of quadwords read between
+  // updates of the read pointer. Kept in dwords, the unit read_ptr_index_ and
+  // the write-back use. Usually 6, so 128 dwords. (has207/xenia-edge@29fcaeac;
+  // the previous `>> 2` was not a quadword-to-dword conversion.)
+  read_ptr_update_freq_ = (uint32_t(1) << std::min(block_size_log2, 19u)) * 2;
 }
 
 XE_NOINLINE XE_COLD void CommandProcessor::LogKickoffInitator(uint32_t value) {
