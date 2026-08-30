@@ -17,6 +17,7 @@
 #include "xenia/apu/xma_context.h"
 #include "xenia/apu/xma_register_file.h"
 #include "xenia/base/bit_map.h"
+#include "xenia/base/byte_stream.h"
 #include "xenia/kernel/xthread.h"
 #include "xenia/xbox.h"
 
@@ -50,6 +51,12 @@ class XmaDecoder {
   bool is_paused() const { return paused_.load(std::memory_order_acquire); }
   void Pause();
   void Resume();
+
+  // Host-side context state (allocation and enable flags) for save states.
+  // The context data itself lives in guest memory. Call with the decoder
+  // paused.
+  bool Save(ByteStream* stream);
+  bool Restore(ByteStream* stream);
 
  protected:
   int GetContextId(uint32_t guest_ptr);

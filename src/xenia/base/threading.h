@@ -40,6 +40,30 @@ void AndroidInitialize();
 void AndroidShutdown();
 #endif
 
+// While alive on the current thread, a suspend request from another thread
+// (Thread::Suspend) is deferred until the scope ends. Used around short
+// critical sections so a thread stopped by Suspend() can never be holding one
+// of the locks the pausing thread needs next (event state queries for save
+// states, the guest clock). Windows suspends at any point; this is a no-op
+// there.
+class SuspendDeferralScope {
+ public:
+  SuspendDeferralScope();
+  ~SuspendDeferralScope();
+  SuspendDeferralScope(const SuspendDeferralScope&) = delete;
+  SuspendDeferralScope& operator=(const SuspendDeferralScope&) = delete;
+};
+// Unscoped form for locks whose acquire and release are separate calls
+// (the global critical region). Every Begin must be matched by an End on
+// the same thread; the deferred suspension, if any, happens in End.
+void BeginSuspendDeferral();
+void EndSuspendDeferral();
+// A per-thread flag the wait primitives set while the thread is blocked in
+// one (cleared the moment the wait is satisfied, before an auto-reset event
+// is consumed). Save states use it to decide whether a thread stopped inside
+// a blocking kernel call must re-issue the call on restore.
+void SetThreadBlockingWaitSlot(bool* slot);
+
 // This is more like an Event with self-reset when returning from Wait()
 class Fence {
  public:
@@ -74,6 +98,37 @@ class Fence {
       signal_state_ = --signal_state;
     }
   }
+  // Like Wait(), but returns false (leaving the fence untouched) if the
+  // timeout passes first.
+  bool WaitFor(std::chrono::milliseconds timeout) {
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::unique_lock<std::mutex> lock(mutex_);
+    assert_true((signal_state_ & ~SIGMASK_) < (SIGMASK_ - 1) &&
+                "Too many threads?");
+
+    // keep local copy to minimize loads
+    auto signal_state = ++signal_state_;
+    for (; !(signal_state & SIGMASK_); signal_state = signal_state_) {
+      if (cond_.wait_until(lock, deadline) == std::cv_status::timeout &&
+          !(signal_state_ & SIGMASK_)) {
+        --signal_state_;  // Withdraw this waiter.
+        return false;
+      }
+    }
+
+    // We can't just clear the signal as other threads may not have read it yet
+    assert_true((signal_state & ~SIGMASK_) > 0);  // wait_count > 0
+    if (signal_state == (1 | SIGMASK_)) {         // wait_count == 1
+      // Last one out turn off the lights
+      signal_state_ = 0;
+    } else {
+      // Oops, another thread is still waiting, set the new count and keep the
+      // signal.
+      signal_state_ = --signal_state;
+    }
+    return true;
+  }
+
 
  private:
   using state_t_ = uint_fast32_t;

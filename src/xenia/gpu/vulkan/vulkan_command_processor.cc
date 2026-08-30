@@ -36,6 +36,7 @@
 #include "xenia/ui/vulkan/vulkan_presenter.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
 
+DECLARE_bool(log_wait_reg_mem);
 DECLARE_bool(clear_memory_page_state);
 DECLARE_bool(readback_resolve_half_pixel_offset);
 
@@ -120,7 +121,83 @@ void VulkanCommandProcessor::InitializeShaderStorage(
                                            std::move(completion_callback));
 }
 
-void VulkanCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {}
+void VulkanCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
+  // Trace playback: an unscaled snapshot.
+  RestoreEdramSnapshotSized(snapshot, xenos::kEdramSizeBytes, 1, 1);
+}
+
+bool VulkanCommandProcessor::CaptureEdramSnapshot(std::vector<uint8_t>& out) {
+  out.clear();
+  if (device_lost_) {
+    return false;
+  }
+  edram_snapshot_scale_x_ = render_target_cache_->draw_resolution_scale_x();
+  edram_snapshot_scale_y_ = render_target_cache_->draw_resolution_scale_y();
+  // A frame, as descriptors may be needed for the render target dump.
+  if (!BeginSubmission(true)) {
+    return false;
+  }
+  uint32_t size = render_target_cache_->PrepareEdramSnapshotRead();
+  if (!size) {
+    return false;
+  }
+  VkBuffer readback_buffer = RequestReadbackBuffer(size);
+  if (readback_buffer == VK_NULL_HANDLE) {
+    return false;
+  }
+  VkBufferCopy copy_region = {};
+  copy_region.size = size;
+  deferred_command_buffer_.CmdVkCopyBuffer(render_target_cache_->edram_buffer(),
+                                           readback_buffer, 1, &copy_region);
+  if (!AwaitAllQueueOperationsCompletion()) {
+    XELOGE("EDRAM snapshot: the queue did not complete");
+    return false;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  void* mapped_data = nullptr;
+  if (dfn.vkMapMemory(device, memexport_readback_buffer_memory_, 0, size, 0,
+                      &mapped_data) != VK_SUCCESS ||
+      !mapped_data) {
+    XELOGE("EDRAM snapshot: could not map the readback buffer");
+    return false;
+  }
+  out.assign(static_cast<const uint8_t*>(mapped_data),
+             static_cast<const uint8_t*>(mapped_data) + size);
+  dfn.vkUnmapMemory(device, memexport_readback_buffer_memory_);
+  XELOGI("EDRAM snapshot: {} bytes read back ({}, {}x{} scale)", size,
+         render_target_cache_->GetPath() ==
+                 RenderTargetCache::Path::kPixelShaderInterlock
+             ? "interlock"
+             : "host render targets",
+         edram_snapshot_scale_x_, edram_snapshot_scale_y_);
+  return true;
+}
+
+bool VulkanCommandProcessor::RestoreEdramSnapshotSized(const void* data,
+                                                       size_t size,
+                                                       uint32_t scale_x,
+                                                       uint32_t scale_y) {
+  if (device_lost_) {
+    return false;
+  }
+  if (scale_x != render_target_cache_->draw_resolution_scale_x() ||
+      scale_y != render_target_cache_->draw_resolution_scale_y()) {
+    XELOGW(
+        "EDRAM snapshot: saved at {}x{} resolution scale, running at {}x{}; "
+        "not restored",
+        scale_x, scale_y, render_target_cache_->draw_resolution_scale_x(),
+        render_target_cache_->draw_resolution_scale_y());
+    return false;
+  }
+  // An earlier restore's upload may still be in flight in the same buffer.
+  AwaitAllQueueOperationsCompletion();
+  if (!BeginSubmission(true)) {
+    return false;
+  }
+  return render_target_cache_->RestoreEdramSnapshot(data, size);
+}
 
 std::string VulkanCommandProcessor::GetWindowTitleText() const {
   std::ostringstream title;
@@ -1462,6 +1539,13 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
     return;
   }
 
+  // Diagnostic (save states): throttled trace of swaps.
+  static uint32_t swaps = 0, swaps_no_texture = 0;
+  if ((++swaps % 120) == 1) {
+    XELOGD("IssueSwap #{} frontbuffer={:08X} {}x{}", swaps, frontbuffer_ptr,
+           frontbuffer_width, frontbuffer_height);
+  }
+
   // In case the swap command is the only one in the frame.
   if (!BeginSubmission(true)) {
     return;
@@ -1474,6 +1558,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
   VkImageView swap_texture_view = texture_cache_->RequestSwapTexture(
       frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format);
   if (swap_texture_view == VK_NULL_HANDLE) {
+    if ((++swaps_no_texture % 60) == 1) {
+      XELOGW("IssueSwap #{}: no swap texture for frontbuffer {:08X} ({} so far)",
+             swaps, frontbuffer_ptr, swaps_no_texture);
+    }
     return;
   }
 

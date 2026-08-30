@@ -78,7 +78,7 @@ bool XModule::Save(ByteStream* stream) {
 
   stream->Write(kModuleSaveSignature);
 
-  stream->Write(path());
+  stream->Write(std::string_view(path()));
   stream->Write(hmodule_ptr_);
 
   if (!SaveObject(stream)) {

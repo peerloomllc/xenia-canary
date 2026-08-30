@@ -9,6 +9,8 @@
 
 #include "xenia/cpu/breakpoint.h"
 
+#include <algorithm>
+
 #include "xenia/base/string_util.h"
 #include "xenia/cpu/backend/backend.h"
 #include "xenia/cpu/backend/code_cache.h"
@@ -99,19 +101,23 @@ void Breakpoint::ForEachHostAddress(
     assert_false(functions.empty());
     uintptr_t host_address = 0;
 
+    // A guest address can be compiled into more than one function (the JIT
+    // compiles per entry point, and functions overlap). The thread may be
+    // running any of the copies, so patch every one that maps the address.
+    // Functions that jump around another function can be misinterpreted as
+    // containing an address; those simply map to 0 and are skipped.
+    std::vector<uintptr_t> seen;
     for (auto function : functions) {
       // TODO(benvanik): other function types.
       assert_true(function->is_guest());
       auto guest_function = reinterpret_cast<GuestFunction*>(function);
-      host_address =
+      uintptr_t candidate =
           guest_function->MapGuestAddressToMachineCode(guest_address);
-
-      // Functions that jump around another function can be misinterpreted as
-      // containing an address. Try each eligible function and use the one that
-      // works.
-      if (host_address != 0) {
-        callback(host_address);
-        break;
+      if (candidate != 0 &&
+          std::find(seen.begin(), seen.end(), candidate) == seen.end()) {
+        seen.push_back(candidate);
+        host_address = candidate;
+        callback(candidate);
       }
     }
 

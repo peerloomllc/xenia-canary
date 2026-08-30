@@ -8,6 +8,8 @@
  */
 
 #include <alloca.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <dlfcn.h>
 #include <stdlib.h>
 
@@ -23,16 +25,25 @@
 
 namespace xe {
 
+// xdg-open without a shell: a path with a space ("Games/Blue Dragon")
+// would otherwise be split into two arguments and open nothing.
+static void XdgOpen(const std::string& target) {
+  pid_t pid = fork();
+  if (pid == 0) {
+    execlp("xdg-open", "xdg-open", target.c_str(), nullptr);
+    _exit(127);
+  } else if (pid > 0) {
+    int status = 0;
+    waitpid(pid, &status, 0);
+  }
+}
+
 void LaunchWebBrowser(const std::string_view url) {
-  auto cmd = std::string("xdg-open ");
-  cmd.append(url);
-  system(cmd.c_str());
+  XdgOpen(std::string(url));
 }
 
 void LaunchFileExplorer(const std::filesystem::path& path) {
-  auto cmd = std::string("xdg-open ");
-  cmd.append(path);
-  system(cmd.c_str());
+  XdgOpen(path.string());
 }
 
 void ShowSimpleMessageBox(SimpleMessageBoxType type, std::string_view message) {

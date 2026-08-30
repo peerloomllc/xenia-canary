@@ -35,6 +35,11 @@ class GTKWindow : public Window {
   // Will be null if the window hasn't been successfully opened yet, or has been
   // closed.
   GtkWidget* window() const { return window_; }
+  // A widget shown over the drawing area while no title runs (the game
+  // library dashboard). Add once after Open(); show/hide as needed.
+  void SetIdleWidget(GtkWidget* widget);
+  void ShowIdleWidget(bool show);
+  bool idle_widget_shown() const { return idle_widget_shown_; }
 
  protected:
   bool OpenImpl() override;
@@ -82,6 +87,14 @@ class GTKWindow : public Window {
   GtkWidget* window_ = nullptr;
   GtkWidget* box_ = nullptr;
   GtkWidget* drawing_area_ = nullptr;
+  GtkWidget* overlay_ = nullptr;
+  GtkWidget* idle_widget_ = nullptr;
+  bool idle_widget_shown_ = false;
+  void CancelMenuIfUnfocused();
+  guint menu_cancel_timeout_ = 0;
+  guint menu_focus_poll_ = 0;
+  bool menu_open_seen_ = false;
+  int menu_open_x_ = 0, menu_open_y_ = 0, menu_open_w_ = 0, menu_open_h_ = 0;
 
   uint32_t batched_size_update_depth_ = 0;
   bool batched_size_update_contained_configure_ = false;

@@ -8,6 +8,9 @@
  */
 
 #include "xenia/kernel/xfile.h"
+
+#include "xenia/base/logging.h"
+#include "xenia/emulator.h"
 #include "xenia/vfs/virtual_file_system.h"
 
 #include "xenia/base/byte_stream.h"
@@ -32,7 +35,9 @@ XFile::XFile() : XObject(kObjectType), completion_port_lock_() {
 XFile::~XFile() {
   // TODO(benvanik): signal that the file is closing?
   async_event_->Set();
-  file_->Destroy();
+  if (file_) {
+    file_->Destroy();
+  }
 }
 
 uint64_t XFile::position() const {
@@ -48,6 +53,9 @@ void XFile::set_position(uint64_t value) {
 X_STATUS XFile::QueryDirectory(X_FILE_DIRECTORY_INFORMATION* out_info,
                                size_t length, const std::string_view file_name,
                                bool restart) {
+  if (!file_) {
+    return X_STATUS_INVALID_HANDLE;
+  }
   std::lock_guard<std::mutex> lock(file_lock_);
   assert_not_null(out_info);
 
@@ -103,6 +111,9 @@ X_STATUS XFile::Read(uint32_t buffer_guest_address, uint32_t buffer_length,
                      uint64_t byte_offset, uint32_t* out_bytes_read,
                      uint32_t apc_context, bool notify_completion) {
   std::lock_guard<std::mutex> lock(file_lock_);
+  if (!file_) {
+    return X_STATUS_INVALID_HANDLE;
+  }
   return ReadInternal(buffer_guest_address, buffer_length, byte_offset,
                       out_bytes_read, apc_context, notify_completion);
 }
@@ -205,6 +216,9 @@ X_STATUS XFile::ReadScatter(uint32_t segments_guest_address, uint32_t length,
                             uint64_t byte_offset, uint32_t* out_bytes_read,
                             uint32_t apc_context) {
   std::lock_guard<std::mutex> lock(file_lock_);
+  if (!file_) {
+    return X_STATUS_INVALID_HANDLE;
+  }
   X_STATUS result = X_STATUS_SUCCESS;
 
   // segments points to an array of buffer pointers of type
@@ -263,6 +277,9 @@ X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length,
                       uint64_t byte_offset, uint32_t* out_bytes_written,
                       uint32_t apc_context) {
   std::lock_guard<std::mutex> lock(file_lock_);
+  if (!file_) {
+    return X_STATUS_INVALID_HANDLE;
+  }
   if (byte_offset == uint64_t(-1)) {
     // Write from current position.
     byte_offset = position_;
@@ -294,9 +311,15 @@ X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length,
 
 X_STATUS XFile::SetLength(size_t length) {
   std::lock_guard<std::mutex> lock(file_lock_);
+  if (!file_) {
+    return X_STATUS_INVALID_HANDLE;
+  }
   return file_->SetLength(length);
 }
 X_STATUS XFile::Rename(const std::filesystem::path file_path) {
+  if (!file_) {
+    return X_STATUS_INVALID_HANDLE;
+  }
   entry()->Rename(file_path);
   return X_STATUS_SUCCESS;
 }
@@ -328,12 +351,29 @@ bool XFile::Save(ByteStream* stream) {
     return false;
   }
 
-  stream->Write(file_->entry()->absolute_path());
-  stream->Write<uint64_t>(position_);
-  stream->Write(file_access());
-  stream->Write<bool>(
-      (file_->entry()->attributes() & vfs::kFileAttributeDirectory) != 0);
+  if (file_) {
+    stream->Write(std::string_view(file_->entry()->absolute_path()));
+    stream->Write<uint64_t>(position_);
+    stream->Write(file_access());
+    stream->Write<bool>(
+        (file_->entry()->attributes() & vfs::kFileAttributeDirectory) != 0);
+  } else {
+    // Never reopened since a restore: carry what the earlier save said.
+    XELOGW("XFile {:08X}: saving unresolved {}", handle(), unresolved_path_);
+    stream->Write(std::string_view(unresolved_path_));
+    stream->Write<uint64_t>(position_);
+    stream->Write<uint32_t>(unresolved_access_);
+    stream->Write<bool>(unresolved_is_directory_);
+  }
   stream->Write<bool>(is_synchronous_);
+
+  // Format 4: the completion ports this file reports to (key, port handle).
+  std::lock_guard<std::mutex> lock(completion_port_lock_);
+  stream->Write<uint32_t>(uint32_t(completion_ports_.size()));
+  for (auto& port : completion_ports_) {
+    stream->Write<uint32_t>(port.first);
+    stream->Write<uint32_t>(port.second->handle());
+  }
 
   return true;
 }
@@ -352,8 +392,14 @@ object_ref<XFile> XFile::Restore(KernelState* kernel_state,
   auto access = stream->Read<uint32_t>();
   auto is_directory = stream->Read<bool>();
   auto is_synchronous = stream->Read<bool>();
-
-  // XELOGD("XFile {:08X} ({})", file->handle(), abs_path);
+  if (kernel_state->emulator()->save_state_version() >= 4) {
+    uint32_t count = stream->Read<uint32_t>();
+    for (uint32_t i = 0; i < count; ++i) {
+      uint32_t key = stream->Read<uint32_t>();
+      uint32_t port_handle = stream->Read<uint32_t>();
+      file->pending_completion_ports_.push_back({key, port_handle});
+    }
+  }
 
   vfs::File* vfs_file = nullptr;
   vfs::FileAction action;
@@ -361,7 +407,13 @@ object_ref<XFile> XFile::Restore(KernelState* kernel_state,
       nullptr, abs_path, vfs::FileDisposition::kOpen, access, is_directory,
       false, &vfs_file, &action);
   if (XFAILED(res)) {
-    // XELOGE("Failed to open XFile: error {:08X}", res);
+    XELOGE("XFile {:08X}: could not reopen {} on restore: {:08X}",
+           file->handle(), abs_path, res);
+    file->unresolved_path_ = abs_path;
+    file->unresolved_access_ = access;
+    file->unresolved_is_directory_ = is_directory;
+    file->position_ = position;
+    file->is_synchronous_ = is_synchronous;
     return object_ref<XFile>(file);
   }
 
@@ -370,6 +422,21 @@ object_ref<XFile> XFile::Restore(KernelState* kernel_state,
   file->is_synchronous_ = is_synchronous;
 
   return object_ref<XFile>(file);
+}
+
+void XFile::RelinkIOCompletionPorts() {
+  std::lock_guard<std::mutex> lock(completion_port_lock_);
+  for (auto& pending : pending_completion_ports_) {
+    auto port = kernel_state()->object_table()->LookupObject<XIOCompletion>(
+        pending.second);
+    if (!port) {
+      XELOGW("XFile {:08X}: completion port {:08X} not restored", handle(),
+             pending.second);
+      continue;
+    }
+    completion_ports_.push_back({pending.first, port});
+  }
+  pending_completion_ports_.clear();
 }
 
 void XFile::NotifyIOCompletionPorts(

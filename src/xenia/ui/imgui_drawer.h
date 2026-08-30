@@ -95,6 +95,11 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
 
   bool IsAnyDialogOpen() const { return !dialogs_.empty(); };
 
+  // Dialog and notification size (cvar ui_scale). The change is applied
+  // at the start of the next Draw, outside a frame.
+  void RequestUIScale(float scale);
+  float ui_scale() const { return ui_scale_; }
+
  protected:
   void OnKeyDown(KeyEvent& e) override;
   void OnKeyUp(KeyEvent& e) override;
@@ -154,6 +159,10 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   // Resources specific to an immediate drawer - must be destroyed before
   // detaching the presenter.
   std::unique_ptr<ImmediateTexture> font_texture_;
+  void ApplyUIScale(float scale);
+  float ui_scale_ = 1.0f;
+  float pending_ui_scale_ = 0.0f;
+  ImGuiStyle base_style_;
   std::unique_ptr<ImmediateTexture> locked_achievement_icon_;
 
   std::vector<std::unique_ptr<ImmediateTexture>> notification_icon_textures_;

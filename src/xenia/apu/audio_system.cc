@@ -281,6 +281,19 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg,
 
 void AudioSystem::SubmitFrame(size_t index, float* samples) {
   SCOPE_profile_cpu_f("apu");
+  submitted_frame_count_.fetch_add(1, std::memory_order_relaxed);
+  if (samples) {
+    bool silent = true;
+    for (uint32_t i = 0; i < AudioDriver::kFrameSamplesMax; ++i) {
+      if (samples[i] != 0.0f) {
+        silent = false;
+        break;
+      }
+    }
+    if (silent) {
+      silent_frame_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
 
   auto global_lock = global_critical_region_.Acquire();
   assert_true(index < kMaximumClientCount);
@@ -355,7 +368,7 @@ bool AudioSystem::Save(ByteStream* stream) {
     stream->Write(client.wrapped_callback_arg);
   }
 
-  return true;
+  return xma_decoder_->Save(stream);
 }
 
 bool AudioSystem::Restore(ByteStream* stream) {
@@ -401,7 +414,7 @@ bool AudioSystem::Restore(ByteStream* stream) {
     client.driver = driver;
   }
 
-  return true;
+  return xma_decoder_->Restore(stream);
 }
 
 void AudioSystem::Pause() {

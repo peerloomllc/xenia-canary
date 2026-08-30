@@ -22,6 +22,7 @@
 #include "xenia/kernel/xboxkrnl/xboxkrnl_ob.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
 #include "xenia/kernel/xevent.h"
+#include "xenia/kernel/xfile.h"
 #include "xenia/kernel/xmodule.h"
 #include "xenia/kernel/xnotifylistener.h"
 #include "xenia/kernel/xobject.h"
@@ -447,6 +448,11 @@ object_ref<UserModule> KernelState::GetExecutableModule() {
     return nullptr;
   }
   return executable_module_;
+}
+
+void KernelState::SetExecutableModuleForRestore(
+    object_ref<UserModule> module) {
+  executable_module_ = std::move(module);
 }
 
 void KernelState::SetExecutableModule(object_ref<UserModule> module) {
@@ -910,8 +916,50 @@ void KernelState::TerminateTitle() {
         }
 
         global_lock.unlock();
-        processor_->StepToGuestSafePoint(thread->thread_id());
+
+        if (thread->in_self_suspend()) {
+
+          // Parked in its own NtSuspendThread: let it out of the condition
+
+          // wait first (the host thread is suspended inside the wait; resume
+
+          // it for a moment), then step and terminate it like any other.
+
+          XELOGI("TerminateTitle: thread {:08X} parked in NtSuspendThread, "
+
+                 "releasing it first",
+
+                 thread->handle());
+
+          thread->AbortSelfSuspend();
+
+          thread->thread()->Resume();
+
+          for (int i = 0; i < 200 && thread->in_self_suspend(); ++i) {
+
+            xe::threading::Sleep(std::chrono::milliseconds(1));
+
+          }
+
+          thread->thread()->Suspend();
+
+        }
+
+        // Bring it to a clean point if that is quick; a thread blocked on a
+        // guest lock whose owner is suspended too (RtlEnterCriticalSection)
+        // never gets there, and it is being terminated anyway, so give up
+        // after a moment instead of the step's 5 s.
+        auto step_started = std::chrono::steady_clock::now();
+        processor_->StepToGuestSafePoint(
+            thread->thread_id(), false, thread->suspend_count(), nullptr,
+            [thread, step_started]() {
+              return thread->in_self_suspend() ||
+                     std::chrono::steady_clock::now() - step_started >
+                         std::chrono::milliseconds(250);
+            });
+
         thread->Terminate(0);
+
         global_lock.lock();
       }
 
@@ -1212,6 +1260,16 @@ bool KernelState::Save(ByteStream* stream) {
   // Save the object table
   object_table_.Save(stream);
 
+  // Format 7: mounted content packages, before the objects so restored file
+  // handles into them resolve.
+  content_manager()->Save(stream);
+  // Format 8: XAM's own state.
+  xam_state_->Save(stream);
+
+  // The TLS allocation bitmap used to be written here; Restore still reads
+  // its entry count, so write an empty one.
+  stream->Write<uint32_t>(0);
+
   // Write the TLS allocation bitmap
   // We save XThreads absolutely first, as they will execute code upon save
   // (which could modify the kernel state)
@@ -1221,6 +1279,7 @@ bool KernelState::Save(ByteStream* stream) {
   stream->Write(static_cast<uint32_t>(threads.size()));
 
   size_t num_threads = threads.size();
+  size_t failed_threads = 0;
   XELOGD("Serializing {} threads...", threads.size());
   for (auto thread : threads) {
     if (!thread->is_guest_thread()) {
@@ -1230,12 +1289,21 @@ bool KernelState::Save(ByteStream* stream) {
     }
 
     if (!thread->Save(stream)) {
-      XELOGD("Failed to save thread \"{}\"", thread->name());
+      XELOGE("Failed to save thread \"{}\"", thread->name());
       num_threads--;
+      if (thread->is_running()) {
+        ++failed_threads;
+      }
     }
   }
 
   *num_threads_ptr = static_cast<uint32_t>(num_threads);
+  if (failed_threads) {
+    // A state missing running threads cannot be resumed; do not pretend.
+    XELOGE("KernelState::Save: {} running guest thread(s) could not be saved",
+           failed_threads);
+    return false;
+  }
 
   // Save all other objects
   auto objects = object_table_.GetAllObjects();
@@ -1245,6 +1313,7 @@ bool KernelState::Save(ByteStream* stream) {
 
   size_t num_objects = objects.size();
   XELOGD("Serializing {} objects...", num_objects);
+  std::map<uint32_t, uint32_t> saved_by_type, dropped_by_type;
   for (auto object : objects) {
     auto prev_offset = stream->offset();
 
@@ -1256,15 +1325,33 @@ bool KernelState::Save(ByteStream* stream) {
 
     stream->Write<uint32_t>(static_cast<uint32_t>(object->type()));
     if (!object->Save(stream)) {
-      XELOGD("Did not save object of type {}",
-             static_cast<uint32_t>(object->type()));
-      assert_always();
+      // No Save for this type: the object is left out. A thread that was
+      // waiting on it re-executes its wait on a dead handle after the
+      // restore, so say so.
+      XELOGW("KernelState::Save: {} object {:08X} '{}' not saved (type {})",
+             XObject::TypeName(object->type()), object->handle(),
+             object->name(), static_cast<uint32_t>(object->type()));
+      dropped_by_type[static_cast<uint32_t>(object->type())]++;
 
       // Revert backwards and overwrite if a save failed.
       stream->set_offset(prev_offset);
       num_objects--;
+    } else {
+      saved_by_type[static_cast<uint32_t>(object->type())]++;
     }
   }
+  std::string summary;
+  for (auto& [type, count] : saved_by_type) {
+    summary += fmt::format(" {}={}", XObject::TypeName(XObject::Type(type)),
+                           count);
+  }
+  std::string dropped;
+  for (auto& [type, count] : dropped_by_type) {
+    dropped += fmt::format(" {}={}", XObject::TypeName(XObject::Type(type)),
+                           count);
+  }
+  XELOGI("KernelState::Save: {} objects saved:{}{}{}", num_objects, summary,
+         dropped.empty() ? "" : "; NOT saved:", dropped);
 
   *num_objects_ptr = static_cast<uint32_t>(num_objects);
   return true;
@@ -1273,6 +1360,9 @@ bool KernelState::Save(ByteStream* stream) {
 // this only gets triggered once per ms at most, so fields other than tick count
 // will probably not be updated in a timely manner for guest code that uses them
 void KernelState::UpdateKeTimestampBundle() {
+  if (timestamp_updates_paused_) {
+    return;
+  }
   X_TIME_STAMP_BUNDLE* lpKeTimeStampBundle =
       memory_->TranslateVirtual<X_TIME_STAMP_BUNDLE*>(ke_timestamp_bundle_ptr_);
   uint32_t uptime_ms = Clock::QueryGuestUptimeMillis();
@@ -1339,6 +1429,17 @@ bool KernelState::Restore(ByteStream* stream) {
   // Restore the object table
   object_table_.Restore(stream);
 
+  if (emulator_->save_state_version() >= 7) {
+    if (!content_manager()->Restore(stream)) {
+      return false;
+    }
+  }
+  if (emulator_->save_state_version() >= 8) {
+    if (!xam_state_->Restore(stream)) {
+      return false;
+    }
+  }
+
   // TLS bitmap is now stored per-process in X_KPROCESS structures (in guest
   // memory) Skip reading old global TLS bitmap if present in old save files
   auto num_bitmap_entries = stream->Read<uint32_t>();
@@ -1347,7 +1448,7 @@ bool KernelState::Restore(ByteStream* stream) {
   }
 
   uint32_t num_threads = stream->Read<uint32_t>();
-  XELOGD("Loading {} threads...", num_threads);
+  XELOGI("Loading {} threads...", num_threads);
   for (uint32_t i = 0; i < num_threads; i++) {
     auto thread = XObject::Restore(this, XObject::Type::Thread, stream);
     if (!thread) {
@@ -1358,7 +1459,7 @@ bool KernelState::Restore(ByteStream* stream) {
   }
 
   uint32_t num_objects = stream->Read<uint32_t>();
-  XELOGD("Loading {} objects...", num_objects);
+  XELOGI("Loading {} objects...", num_objects);
   for (uint32_t i = 0; i < num_objects; i++) {
     uint32_t type = stream->Read<uint32_t>();
 
@@ -1369,6 +1470,27 @@ bool KernelState::Restore(ByteStream* stream) {
       return false;
     }
   }
+
+  // Files report reads to completion ports; both are restored now, so the
+  // saved (key, port handle) pairs can be turned back into references.
+  for (auto file : object_table_.GetObjectsByType<XFile>()) {
+    file->RelinkIOCompletionPorts();
+  }
+
+  // TerminateTitle dropped the executable module; the restored user modules
+  // have been reloaded, so point at the executable among them again.
+  if (!executable_module_) {
+    auto global_lock = global_critical_region_.Acquire();
+    for (auto& module : user_modules_) {
+      if (module->is_executable()) {
+        XELOGI("Restore: executable module is {} ({:08X})", module->path(),
+               module->handle());
+        SetExecutableModuleForRestore(module);
+        break;
+      }
+    }
+  }
+  XELOGI("Restore: {} user modules loaded", user_modules_.size());
 
   return true;
 }
@@ -1432,6 +1554,15 @@ void KernelState::EmulateCPInterruptDPC(uint32_t interrupt_callback,
   xboxkrnl::xeKeSetCurrentProcessType(X_PROCTYPE_TITLE, current_context);
 
   uint64_t args[] = {source, interrupt_callback_data};
+  {
+    // Diagnostic (save states): throttled trace of interrupt dispatch.
+    static uint32_t dispatched[4] = {};
+    uint32_t idx = source < 3 ? source : 3;
+    if ((++dispatched[idx] % 300) == 1) {
+      XELOGD("CP interrupt source {} #{} callback={:08X} on thread {:08X}",
+             source, dispatched[idx], interrupt_callback, thread->handle());
+    }
+  }
   processor_->Execute(thread->thread_state(), interrupt_callback, args,
                       xe::countof(args));
   xboxkrnl::xeKeSetCurrentProcessType(X_PROCTYPE_IDLE, current_context);

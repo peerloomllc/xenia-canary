@@ -7,6 +7,8 @@
  ******************************************************************************
  */
 
+#include <atomic>
+
 #include "xenia/base/logging.h"
 #include "xenia/kernel/info/file.h"
 #include "xenia/kernel/kernel_state.h"
@@ -151,6 +153,19 @@ dword_result_t NtReadFile_entry(dword_t file_handle, dword_t event_handle,
       if (io_status_block) {
         io_status_block->status = result;
         io_status_block->information = bytes_read;
+      }
+      if (XFAILED(result) || bytes_read != buffer_length) {
+        // Diagnostic (first 200): a read that failed or came up short.
+        static std::atomic<int> logged{0};
+        if (logged++ < 200) {
+          XELOGI("NtReadFile {} h={:08X} off={} len={} got={} status={:08X} "
+                 "pos={} size={}",
+                 file->file() ? file->entry()->name() : "<unresolved>",
+                 uint32_t(file_handle),
+                 byte_offset_ptr ? int64_t(*byte_offset_ptr) : -1,
+                 uint32_t(buffer_length), bytes_read, uint32_t(result),
+                 file->position(), file->file() ? file->entry()->size() : 0);
+        }
       }
 
       // Queue the APC callback. It must be delivered via the APC mechanism even

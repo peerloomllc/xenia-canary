@@ -168,6 +168,9 @@ class X64Backend : public Backend {
   virtual void InitializeBackendContext(void* ctx) override;
   virtual void DeinitializeBackendContext(void* ctx) override;
   virtual void PrepareForReentry(void* ctx) override;
+  size_t GetGuestCallChain(void* ctx, uint32_t* out_addresses,
+                           uint32_t* out_stack_pointers,
+                           size_t max_addresses) override;
   X64BackendContext* BackendContextForGuestContext(void* ctx) {
     return reinterpret_cast<X64BackendContext*>(
         reinterpret_cast<intptr_t>(ctx) - sizeof(X64BackendContext));

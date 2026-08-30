@@ -235,6 +235,10 @@ class KernelState {
   object_ref<XThread> LaunchModule(object_ref<UserModule> module);
   object_ref<UserModule> GetExecutableModule();
   void SetExecutableModule(object_ref<UserModule> module);
+  // Restore-time variant: only records the module. The process structure,
+  // TLS and kernel variables it would initialise come from the saved memory
+  // image instead.
+  void SetExecutableModuleForRestore(object_ref<UserModule> module);
   object_ref<UserModule> LoadUserModule(const std::string_view name,
                                         bool call_entry = true);
   object_ref<UserModule> LoadUserModuleFromMemory(const std::string_view name,
@@ -315,6 +319,9 @@ class KernelState {
   XE_COLD
   uint32_t CreateKeTimestampBundle();
   void UpdateKeTimestampBundle();
+  void set_timestamp_updates_paused(bool paused) {
+    timestamp_updates_paused_ = paused;
+  }
 
   void BeginDPCImpersonation(cpu::ppc::PPCContext* context,
                              DPCImpersonationScope& scope);
@@ -384,6 +391,10 @@ class KernelState {
 
   uint32_t ke_timestamp_bundle_ptr_ = 0;
   std::unique_ptr<xe::threading::HighResolutionTimer> timestamp_timer_;
+  // Set while a save state is being restored, so the 1 ms timer does not
+  // overwrite the restored bundle before the emulator has read the uptime
+  // the guest last saw.
+  std::atomic<bool> timestamp_updates_paused_{false};
   uint32_t quantum_timer_counter_ = 0;
   cpu::backend::GuestTrampolineGroup kernel_trampoline_group_;
   // fixed address referenced by dashboards. Data is currently unknown

@@ -8,12 +8,22 @@
  */
 
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
+
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+#include "xenia/base/logging.h"
+#include "xenia/kernel/kernel_flags.h"
 #include "xenia/base/atomic.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/platform.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
+#include "xenia/kernel/xevent.h"
 #include "xenia/kernel/xsemaphore.h"
 #include "xenia/kernel/xtimer.h"
 #include "xenia/xbox.h"
@@ -54,6 +64,165 @@ namespace xboxkrnl {
 //   lwz r11, 0x100(r13)
 //   stw r3, 0x160(r11)
 // }
+
+
+// ---------------------------------------------------------------------------
+// Event tracing (--trace_event_handles).
+//
+// NtSetEvent / NtClearEvent / the waits are tagged kHighFrequency, and turning
+// on --log_high_frequency_kernel_calls slows a title so much that a timing
+// dependent hang can never be compared against a passing run. This traces
+// only event objects, only the requested handles, at info level, and stamps
+// each line with a global sequence number and a microsecond timestamp so the
+// interleaving between a producer's NtSetEvent and a consumer's
+// NtWaitForSingleObjectEx can be reconstructed from the log regardless of how
+// the logger orders lines from different threads.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct EventTraceConfig {
+  bool enabled = false;
+  bool all = false;
+  std::vector<uint32_t> handles;
+};
+
+const EventTraceConfig& EventTraceGetConfig() {
+  static const EventTraceConfig config = [] {
+    EventTraceConfig c;
+    const std::string& spec = cvars::trace_event_handles;
+    if (spec.empty()) {
+      return c;
+    }
+    c.enabled = true;
+    if (spec == "all") {
+      c.all = true;
+      return c;
+    }
+    size_t pos = 0;
+    while (pos <= spec.size()) {
+      size_t end = spec.find(',', pos);
+      if (end == std::string::npos) {
+        end = spec.size();
+      }
+      std::string token = spec.substr(pos, end - pos);
+      if (!token.empty()) {
+        c.handles.push_back(
+            static_cast<uint32_t>(std::strtoul(token.c_str(), nullptr, 16)));
+      }
+      pos = end + 1;
+    }
+    return c;
+  }();
+  return config;
+}
+
+inline bool EventTraceEnabled() { return EventTraceGetConfig().enabled; }
+
+inline bool EventTraceWants(uint32_t handle) {
+  const auto& c = EventTraceGetConfig();
+  if (!c.enabled) {
+    return false;
+  }
+  if (c.all) {
+    return true;
+  }
+  for (uint32_t h : c.handles) {
+    if (h == handle) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// With 'all', every waitable object is traced (a wait on a thread handle is
+// a join, and that is where a producer can silently park). With an explicit
+// handle list, whatever object owns the handle is traced.
+inline bool EventTraceWants(XObject* object) {
+  return object && EventTraceWants(object->handle());
+}
+
+inline uint64_t EventTraceMicros() {
+  static const auto t0 = std::chrono::steady_clock::now();
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - t0)
+          .count());
+}
+
+inline uint32_t EventTraceGuestLR() {
+  auto thread_state = cpu::ThreadState::Get();
+  return thread_state ? static_cast<uint32_t>(thread_state->context()->lr) : 0;
+}
+
+// Event: 0/1 signal state. Anything else: 0xT0000000 | type, so the log
+// shows what kind of object was waited on (Thread = 4, Semaphore = 5, ...).
+inline uint32_t EventTraceState(XObject* object) {
+  if (!object) {
+    return 0xFFFFFFFFu;
+  }
+  if (object->type() != XObject::Type::Event) {
+    return 0xF0000000u | static_cast<uint32_t>(object->type());
+  }
+  uint32_t type = 0, state = 0;
+  static_cast<XEvent*>(object)->Query(&type, &state);
+  return state;
+}
+
+inline std::string EventTraceTimeout(const uint64_t* timeout_ptr) {
+  if (!timeout_ptr) {
+    return "inf";
+  }
+  return fmt::format("{}", static_cast<int64_t>(*timeout_ptr));
+}
+
+inline bool EventTraceWantsAny(XObject** objects, uint32_t count) {
+  if (!EventTraceEnabled()) {
+    return false;
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    if (EventTraceWants(objects[i])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// "n=3 any=1 [F8000010:0 F8000018:1 F8000020:0]" - handle:state pairs, with
+// non-event objects shown as handle:T<type>.
+std::string EventTraceDescribe(XObject** objects, uint32_t count,
+                               uint32_t wait_type) {
+  std::string out = fmt::format("n={} any={} [", count, wait_type);
+  for (uint32_t i = 0; i < count; ++i) {
+    if (i) {
+      out += ' ';
+    }
+    XObject* o = objects[i];
+    if (!o) {
+      out += "null";
+    } else if (o->type() == XObject::Type::Event) {
+      out += fmt::format("{:08X}:{}", o->handle(), EventTraceState(o));
+    } else {
+      out += fmt::format("{:08X}:T{}", o->handle(),
+                         static_cast<uint32_t>(o->type()));
+    }
+  }
+  out += ']';
+  return out;
+}
+
+std::atomic<uint64_t> event_trace_seq_{0};
+
+template <typename... Args>
+void EventTraceLine(std::string_view format, const Args&... args) {
+  uint64_t seq = event_trace_seq_.fetch_add(1, std::memory_order_relaxed);
+  std::string body = fmt::format(fmt::runtime(format), args...);
+  xe::logging::AppendLogLineFormat(xe::LogSrc::Kernel, xe::LogLevel::Info, 'E',
+                                   "EVT #{} t={} lr={:08X} {}", seq,
+                                   EventTraceMicros(), EventTraceGuestLR(),
+                                   body);
+}
+
+}  // namespace
 
 template <typename T>
 object_ref<T> LookupNamedObject(KernelState* kernel_state,
@@ -192,9 +361,19 @@ dword_result_t ExCreateThread_entry(lpdword_t handle_ptr, dword_t stack_size,
                                     lpvoid_t start_address,
                                     lpvoid_t start_context,
                                     dword_t creation_flags) {
-  return ExCreateThread(handle_ptr, stack_size, thread_id_ptr,
-                        xapi_thread_startup, start_address, start_context,
-                        creation_flags);
+  dword_result_t result =
+      ExCreateThread(handle_ptr, stack_size, thread_id_ptr,
+                     xapi_thread_startup, start_address, start_context,
+                     creation_flags);
+  if (EventTraceEnabled()) {
+    EventTraceLine("createthread h={:08X} flags={:08X} start={:08X} ctx={:08X} "
+                   "result={:08X}",
+                   handle_ptr ? static_cast<uint32_t>(*handle_ptr) : 0u,
+                   creation_flags.value(), start_address.guest_address(),
+                   start_context.guest_address(),
+                   static_cast<uint32_t>(result));
+  }
+  return result;
 }
 DECLARE_XBOXKRNL_EXPORT1(ExCreateThread, kThreading, kImplemented);
 
@@ -219,10 +398,17 @@ uint32_t NtResumeThread(uint32_t handle, uint32_t* suspend_count_ptr) {
   if (thread) {
     if (thread->type() == XObject::Type::Thread) {
       result = thread->Resume(&suspend_count);
+      if (EventTraceEnabled()) {
+        EventTraceLine("resume h={:08X} prev_count={} result={:08X}", handle,
+                       suspend_count, result);
+      }
     } else {
       return X_STATUS_OBJECT_TYPE_MISMATCH;
     }
   } else {
+    if (EventTraceEnabled()) {
+      EventTraceLine("resume h={:08X} INVALID_HANDLE", handle);
+    }
     return X_STATUS_INVALID_HANDLE;
   }
   if (suspend_count_ptr) {
@@ -288,7 +474,7 @@ dword_result_t NtSuspendThread_entry(dword_t handle,
 
         if (is_self_suspend) {
           XELOGD("Thread {:X} self-suspending", thread->handle());
-          suspend_count = thread->SelfSuspend();
+          suspend_count = thread->SelfSuspend(thread->TakeRestoredSelfSuspend());
           result = X_STATUS_SUCCESS;
           XELOGD("Thread {:X} resumed", thread->handle());
         } else {
@@ -303,6 +489,10 @@ dword_result_t NtSuspendThread_entry(dword_t handle,
     }
   } else {
     return X_STATUS_INVALID_HANDLE;
+  }
+  if (EventTraceEnabled()) {
+    EventTraceLine("suspend h={:08X} prev_count={} result={:08X}",
+                   handle.value(), suspend_count, result);
   }
 
   if (suspend_count_ptr) {
@@ -573,6 +763,11 @@ void KeInitializeEvent_entry(pointer_t<X_KEVENT> event_ptr, dword_t event_type,
     assert_always();
     return;
   }
+  if (EventTraceWants(ev.get())) {
+    EventTraceLine("init h={:08X} native={:08X} type={} initial={}",
+                   ev->handle(), event_ptr.guest_address(),
+                   event_type.value(), initial_state.value());
+  }
 }
 DECLARE_XBOXKRNL_EXPORT1(KeInitializeEvent, kThreading, kImplemented);
 
@@ -584,6 +779,10 @@ uint32_t xeKeSetEvent(X_KEVENT* event_ptr, uint32_t increment, uint32_t wait) {
     return 0;
   }
 
+  if (EventTraceWants(ev.get())) {
+    EventTraceLine("keset h={:08X} prev={}", ev->handle(),
+                   EventTraceState(ev.get()));
+  }
   return ev->Set(increment, !!wait);
 }
 
@@ -602,6 +801,10 @@ dword_result_t KePulseEvent_entry(pointer_t<X_KEVENT> event_ptr,
     return 0;
   }
 
+  if (EventTraceWants(ev.get())) {
+    EventTraceLine("kepulse h={:08X} prev={}", ev->handle(),
+                   EventTraceState(ev.get()));
+  }
   return ev->Pulse(increment, !!wait);
 }
 DECLARE_XBOXKRNL_EXPORT2(KePulseEvent, kThreading, kImplemented,
@@ -615,6 +818,10 @@ dword_result_t KeResetEvent_entry(pointer_t<X_KEVENT> event_ptr) {
     return 0;
   }
 
+  if (EventTraceWants(ev.get())) {
+    EventTraceLine("kereset h={:08X} prev={}", ev->handle(),
+                   EventTraceState(ev.get()));
+  }
   return ev->Reset();
 }
 DECLARE_XBOXKRNL_EXPORT1(KeResetEvent, kThreading, kImplemented);
@@ -648,6 +855,10 @@ dword_result_t NtCreateEvent_entry(
   if (handle_ptr) {
     *handle_ptr = ev->handle();
   }
+  if (EventTraceWants(ev.get())) {
+    EventTraceLine("create h={:08X} type={} initial={}", ev->handle(),
+                   event_type.value(), initial_state.value());
+  }
   return X_STATUS_SUCCESS;
 }
 DECLARE_XBOXKRNL_EXPORT1(NtCreateEvent, kThreading, kImplemented);
@@ -660,6 +871,10 @@ uint32_t xeNtSetEvent(uint32_t handle, xe::be<uint32_t>* previous_state_ptr) {
     // d3 ros does this
     if (ev->type() != XObject::Type::Event) {
       return X_STATUS_OBJECT_TYPE_MISMATCH;
+    }
+    if (EventTraceWants(handle)) {
+      EventTraceLine("set h={:08X} prev={}", handle,
+                     EventTraceState(ev.get()));
     }
     int32_t was_signalled = ev->Set(0, false);
     if (previous_state_ptr) {
@@ -683,6 +898,10 @@ dword_result_t NtPulseEvent_entry(dword_t handle,
 
   auto ev = kernel_state()->object_table()->LookupObject<XEvent>(handle);
   if (ev) {
+    if (EventTraceWants(handle)) {
+      EventTraceLine("pulse h={:08X} prev={}", handle.value(),
+                     EventTraceState(ev.get()));
+    }
     int32_t was_signalled = ev->Pulse(0, false);
     if (previous_state_ptr) {
       *previous_state_ptr = static_cast<uint32_t>(was_signalled);
@@ -719,6 +938,10 @@ uint32_t xeNtClearEvent(uint32_t handle) {
 
   auto ev = kernel_state()->object_table()->LookupObject<XEvent>(handle);
   if (ev) {
+    if (EventTraceWants(handle)) {
+      EventTraceLine("clear h={:08X} prev={}", handle,
+                     EventTraceState(ev.get()));
+    }
     ev->Reset();
   } else {
     result = X_STATUS_INVALID_HANDLE;
@@ -999,8 +1222,20 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason,
     return X_STATUS_ABANDONED_WAIT_0;
   }
 
+  const bool trace = EventTraceWants(object.get());
+  uint64_t t0 = 0;
+  if (trace) {
+    t0 = EventTraceMicros();
+    EventTraceLine("kewait h={:08X} state={} timeout={}", object->handle(),
+                   EventTraceState(object.get()),
+                   EventTraceTimeout(timeout_ptr));
+  }
   X_STATUS result =
       object->Wait(wait_reason, processor_mode, alertable, timeout_ptr);
+  if (trace) {
+    EventTraceLine("kewoke h={:08X} result={:08X} waited_us={}",
+                   object->handle(), result, EventTraceMicros() - t0);
+  }
   if (alertable) {
     if (result == X_STATUS_USER_APC) {
       xeProcessUserApcs(nullptr);
@@ -1029,8 +1264,20 @@ uint32_t NtWaitForSingleObjectEx(uint32_t object_handle, uint32_t wait_mode,
       kernel_state()->object_table()->LookupObject<XObject>(object_handle);
   if (object) {
     uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+    const bool trace = EventTraceWants(object.get());
+    uint64_t t0 = 0;
+    if (trace) {
+      t0 = EventTraceMicros();
+      EventTraceLine("wait h={:08X} state={} timeout={}", object_handle,
+                     EventTraceState(object.get()),
+                     EventTraceTimeout(timeout_ptr));
+    }
     result =
         object->Wait(3, wait_mode, alertable, timeout_ptr ? &timeout : nullptr);
+    if (trace) {
+      EventTraceLine("woke h={:08X} result={:08X} waited_us={}", object_handle,
+                     result, EventTraceMicros() - t0);
+    }
     if (alertable) {
       if (result == X_STATUS_USER_APC) {
         xeProcessUserApcs(nullptr);
@@ -1076,9 +1323,23 @@ dword_result_t KeWaitForMultipleObjects_entry(
     }
   }
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+  const bool trace = EventTraceWantsAny(
+      reinterpret_cast<XObject**>(&objects[0]), uint32_t(count));
+  uint64_t t0 = 0;
+  if (trace) {
+    t0 = EventTraceMicros();
+    EventTraceLine("kewaitmulti {} timeout={}",
+                   EventTraceDescribe(reinterpret_cast<XObject**>(&objects[0]),
+                                      uint32_t(count), wait_type),
+                   EventTraceTimeout(timeout_ptr ? &timeout : nullptr));
+  }
   X_STATUS result = XObject::WaitMultiple(
       uint32_t(count), reinterpret_cast<XObject**>(&objects[0]), wait_type,
       wait_reason, processor_mode, alertable, timeout_ptr ? &timeout : nullptr);
+  if (trace) {
+    EventTraceLine("kewokemulti result={:08X} waited_us={}", result,
+                   EventTraceMicros() - t0);
+  }
   if (alertable) {
     if (result == X_STATUS_USER_APC) {
       xeProcessUserApcs(nullptr);
@@ -1120,9 +1381,23 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, xe::be<uint32_t>* handles,
     }
   }
 
+  const bool trace =
+      EventTraceWantsAny(reinterpret_cast<XObject**>(&objects[0]), count);
+  uint64_t t0 = 0;
+  if (trace) {
+    t0 = EventTraceMicros();
+    EventTraceLine("waitmulti {} timeout={}",
+                   EventTraceDescribe(reinterpret_cast<XObject**>(&objects[0]),
+                                      count, wait_type),
+                   EventTraceTimeout(timeout_ptr));
+  }
   auto result =
       XObject::WaitMultiple(count, reinterpret_cast<XObject**>(&objects[0]),
                             wait_type, 6, wait_mode, alertable, timeout_ptr);
+  if (trace) {
+    EventTraceLine("wokemulti result={:08X} waited_us={}", result,
+                   EventTraceMicros() - t0);
+  }
   if (alertable) {
     if (result == X_STATUS_USER_APC) {
       xeProcessUserApcs(nullptr);
@@ -1162,9 +1437,24 @@ dword_result_t NtSignalAndWaitForSingleObjectEx_entry(dword_t signal_handle,
   global_critical_region::mutex().unlock();
   if (signal_object && wait_object) {
     uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+    const bool trace = EventTraceWants(signal_object.get()) ||
+                       EventTraceWants(wait_object.get());
+    uint64_t t0 = 0;
+    if (trace) {
+      t0 = EventTraceMicros();
+      EventTraceLine(
+          "sigwait sig={:08X} sigstate={} h={:08X} state={} timeout={}",
+          signal_handle.value(), EventTraceState(signal_object.get()),
+          wait_handle.value(), EventTraceState(wait_object.get()),
+          EventTraceTimeout(timeout_ptr ? &timeout : nullptr));
+    }
     result = XObject::SignalAndWait(signal_object.get(), wait_object.get(), 3,
                                     wait_mode, alertable,
                                     timeout_ptr ? &timeout : nullptr);
+    if (trace) {
+      EventTraceLine("sigwoke h={:08X} result={:08X} waited_us={}",
+                     wait_handle.value(), result, EventTraceMicros() - t0);
+    }
   } else {
     result = X_STATUS_INVALID_HANDLE;
   }
@@ -1218,6 +1508,10 @@ uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock,
     xe::threading::MaybeYield();
   }
 
+  // Holding a guest spinlock: a Thread::Suspend must wait for the release,
+  // or every other thread that needs the lock spins for as long as the
+  // emulator is paused (and a save state would record it as taken).
+  xe::threading::BeginSuspendDeferral();
   return old_irql;
 }
 
@@ -1233,6 +1527,7 @@ void xeKeKfReleaseSpinLock(PPCContext* ctx, X_KSPINLOCK* lock,
   assert_true(lock->prcb_of_owner == static_cast<uint32_t>(ctx->r[13]));
   // Unlock with release semantics to ensure all prior writes are visible.
   xe::atomic_store_release(0u, &lock->prcb_of_owner.value);
+  xe::threading::EndSuspendDeferral();
 
   if (change_irql) {
     // Unlock.
@@ -1271,6 +1566,7 @@ dword_result_t KeTryToAcquireSpinLockAtRaisedIrql_entry(
           lock_ptr.guest_address())) {
     return 0;
   }
+  xe::threading::BeginSuspendDeferral();
   return 1;
 }
 DECLARE_XBOXKRNL_EXPORT4(KeTryToAcquireSpinLockAtRaisedIrql, kThreading,

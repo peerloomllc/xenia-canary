@@ -8,6 +8,8 @@
  */
 
 #include "xenia/base/mutex.h"
+
+#include "xenia/base/threading.h"
 #if XE_PLATFORM_WIN32 == 1
 #include "xenia/base/platform_win.h"
 #elif XE_PLATFORM_LINUX == 1
@@ -29,6 +31,7 @@ void xe_global_mutex::lock() {
   AcquireSRWLockExclusive(&srwlock_);
   owner_thread_ = self;
   recursion_count_ = 1;
+  threading::BeginSuspendDeferral();
 }
 
 void xe_global_mutex::unlock() {
@@ -47,6 +50,7 @@ bool xe_global_mutex::try_lock() {
   if (TryAcquireSRWLockExclusive(&srwlock_)) {
     owner_thread_ = self;
     recursion_count_ = 1;
+  threading::BeginSuspendDeferral();
     return true;
   }
   return false;
@@ -88,7 +92,17 @@ inline int futex_wake(std::atomic<uint32_t>* addr, int count) {
                  0);
 }
 
-inline pid_t gettid() { return static_cast<pid_t>(syscall(SYS_gettid)); }
+// The kernel thread id never changes for a thread, and every lock() asks for
+// it: cached per thread. Uncached this was ~39,000 gettid syscalls a second
+// on the GPU command processor thread (Eternal Sonata's intro cutscene) and
+// most of that thread's time in the kernel (Windows reads it from the TEB).
+inline pid_t gettid() {
+  static thread_local pid_t cached_tid = 0;
+  if (!cached_tid) {
+    cached_tid = static_cast<pid_t>(syscall(SYS_gettid));
+  }
+  return cached_tid;
+}
 
 }  // namespace
 
@@ -108,6 +122,7 @@ void xe_global_mutex::lock() {
           expected, 1, std::memory_order_acquire, std::memory_order_relaxed))) {
     owner_.store(self, std::memory_order_relaxed);
     recursion_count_ = 1;
+  threading::BeginSuspendDeferral();
     return;
   }
 
@@ -127,6 +142,7 @@ void xe_global_mutex::lock_slow() {
                                        std::memory_order_relaxed)) {
       owner_.store(self, std::memory_order_relaxed);
       recursion_count_ = 1;
+  threading::BeginSuspendDeferral();
       return;
     }
   }
@@ -139,6 +155,7 @@ void xe_global_mutex::lock_slow() {
       // We got the lock while marking contended
       owner_.store(self, std::memory_order_relaxed);
       recursion_count_ = 1;
+  threading::BeginSuspendDeferral();
       return;
     }
 
@@ -151,6 +168,7 @@ void xe_global_mutex::lock_slow() {
                                        std::memory_order_relaxed)) {
       owner_.store(self, std::memory_order_relaxed);
       recursion_count_ = 1;
+  threading::BeginSuspendDeferral();
       return;
     }
   }
@@ -167,6 +185,10 @@ void xe_global_mutex::unlock() {
   if (state_.exchange(0, std::memory_order_release) == 2) {
     futex_wake(&state_, 1);
   }
+  // A thread must never be stopped by Thread::Suspend while it holds the
+  // global critical region: the pausing thread needs it next. Deferred
+  // suspension, if requested meanwhile, happens here.
+  threading::EndSuspendDeferral();
 }
 
 bool xe_global_mutex::try_lock() {
@@ -183,6 +205,7 @@ bool xe_global_mutex::try_lock() {
                                      std::memory_order_relaxed)) {
     owner_.store(self, std::memory_order_relaxed);
     recursion_count_ = 1;
+  threading::BeginSuspendDeferral();
     return true;
   }
   return false;

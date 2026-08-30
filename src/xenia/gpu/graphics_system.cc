@@ -9,6 +9,8 @@
 
 #include "xenia/gpu/graphics_system.h"
 
+#include <algorithm>
+
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
@@ -18,6 +20,7 @@
 #include "xenia/config.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/gpu_flags.h"
+#include "xenia/emulator.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/ui/graphics_provider.h"
 #include "xenia/ui/window.h"
@@ -191,6 +194,14 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
                 if (!cvars::vsync && normalized_framerate_limit > 0) {
                   sleep_duration_ns = 1000000000 / normalized_framerate_limit;
                 }
+                // The Windows branch paces vblanks on the guest clock, which
+                // the time scalar stretches, so 2x there really is twice the
+                // vblanks. This branch sleeps in host time; apply the scalar
+                // here so fast-forward and slow-motion work on Linux too.
+                const double scalar = std::clamp(Clock::guest_time_scalar(),
+                                                 1.0 / 16.0, 16.0);
+                sleep_duration_ns =
+                    static_cast<uint64_t>(sleep_duration_ns / scalar);
                 threading::NanoSleep(sleep_duration_ns);
               } else {
                 xe::threading::Sleep(std::chrono::milliseconds(1));
@@ -396,10 +407,10 @@ void GraphicsSystem::BeginTracing() {
 
 void GraphicsSystem::EndTracing() { command_processor_->EndTracing(); }
 
-void GraphicsSystem::Pause() {
+void GraphicsSystem::Pause(bool capture_edram) {
   paused_ = true;
 
-  command_processor_->Pause();
+  command_processor_->Pause(capture_edram);
 }
 
 void GraphicsSystem::Resume() {
@@ -419,7 +430,28 @@ bool GraphicsSystem::Restore(ByteStream* stream) {
   interrupt_callback_ = stream->Read<uint32_t>();
   interrupt_callback_data_ = stream->Read<uint32_t>();
 
-  return command_processor_->Restore(stream);
+  // Format 8 files carry the EDRAM contents after the register file.
+  bool has_edram_snapshot =
+      kernel_state_ && kernel_state_->emulator() &&
+      kernel_state_->emulator()->save_state_version() >= 8;
+  if (!command_processor_->Restore(stream, has_edram_snapshot)) {
+    return false;
+  }
+  // Guest memory and the register file were rewritten behind the host GPU
+  // caches' backs: every cached texture, render target, shared-memory page
+  // and primitive buffer still describes the pre-restore state, and the
+  // presenter kept showing the last pre-restore frame. Invalidate and drop
+  // all of it on the command processor's thread once it resumes, as the
+  // trace player does before playback.
+  // The EDRAM contents go back afterwards: the snapshot takes over every
+  // EDRAM tile, and the render targets that held the pre-restore contents
+  // are dropped by the cache clear once they own nothing.
+  command_processor_->CallInThread([cp = command_processor_.get()]() {
+    cp->TracePlaybackWroteMemory(0, 0x20000000);
+    cp->ClearCaches();
+    cp->RestoreSavedEdramSnapshot();
+  });
+  return true;
 }
 
 std::pair<uint32_t, uint32_t> GraphicsSystem::GetResolution() const {

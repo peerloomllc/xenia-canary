@@ -12,6 +12,7 @@
 
 #include <memory>
 
+#include "xenia/base/byte_stream.h"
 #include "xenia/kernel/xam/achievement_manager.h"
 #include "xenia/kernel/xam/app_manager.h"
 #include "xenia/kernel/xam/content_manager.h"
@@ -57,6 +58,12 @@ class XamState {
   void LoadSpaInfo(const SpaInfo* info);
 
   void SetContentRegisterCallback(uint32_t callback);
+
+  // Save states (format 8): the callbacks and dashboard data the title
+  // registered, and the profile signed into slot 0 at the save (a restore
+  // with another profile warns; content and saves would go to it).
+  bool Save(ByteStream* stream);
+  bool Restore(ByteStream* stream);
 
   bool IsUIActive() const { return is_xam_dialog_present_.load(); }
 

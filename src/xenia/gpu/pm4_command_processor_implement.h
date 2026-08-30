@@ -660,6 +660,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_XE_SWAP(uint32_t packet,
   uint32_t frontbuffer_height = reader_.ReadAndSwap<uint32_t>();
   reader_.AdvanceRead((count - 4) * sizeof(uint32_t));
 
+  swap_count_.fetch_add(1, std::memory_order_relaxed);
   COMMAND_PROCESSOR::IssueSwap(frontbuffer_ptr, frontbuffer_width,
                                frontbuffer_height);
 
@@ -715,6 +716,27 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
                 : register_file_->values[poll_reg_addr];
 
   bool matched = false;
+  // Diagnostic: a wait that runs long is logged once with what it polls.
+  // Save-state restores have stalled here.
+  auto wait_started = std::chrono::steady_clock::now();
+  bool wait_logged = false;
+  if (cvars::log_wait_reg_mem) {
+    // Diagnostic (60 fps patches): what the guest makes the GPU wait on,
+    // throttled to one line per second per poll address.
+    static std::map<uint32_t, std::pair<std::chrono::steady_clock::time_point,
+                                        uint32_t>>
+        last_logged;
+    auto& entry = last_logged[poll_reg_addr];
+    ++entry.second;
+    if (wait_started - entry.first > std::chrono::seconds(1)) {
+      XELOGI("WAIT_REG_MEM {} {:08X} mask={:08X} ref={:08X} wait_info={:X} "
+             "wait={:X} value_now={:08X} ({} in the last second)",
+             is_memory ? "mem" : "reg", poll_reg_addr, mask, ref, wait_info,
+             wait, uint32_t(value_ref), entry.second);
+      entry.first = wait_started;
+      entry.second = 0;
+    }
+  }
 
   do {
     uint32_t value = value_ref;
@@ -730,6 +752,15 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
       }
     }
     matched = MatchValueAndRef(value & mask, ref, wait_info);
+    if (!matched && !wait_logged &&
+        std::chrono::steady_clock::now() - wait_started >
+            std::chrono::milliseconds(500)) {
+      wait_logged = true;
+      XELOGW("WAIT_REG_MEM stalled >500 ms: {} {:08X} value={:08X} mask={:08X} "
+             "ref={:08X} wait_info={:08X} wait={:X} read_ptr={:X}",
+             is_memory ? "mem" : "reg", poll_reg_addr, value, mask, ref,
+             wait_info, wait, read_ptr_index_);
+    }
 
     if (!matched) {
       // Wait.
@@ -1450,12 +1481,25 @@ uint32_t COMMAND_PROCESSOR::ExecutePrimaryBuffer(uint32_t read_index,
   // chiplets l3
   reader_.BeginPrefetchedRead<swcache::PrefetchTag::Level2>(
       GetCurrentRingReadCount());
+  // The guest polls the read pointer write-back to know how much ring space
+  // it has. Hardware advances it continuously; publishing it only after the
+  // whole burst (the caller does that) left the game waiting for the
+  // command processor to finish everything it had queued before it could
+  // submit more (Eternal Sonata's intro cutscene: 14-19 fps of a 30 fps
+  // scene, the main thread spinning on the pointer). Publish every few
+  // packets instead.
+  uint32_t packets_since_writeback = 0;
   do {
     if (!COMMAND_PROCESSOR::ExecutePacket()) {
       // This probably should be fatal - but we're going to continue anyways.
       XELOGE("**** PRIMARY RINGBUFFER: Failed to execute packet.");
       assert_always();
       break;
+    }
+    if (read_ptr_writeback_ptr_ && (++packets_since_writeback & 7) == 0) {
+      xe::store_and_swap<uint32_t>(
+          memory_->TranslatePhysical(read_ptr_writeback_ptr_),
+          uint32_t(reader_.read_offset() / sizeof(uint32_t)));
     }
   } while (reader_.read_count());
 

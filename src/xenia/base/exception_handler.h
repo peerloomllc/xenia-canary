@@ -218,6 +218,12 @@ class Exception {
 
 class ExceptionHandler {
  public:
+  // A per-thread slot the handler fills with the faulting host PC for the
+  // duration of the callback chain (0 otherwise). Registered by the CPU
+  // layer for each guest thread so that another thread can tell where a
+  // thread stopped inside the handler was executing.
+  static void SetThreadExceptionPcSlot(uint64_t* slot);
+
   typedef bool (*Handler)(Exception* ex, void* data);
 
   // Installs an exception handler.

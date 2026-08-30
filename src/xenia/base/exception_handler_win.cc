@@ -184,3 +184,7 @@ void ExceptionHandler::Uninstall(Handler fn, void* data) {
 }
 
 }  // namespace xe
+
+namespace xe {
+void ExceptionHandler::SetThreadExceptionPcSlot(uint64_t* slot) {}
+}  // namespace xe

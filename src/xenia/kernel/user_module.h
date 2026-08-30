@@ -35,6 +35,8 @@ constexpr fourcc_t kEXESignature = make_fourcc('M', 'Z', 0, 0);
 
 class UserModule : public XModule {
  public:
+  // Computes the XXH3 of the code section, the patch DB's key.
+  void CalculateHash();
   UserModule(KernelState* kernel_state);
   ~UserModule() override;
 
@@ -123,7 +125,6 @@ class UserModule : public XModule {
   bool is_attached_ = false;
 
  private:
-  void CalculateHash();
 
   std::string name_;
   std::string path_;

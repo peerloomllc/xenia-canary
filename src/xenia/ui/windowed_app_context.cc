@@ -45,6 +45,10 @@ WindowedAppContext::~WindowedAppContext() {
 
 bool WindowedAppContext::CallInUIThreadDeferred(
     std::function<void()> function) {
+  // Guest threads post here too. Between the queue mutex and the platform
+  // wake-up (a GLib main-context lock on GTK) this must not be interrupted
+  // by Thread::Suspend, or the UI thread and anyone else posting deadlock.
+  threading::SuspendDeferralScope no_suspend;
   {
     std::unique_lock<std::mutex> pending_functions_lock(
         pending_functions_mutex_);

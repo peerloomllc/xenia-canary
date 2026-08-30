@@ -7,6 +7,7 @@
  ******************************************************************************
  */
 
+#include "xenia/base/logging.h"
 #include "xenia/base/threading.h"
 
 #include "xenia/base/assert.h"
@@ -15,6 +16,8 @@
 #include "xenia/base/threading_timer_queue.h"
 
 #include <pthread.h>
+#include <csetjmp>
+#include <thread>
 #include <sched.h>
 #include <semaphore.h>
 #include <signal.h>
@@ -94,12 +97,13 @@ timespec DurationToTimeSpec(std::chrono::duration<_Rep, _Period> duration) {
 enum class SignalType {
   kThreadSuspend,
   kThreadUserCallback,
-#if XE_PLATFORM_ANDROID
-  // pthread_cancel is not available on Android, using a signal handler for
-  // simplified PTHREAD_CANCEL_ASYNCHRONOUS-like behavior - not disabling
-  // cancellation currently, so should be enough.
+  // Terminating another thread. pthread_cancel is not available on Android,
+  // and on glibc its forced unwind calls std::terminate as soon as it meets
+  // a noexcept frame (std::chrono::steady_clock::now() in a suspended thread
+  // was enough), so on every POSIX target the handler abandons the thread's
+  // frames with a jump back to ThreadStartRoutine instead - the semantics of
+  // TerminateThread on Windows.
   kThreadTerminate,
-#endif
   k_Count
 };
 
@@ -143,6 +147,22 @@ uint32_t current_thread_system_id() {
   return static_cast<uint32_t>(syscall(SYS_gettid));
 }
 
+thread_local bool* blocking_wait_slot_ = nullptr;
+void SetThreadBlockingWaitSlot(bool* slot) { blocking_wait_slot_ = slot; }
+inline void SetBlockingWait(bool value) {
+  if (blocking_wait_slot_) {
+    *blocking_wait_slot_ = value;
+  }
+}
+// Marks the thread as blocked for the lifetime of the object unless
+// Done() is called first (the wait was satisfied).
+struct BlockingWaitMark {
+  BlockingWaitMark() { SetBlockingWait(true); }
+  ~BlockingWaitMark() { SetBlockingWait(false); }
+  void Done() { SetBlockingWait(false); }
+};
+
+
 void MaybeYield() {
   sched_yield();
   __sync_synchronize();
@@ -151,6 +171,7 @@ void MaybeYield() {
 void SyncMemory() { __sync_synchronize(); }
 
 void Sleep(std::chrono::microseconds duration) {
+  BlockingWaitMark blocked;
   timespec rqtp = DurationToTimeSpec(duration);
   timespec rmtp = {};
   auto p_rqtp = &rqtp;
@@ -223,9 +244,70 @@ bool SetTlsValue(TlsHandle handle, uintptr_t value) {
   return pthread_setspecific(handle, reinterpret_cast<void*>(value)) == 0;
 }
 
+// Suspend deferral (see SuspendDeferralScope in threading.h). The suspend
+// signal handler checks the depth; if non-zero it only records the request,
+// and the outermost scope exit performs the suspension.
+thread_local int suspend_deferral_depth_ = 0;
+thread_local bool suspend_deferred_ = false;
+thread_local bool terminate_deferred_ = false;
+static void PerformDeferredSuspend();
+static void PerformDeferredTerminate();
+
+void BeginSuspendDeferral() { ++suspend_deferral_depth_; }
+void EndSuspendDeferral() {
+  if (suspend_deferral_depth_ <= 0) {
+    // Unbalanced release (a guest spinlock released that was not acquired
+    // through the helpers); ignore rather than leave the depth negative.
+    suspend_deferral_depth_ = 0;
+    return;
+  }
+  if (--suspend_deferral_depth_ == 0) {
+    if (terminate_deferred_) {
+      // Leaving the critical section was the point: nothing is held now.
+      terminate_deferred_ = false;
+      PerformDeferredTerminate();
+    }
+    if (suspend_deferred_) {
+      suspend_deferred_ = false;
+      PerformDeferredSuspend();
+    }
+  }
+}
+SuspendDeferralScope::SuspendDeferralScope() { BeginSuspendDeferral(); }
+SuspendDeferralScope::~SuspendDeferralScope() { EndSuspendDeferral(); }
+
+class PosixConditionBase;
+// The condition the calling thread is blocked in (see Wait()). A thread
+// terminated from outside while waiting leaves a phantom waiter on the
+// condvar; glibc's pthread_cond_destroy then blocks forever, so such a
+// condvar is marked abandoned and leaked instead of destroyed.
+thread_local PosixConditionBase* current_wait_condition_ = nullptr;
+
 class PosixConditionBase {
  public:
-  PosixConditionBase() {
+  static void MarkCurrentWaitAbandoned();
+
+  // Locks a robust std::mutex, recovering it if the previous owner died
+  // (a guest thread terminated while inside a critical section).
+  struct RobustLock {
+    explicit RobustLock(std::mutex& m)
+        : native_(static_cast<pthread_mutex_t*>(m.native_handle())) {
+      int r = pthread_mutex_lock(native_);
+      if (r == EOWNERDEAD) {
+        pthread_mutex_consistent(native_);
+      }
+      locked_ = (r == 0 || r == EOWNERDEAD);
+    }
+    ~RobustLock() {
+      if (locked_) {
+        pthread_mutex_unlock(native_);
+      }
+    }
+    pthread_mutex_t* native_;
+    bool locked_;
+  };
+
+  PosixConditionBase() : cond_(new std::condition_variable()) {
     // Initialize as robust mutex to handle thread termination gracefully
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
@@ -238,7 +320,11 @@ class PosixConditionBase {
     pthread_mutexattr_destroy(&attr);
   }
 
-  virtual ~PosixConditionBase() = default;
+  virtual ~PosixConditionBase() {
+    if (!abandoned_.load(std::memory_order_acquire)) {
+      delete cond_;
+    }
+  }
   virtual bool Signal() = 0;
 
   WaitResult Wait(std::chrono::milliseconds timeout) {
@@ -260,12 +346,16 @@ class PosixConditionBase {
     if (predicate()) {
       executed = true;
     } else {
+      current_wait_condition_ = this;
+      BlockingWaitMark blocked;
       if (timeout == std::chrono::milliseconds::max()) {
-        cond_.wait(lock, predicate);
+        cond_->wait(lock, predicate);
         executed = true;  // Did not time out;
       } else {
-        executed = cond_.wait_for(lock, timeout, predicate);
+        executed = cond_->wait_for(lock, timeout, predicate);
       }
+      blocked.Done();  // Satisfied (or timed out) - not consumed yet.
+      current_wait_condition_ = nullptr;
     }
     if (executed) {
       post_execution();
@@ -293,6 +383,7 @@ class PosixConditionBase {
                         ? std::chrono::steady_clock::time_point::max()
                         : start_time + timeout;
 
+    BlockingWaitMark blocked;
     while (true) {
       // Check all handles to see if any/all are signaled
       // Use try_lock to avoid deadlocks from lock ordering issues
@@ -303,6 +394,7 @@ class PosixConditionBase {
       std::vector<std::unique_lock<std::mutex>> locks;
       locks.reserve(handles.size());
       bool all_locked = true;
+      SuspendDeferralScope no_suspend;
 
       for (size_t i = 0; i < handles.size(); ++i) {
         // Try to lock, handling robust mutex EOWNERDEAD case
@@ -357,6 +449,7 @@ class PosixConditionBase {
       }
 
       if (condition_met) {
+        blocked.Done();
         // Execute post_execution for the signaled handle(s)
         if (wait_all) {
           for (size_t i = 0; i < handles.size(); ++i) {
@@ -386,15 +479,23 @@ class PosixConditionBase {
   }
 
   [[nodiscard]] virtual void* native_handle() const {
-    return const_cast<std::condition_variable&>(cond_).native_handle();
+    return cond_->native_handle();
   }
 
  protected:
   [[nodiscard]] inline virtual bool signaled() const = 0;
   inline virtual void post_execution() = 0;
-  std::condition_variable cond_;
+  std::condition_variable* cond_;
   std::mutex mutex_;
+  std::atomic<bool> abandoned_{false};
 };
+
+void PosixConditionBase::MarkCurrentWaitAbandoned() {
+  if (current_wait_condition_) {
+    current_wait_condition_->abandoned_.store(true, std::memory_order_release);
+    current_wait_condition_ = nullptr;
+  }
+}
 
 // There really is no native POSIX handle for a single wait/signal construct
 // pthreads is at a lower level with more handles for such a mechanism.
@@ -411,25 +512,60 @@ class PosixCondition<Event> : public PosixConditionBase {
   ~PosixCondition() override = default;
 
   bool Signal() override {
-    auto lock = std::unique_lock(mutex_);
+    SuspendDeferralScope no_suspend;
+    RobustLock lock(mutex_);
     signal_ = true;
-    cond_.notify_all();
+    cond_->notify_all();
     return true;
   }
 
   void Reset() {
-    auto lock = std::unique_lock(mutex_);
+    SuspendDeferralScope no_suspend;
+    RobustLock lock(mutex_);
     signal_ = false;
   }
 
+  EventInfo Query() {
+    SuspendDeferralScope no_suspend;
+    // Never block here: the pausing thread queries every event for a save
+    // state, and a thread stopped while holding mutex_ would deadlock it.
+    // Spin briefly, then read the state unlocked and say who holds the lock.
+    auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
+    bool locked = false;
+    for (int i = 0; i < 1000 && !locked; ++i) {
+      int r = pthread_mutex_trylock(native_mutex);
+      if (r == 0 || r == EOWNERDEAD) {
+        if (r == EOWNERDEAD) {
+          pthread_mutex_consistent(native_mutex);
+        }
+        locked = true;
+      } else {
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+      }
+    }
+    if (!locked) {
+      XELOGW("PosixEvent::Query: mutex held by tid {} for >100 ms; reading "
+             "state unlocked",
+             native_mutex->__data.__owner & 0x3fffffff);
+    }
+    bool state = signal_.load(std::memory_order_acquire);
+    if (locked) {
+      pthread_mutex_unlock(native_mutex);
+    }
+    // EVENT_TYPE: NotificationEvent = 0, SynchronizationEvent = 1.
+    return EventInfo{manual_reset_ ? 0u : 1u, state ? 1u : 0u};
+  }
+
  private:
-  [[nodiscard]] bool signaled() const override { return signal_; }
+  [[nodiscard]] bool signaled() const override {
+    return signal_.load(std::memory_order_relaxed);
+  }
   void post_execution() override {
     if (!manual_reset_) {
-      signal_ = false;
+      signal_.store(false, std::memory_order_relaxed);
     }
   }
-  bool signal_;
+  std::atomic<bool> signal_;
   const bool manual_reset_;
 };
 
@@ -442,7 +578,8 @@ class PosixCondition<Semaphore> final : public PosixConditionBase {
   bool Signal() override { return Release(1, nullptr); }
 
   bool Release(uint32_t release_count, int* out_previous_count) {
-    auto lock = std::unique_lock(mutex_);
+    SuspendDeferralScope no_suspend;
+    RobustLock lock(mutex_);  // robust: the owner may have been terminated
     // Validate that releasing would not exceed the maximum count
     if (count_ + release_count > maximum_count_) {
       return false;
@@ -451,7 +588,7 @@ class PosixCondition<Semaphore> final : public PosixConditionBase {
       *out_previous_count = count_;
     }
     count_ += release_count;
-    cond_.notify_all();
+    cond_->notify_all();
     return true;
   }
 
@@ -459,7 +596,7 @@ class PosixCondition<Semaphore> final : public PosixConditionBase {
   [[nodiscard]] bool signaled() const override { return count_ > 0; }
   void post_execution() override {
     count_--;
-    cond_.notify_all();
+    cond_->notify_all();
   }
   uint32_t count_;
   const uint32_t maximum_count_;
@@ -478,12 +615,13 @@ class PosixCondition<Mutant> final : public PosixConditionBase {
   bool Signal() override { return Release(); }
 
   bool Release() {
+    SuspendDeferralScope no_suspend;
     if (owner_ == std::this_thread::get_id() && count_ > 0) {
-      auto lock = std::unique_lock(mutex_);
+      RobustLock lock(mutex_);  // robust: the owner may have been terminated
       --count_;
       // Free to be acquired by another thread
       if (count_ == 0) {
-        cond_.notify_all();
+        cond_->notify_all();
       }
       return true;
     }
@@ -515,9 +653,9 @@ class PosixCondition<Timer> final : public PosixConditionBase {
   ~PosixCondition() override { Cancel(); }
 
   bool Signal() override {
-    std::lock_guard lock(mutex_);
+    RobustLock lock(mutex_);
     signal_ = true;
-    cond_.notify_all();
+    cond_->notify_all();
     return true;
   }
 
@@ -525,7 +663,7 @@ class PosixCondition<Timer> final : public PosixConditionBase {
                std::function<void()> opt_callback) {
     Cancel();
 
-    std::lock_guard lock(mutex_);
+    RobustLock lock(mutex_);
 
     callback_ = std::move(opt_callback);
     signal_ = false;
@@ -537,7 +675,7 @@ class PosixCondition<Timer> final : public PosixConditionBase {
                     std::function<void()> opt_callback) {
     Cancel();
 
-    std::lock_guard lock(mutex_);
+    RobustLock lock(mutex_);
 
     callback_ = std::move(opt_callback);
     signal_ = false;
@@ -564,7 +702,7 @@ class PosixCondition<Timer> final : public PosixConditionBase {
     // As the callback may reset the timer, store local.
     std::function<void()> callback;
     {
-      std::lock_guard lock(timer->mutex_);
+      RobustLock lock(timer->mutex_);
       callback = timer->callback_;
     }
     if (callback) {
@@ -681,6 +819,16 @@ class PosixCondition<Thread> final : public PosixConditionBase {
   }
 
   bool Signal() override { return true; }
+
+  // Called on the thread itself from the terminate signal handler: abandon
+  // every frame and jump back to ThreadStartRoutine, which then finishes the
+  // thread normally.
+  [[noreturn]] void ExitViaJump() {
+    if (exit_jump_armed_.exchange(false)) {
+      siglongjmp(exit_jump_, 1);
+    }
+    pthread_exit(reinterpret_cast<void*>(-1));
+  }
 
   std::string name() const {
     WaitStarted();
@@ -853,9 +1001,14 @@ class PosixCondition<Thread> final : public PosixConditionBase {
     }
     WaitStarted();
     std::unique_lock lock(state_mutex_);
+    XELOGI("PosixThread::Resume tid={} count={} state={} by={} from={}", tid_,
+           suspend_count_, static_cast<int>(state_), current_thread_system_id(),
+           __builtin_return_address(0));
     // Check if thread has any suspend count (Windows allows resume even if
     // running)
     if (suspend_count_ == 0) {
+      XELOGI("PosixThread::Resume: nothing to resume, tid={} state={}", tid_,
+             static_cast<int>(state_));
       return false;
     }
     if (out_previous_suspend_count) {
@@ -879,6 +1032,9 @@ class PosixCondition<Thread> final : public PosixConditionBase {
       *out_previous_suspend_count = 0;
     }
     WaitStarted();
+    XELOGI("PosixThread::Suspend tid={} count={} state={} by={} from={}", tid_,
+           suspend_count_, static_cast<int>(state_), current_thread_system_id(),
+           __builtin_return_address(0));
 
     // Check if we're trying to suspend ourselves
     bool is_current_thread = pthread_self() == thread_;
@@ -934,25 +1090,29 @@ class PosixCondition<Thread> final : public PosixConditionBase {
     }
 
     {
-      std::lock_guard lock(mutex_);
+      // Robust: a thread that died inside a wait on this condition (a
+      // guest thread terminated earlier in the same title teardown) may
+      // have been the last owner; a plain std::lock_guard would throw
+      // std::system_error(EOWNERDEAD) and abort the process.
+      RobustLock lock(mutex_);
 
       exit_code_ = exit_code;
       signaled_ = true;
-      cond_.notify_all();
+      cond_->notify_all();
     }
     if (is_current_thread) {
       pthread_exit(reinterpret_cast<void*>(exit_code));
     }
-#ifdef XE_PLATFORM_ANDROID
     if (pthread_kill(thread_, GetSystemSignal(SignalType::kThreadTerminate)) !=
         0) {
       assert_always();
     }
-#else
-    if (pthread_cancel(thread_) != 0) {
-      assert_always();
+    // The thread abandons its frames asynchronously and then runs the finish
+    // block in ThreadStartRoutine, which touches this object. Wait for it to
+    // be gone before the caller can release us.
+    if (!joined_.exchange(true)) {
+      pthread_join(thread_, nullptr);
     }
-#endif
   }
 
   void WaitStarted() const {
@@ -981,12 +1141,15 @@ class PosixCondition<Thread> final : public PosixConditionBase {
   static void* ThreadStartRoutine(void* parameter);
   bool signaled() const override { return signaled_; }
   void post_execution() override {
-    if (thread_) {
+    if (thread_ && !joined_.exchange(true)) {
       pthread_join(thread_, nullptr);
     }
     sem_destroy(&suspend_sem_);
   }
   pthread_t thread_;
+  sigjmp_buf exit_jump_;
+  std::atomic<bool> exit_jump_armed_{false};
+  std::atomic<bool> joined_{false};
   pid_t tid_ = 0;                     // Kernel TID for setpriority() fallback
   mutable bool fifo_failed_ = false;  // True after SCHED_FIFO was rejected
   bool signaled_;
@@ -1130,11 +1293,7 @@ class PosixEvent final : public PosixConditionHandle<Event> {
   ~PosixEvent() override = default;
   void Set() override { handle_.Signal(); }
   void Reset() override { handle_.Reset(); }
-  EventInfo Query() override {
-    EventInfo result{};
-    assert_always();
-    return result;
-  }
+  EventInfo Query() override { return handle_.Query(); }
   void Pulse() override {
     using namespace std::chrono_literals;
     handle_.Signal();
@@ -1202,6 +1361,9 @@ class PosixTimer final : public PosixConditionHandle<Timer> {
   }
   bool SetOnceAt(WClock_::time_point due_time,
                  std::function<void()> opt_callback = nullptr) override {
+    // A due time in the past fires at once; converting one far in the past
+    // to the steady clock overflows into the far future.
+    due_time = std::max(due_time, WClock_::now());
     return SetOnceAt(date::clock_cast<GClock_>(due_time),
                      std::move(opt_callback));
   };
@@ -1220,6 +1382,7 @@ class PosixTimer final : public PosixConditionHandle<Timer> {
   bool SetRepeatingAt(WClock_::time_point due_time,
                       std::chrono::milliseconds period,
                       std::function<void()> opt_callback = nullptr) override {
+    due_time = std::max(due_time, WClock_::now());
     return SetRepeatingAt(date::clock_cast<GClock_>(due_time), period,
                           std::move(opt_callback));
   }
@@ -1296,6 +1459,19 @@ class PosixThread final : public PosixConditionHandle<Thread> {
 
 thread_local PosixThread* current_thread_ = nullptr;
 
+static void PerformDeferredSuspend() {
+  if (current_thread_) {
+    current_thread_->WaitSuspended();
+  }
+}
+
+static void PerformDeferredTerminate() {
+  if (current_thread_) {
+    current_thread_->condition().ExitViaJump();
+  }
+  pthread_exit(reinterpret_cast<void*>(-1));
+}
+
 void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
 #if !XE_PLATFORM_ANDROID
   if (pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, nullptr) != 0) {
@@ -1319,17 +1495,35 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
     std::unique_lock lock(thread->handle_.state_mutex_);
     thread->handle_.state_ =
         create_suspended ? State::kSuspended : State::kRunning;
+    // The initial suspend count has to be published together with the
+    // state, before the notify. Resume() returns from WaitStarted() as soon
+    // as the state is set, and if it took the lock between that and a later
+    // "suspend_count_ = 1" it saw a count of zero, did nothing, and this
+    // thread then waited forever for a resume that had already happened.
+    if (create_suspended) {
+      thread->handle_.suspend_count_ = 1;
+    }
     thread->handle_.state_signal_.notify_all();
   }
 
   if (create_suspended) {
-    std::unique_lock lock(thread->handle_.state_mutex_);
-    thread->handle_.suspend_count_ = 1;
-    thread->handle_.state_signal_.wait(
-        lock, [thread] { return thread->handle_.suspend_count_ == 0; });
+    // Block on the same semaphore Resume() posts when the count reaches
+    // zero. A post that lands before this wait is not lost, and using the
+    // semaphore here means Resume()'s post is consumed rather than left
+    // behind for a later Suspend() to trip over.
+    thread->handle_.WaitSuspended();
   }
 
-  start_routine();
+  if (sigsetjmp(thread->handle_.exit_jump_, 1) == 0) {
+    thread->handle_.exit_jump_armed_.store(true);
+    start_routine();
+    thread->handle_.exit_jump_armed_.store(false);
+  } else {
+    // Terminated from another thread: everything below this frame has been
+    // abandoned, locks included. If it was blocked in a wait, that condvar
+    // now has a phantom waiter and must not be destroyed.
+    PosixConditionBase::MarkCurrentWaitAbandoned();
+  }
 
   {
     std::unique_lock lock(thread->handle_.state_mutex_);
@@ -1337,10 +1531,20 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
   }
 
   {
-    std::unique_lock lock(thread->handle_.mutex_);
+    // mutex_ is robust; a waiter on this thread that was itself terminated
+    // may have died holding it.
+    auto native_mutex =
+        static_cast<pthread_mutex_t*>(thread->handle_.mutex_.native_handle());
+    int lock_result = pthread_mutex_lock(native_mutex);
+    if (lock_result == EOWNERDEAD) {
+      pthread_mutex_consistent(native_mutex);
+    }
     thread->handle_.exit_code_ = 0;
     thread->handle_.signaled_ = true;
-    thread->handle_.cond_.notify_all();
+    thread->handle_.cond_->notify_all();
+    if (lock_result == 0 || lock_result == EOWNERDEAD) {
+      pthread_mutex_unlock(native_mutex);
+    }
   }
 
   current_thread_ = nullptr;
@@ -1351,9 +1555,7 @@ std::unique_ptr<Thread> Thread::Create(CreationParameters params,
                                        std::function<void()> start_routine) {
   install_signal_handler(SignalType::kThreadSuspend);
   install_signal_handler(SignalType::kThreadUserCallback);
-#if XE_PLATFORM_ANDROID
   install_signal_handler(SignalType::kThreadTerminate);
-#endif
   auto thread = std::make_unique<PosixThread>();
   if (!thread->Initialize(params, std::move(start_routine))) {
     return nullptr;
@@ -1408,6 +1610,11 @@ static void signal_handler(int signal, siginfo_t* info, void* context) {
         // before the thread has initialized or after it has exited
         return;
       }
+      if (suspend_deferral_depth_ > 0) {
+        // Inside a critical section: suspend when it is left instead.
+        suspend_deferred_ = true;
+        return;
+      }
       current_thread_->WaitSuspended();
     } break;
     case SignalType::kThreadUserCallback: {
@@ -1418,11 +1625,20 @@ static void signal_handler(int signal, siginfo_t* info, void* context) {
         p_thread->CallUserCallback();
       }
     } break;
-#if XE_PLATFORM_ANDROID
     case SignalType::kThreadTerminate: {
+      if (suspend_deferral_depth_ > 0) {
+        // Inside a critical section (holding one of our locks): abandon
+        // the thread when it leaves, not now, or the lock stays taken.
+        terminate_deferred_ = true;
+        // A suspend that was deferred too must not park the thread in the
+        // section; termination takes precedence at the exit.
+        return;
+      }
+      if (current_thread_) {
+        current_thread_->condition().ExitViaJump();
+      }
       pthread_exit(reinterpret_cast<void*>(-1));
     } break;
-#endif
     default:
       assert_always();
   }

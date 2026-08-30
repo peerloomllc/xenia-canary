@@ -9,6 +9,8 @@
 
 #include "xenia/apu/sdl/sdl_audio_system.h"
 
+#include "xenia/base/logging.h"
+
 #include "xenia/apu/apu_flags.h"
 #include "xenia/apu/sdl/sdl_audio_driver.h"
 
@@ -23,9 +25,28 @@ std::unique_ptr<AudioSystem> SDLAudioSystem::Create(cpu::Processor* processor) {
 SDLAudioSystem::SDLAudioSystem(cpu::Processor* processor)
     : AudioSystem(processor) {}
 
-SDLAudioSystem::~SDLAudioSystem() {}
+SDLAudioSystem::~SDLAudioSystem() {
+  if (sdl_audio_held_) {
+    SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    sdl_audio_held_ = false;
+  }
+}
 
-void SDLAudioSystem::Initialize() { AudioSystem::Initialize(); }
+void SDLAudioSystem::Initialize() {
+  // Hold the SDL audio subsystem for the life of the system. Each driver
+  // takes and drops its own reference; without this one the last driver's
+  // Shutdown quits the subsystem, which (through sdl2-compat and SDL3)
+  // tears down PipeWire and dlclose()s its modules. A save-state restore
+  // destroys and recreates every driver, and that dlclose deadlocked
+  // against the NVIDIA driver resolving symbols on the UI thread.
+  if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
+    sdl_audio_held_ = true;
+  } else {
+    XELOGW("SDLAudioSystem: SDL_InitSubSystem(AUDIO) failed: {}",
+           SDL_GetError());
+  }
+  AudioSystem::Initialize();
+}
 
 X_STATUS SDLAudioSystem::CreateDriver(size_t index,
                                       xe::threading::Semaphore* semaphore,

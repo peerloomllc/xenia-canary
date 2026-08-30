@@ -48,6 +48,12 @@ class AudioSystem {
                           size_t* out_index);
   void UnregisterClient(size_t index);
   void SubmitFrame(size_t index, float* samples);
+  // Frames the guest submitted to any client; --stats_log_seconds.
+  uint64_t submitted_frame_count() const {
+    return submitted_frame_count_.load();
+  }
+  // Of those, frames whose every sample was zero.
+  uint64_t silent_frame_count() const { return silent_frame_count_.load(); }
 
   // Creates an independent, non-registered driver instance.
   virtual AudioDriver* CreateDriver(xe::threading::Semaphore* semaphore,
@@ -91,6 +97,8 @@ class AudioSystem {
     bool in_use;
     std::mutex lock;
   } clients_[kMaximumClientCount];
+  std::atomic<uint64_t> submitted_frame_count_{0};
+  std::atomic<uint64_t> silent_frame_count_{0};
 
   int FindFreeClient();
 

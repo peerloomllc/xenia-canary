@@ -81,7 +81,7 @@ class GraphicsSystem {
   void EndTracing();
 
   bool is_paused() const { return paused_; }
-  void Pause();
+  void Pause(bool capture_edram = false);
   void Resume();
 
   bool Save(ByteStream* stream);

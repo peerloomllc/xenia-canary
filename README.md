@@ -16,6 +16,79 @@ We've got jobs/lives/etc, so don't expect instant answers.
 
 Discussing illegal activities will get you banned.
 
+## This fork: native Linux work (peerloomllc)
+
+This is [xenia-canary](https://github.com/xenia-canary/xenia-canary) at
+commit `9d08d64b5` plus fixes and features for the **native Linux build**
+(the Vulkan renderer, SDL audio, GTK UI), developed and tested on Fedora
+with an NVIDIA GPU, mainly with Lost Odyssey, Eternal Sonata and Blue
+Dragon. It is not affiliated with the Xenia project. The pieces that are
+general fixes are offered upstream as separate pull requests; everything
+else lives here. Branch: `linux-native-work`.
+
+**Fixes**
+
+* Guest threads sometimes never started on Linux (a resume lost between
+  the thread publishing "started" and setting its own suspend count):
+  Lost Odyssey hung at "Loading" about half the time. Upstream PR
+  [#1187](https://github.com/xenia-canary/xenia-canary/pull/1187).
+* Kernel timers with an absolute due time in the past never fired
+  (Eternal Sonata was silent).
+* The Linux mutex made a `gettid` syscall on every lock (39,000/s on the
+  GPU thread); the ring buffer read pointer was published to the guest
+  once per burst instead of as it advanced. Both cost frame rate.
+* Any ImGui dialog crashed the native build when fontconfig picked a CFF
+  CJK font.
+* A title opened in the first seconds after the window appeared
+  deadlocked the UI thread.
+
+**Features**
+
+* Save states: F8 saves, F10 loads, PageUp/PageDown pick one of nine
+  slots per title (per disc for multi-disc titles), with a thumbnail and
+  a slot table. LZ4-compressed files; the game pauses for a few hundred
+  milliseconds. Guest memory, threads, kernel objects, the guest clock,
+  GPU registers and EDRAM, XMA decoder state, the media player, mounted
+  DLC and the signed-in profile are in the file. Single-player only;
+  nothing online is saved.
+* Pause (F7), fast-forward and slow-motion (numpad + - *) with
+  time-stretched audio (SoundTouch), mute (Delete), an FPS overlay, all
+  reassignable in-app.
+* A GTK Preferences window (Settings menu): Graphics (output, colour
+  filters, accuracy, performance), Audio, Input, Folders (games, content,
+  save states), Patches (per-game patch toggles, lookup and download from
+  the community patch repository), Profiles, Console.
+* A game library dashboard when no title runs: scanned games folder,
+  icons, list or grid view, launch.
+* Menus: File, Emulation, Settings, Tools, Help; Reset Game and Close
+  Game; the advanced GPU options in a dialog; per-title content listing.
+* Diagnostic flags for guest-side investigation (`--stack_dump_interval_seconds`,
+  `--watch_guest_pointer`, `--find_guest_refs`, `--find_guest_pattern`,
+  `--poke_guest_memory`, `--trace_event_handles`, `--stats_log_seconds`,
+  `--log_wait_reg_mem`); a save-state hang leaves the stalled thread's
+  stack in the log.
+
+**Building on Fedora (44)**
+
+```sh
+sudo dnf install clang cmake ninja-build python3 gtk3-devel lz4-devel sdl2-compat-devel \
+    vulkan-loader-devel spirv-tools glslang libunwind-devel alsa-lib-devel libX11-devel
+git clone --recursive -b linux-native-work https://github.com/peerloomllc/xenia-canary.git
+cd xenia-canary
+export CC=/usr/bin/clang CXX=/usr/bin/clang++
+./xb build --config=release
+build/bin/Linux/Release/xenia_canary --gpu=vulkan --apu=sdl
+```
+
+Other distributions: the same libraries under their own names; see
+[docs/building.md](docs/building.md) for the Ubuntu package list. Releases
+carry a binary built on Fedora 44 (glibc 2.43); it needs the GTK 3, SDL2,
+Vulkan loader, lz4, libunwind and ALSA runtime libraries.
+
+**Support development**: https://peerloomllc.com/about/
+
+---
+
 ## Status
 
 Buildbot | Status | Releases

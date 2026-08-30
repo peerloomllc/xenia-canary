@@ -103,6 +103,8 @@ class alignas(4096) xe_global_mutex {
   void lock();
   void unlock();
   bool try_lock();
+  // Diagnostics only: the system thread id of the owner, 0 when free.
+  pid_t owner() const { return owner_.load(std::memory_order_relaxed); }
 };
 using global_mutex_type = xe_global_mutex;
 

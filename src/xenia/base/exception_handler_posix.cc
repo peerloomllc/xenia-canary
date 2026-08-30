@@ -9,6 +9,12 @@
 
 #include "xenia/base/exception_handler.h"
 
+#include <unistd.h>
+
+#include <sys/syscall.h>
+
+#include <cstdio>
+
 #include <signal.h>
 #include <cstdint>
 
@@ -32,9 +38,36 @@ constexpr size_t kMaxHandlerCount = 8;
 // All custom handlers, left-aligned and null terminated.
 // Executed in order.
 std::pair<ExceptionHandler::Handler, void*> handlers_[kMaxHandlerCount];
+thread_local uint64_t* exception_pc_slot_ = nullptr;
+
+void ExceptionHandler::SetThreadExceptionPcSlot(uint64_t* slot) {
+  exception_pc_slot_ = slot;
+}
 
 static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
                                      void* signal_context) {
+  // Publish the faulting PC for the whole handler (see
+  // SetThreadExceptionPcSlot) before any of the context copying below.
+  struct SlotScope {
+    uint64_t previous = 0;
+    SlotScope(void* ctx) {
+      if (exception_pc_slot_) {
+        previous = *exception_pc_slot_;  // Nested fault inside a handler.
+#if XE_ARCH_AMD64
+        *exception_pc_slot_ = uint64_t(
+            static_cast<ucontext_t*>(ctx)->uc_mcontext.gregs[REG_RIP]);
+#else
+        *exception_pc_slot_ = 1;
+#endif
+      }
+    }
+    ~SlotScope() {
+      if (exception_pc_slot_) {
+        *exception_pc_slot_ = previous;
+      }
+    }
+  } slot_scope(signal_context);
+
   mcontext_t& mcontext =
       reinterpret_cast<ucontext_t*>(signal_context)->uc_mcontext;
 

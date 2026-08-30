@@ -78,6 +78,22 @@ size_t BitMap::AcquireFromBack() {
   return -1LL;
 }
 
+bool BitMap::AcquireAt(size_t index) {
+  auto slot = index / kDataSizeBits;
+  index -= slot * kDataSizeBits;
+  uint64_t bit = 1ull << (kDataSizeBits - index - 1);
+  uint64_t entry = 0;
+  uint64_t new_entry = 0;
+  do {
+    entry = data_[slot];
+    if (!(entry & bit)) {
+      return false;  // Already taken.
+    }
+    new_entry = entry & ~bit;
+  } while (!xe::atomic_cas(entry, new_entry, &data_[slot]));
+  return true;
+}
+
 void BitMap::Release(size_t index) {
   auto slot = index / kDataSizeBits;
   index -= slot * kDataSizeBits;

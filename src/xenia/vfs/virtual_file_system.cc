@@ -137,9 +137,18 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
     normalized_path = resolved_path;
   }
 
-  // Find the device.
+  // Find the device. A path naming the mount point itself without the
+  // trailing separator ("\Device\Content\5" for the device mounted at
+  // "\Device\Content\5\") is the device root: OpenFile looks up the parent
+  // directory that way when it opens by absolute path.
   auto it = std::ranges::find_if(std::as_const(devices_), [&](const auto& d) {
-    return xe::utf8::starts_with(normalized_path, d->mount_path());
+    const auto& mount = d->mount_path();
+    if (xe::utf8::starts_with(normalized_path, mount)) {
+      return true;
+    }
+    return !mount.empty() && (mount.back() == '\\' || mount.back() == '/') &&
+           normalized_path.size() + 1 == mount.size() &&
+           xe::utf8::starts_with(mount, normalized_path);
   });
   if (it == devices_.cend()) {
     // Supress logging the error for ShaderDumpxe:\CompareBackEnds as this is
@@ -151,7 +160,10 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
   }
 
   const auto& device = *it;
-  auto relative_path = normalized_path.substr(device->mount_path().size());
+  auto relative_path =
+      normalized_path.size() >= device->mount_path().size()
+          ? normalized_path.substr(device->mount_path().size())
+          : std::string();
   return device->ResolvePath(relative_path);
 }
 

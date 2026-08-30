@@ -71,6 +71,35 @@ bool GtkFilePicker::Show(Window* parent_window) {
       action, "_Cancel", GTK_RESPONSE_CANCEL, confirm_button.c_str(),
       GTK_RESPONSE_ACCEPT, NULL);
 
+  if (!this->title().empty()) {
+    gtk_window_set_title(GTK_WINDOW(dialog), this->title().c_str());
+  }
+  if (!default_path().empty()) {
+    std::error_code ec;
+    if (std::filesystem::is_directory(default_path(), ec)) {
+      gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(dialog),
+                                          default_path().string().c_str());
+    }
+  }
+  if (type() == Type::kFile) {
+    for (const auto& [name, patterns] : extensions()) {
+      GtkFileFilter* filter = gtk_file_filter_new();
+      gtk_file_filter_set_name(filter, name.c_str());
+      // "*.iso;*.xex" -> one pattern each.
+      size_t start = 0;
+      while (start <= patterns.size()) {
+        size_t end = patterns.find(';', start);
+        if (end == std::string::npos) end = patterns.size();
+        if (end > start) {
+          gtk_file_filter_add_pattern(
+              filter, patterns.substr(start, end - start).c_str());
+        }
+        start = end + 1;
+      }
+      gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), filter);
+    }
+  }
+
   gint res = gtk_dialog_run(GTK_DIALOG(dialog));
   char* filename;
   if (res == GTK_RESPONSE_ACCEPT) {

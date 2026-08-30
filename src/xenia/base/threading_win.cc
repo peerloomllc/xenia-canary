@@ -641,3 +641,13 @@ void Thread::Exit(int exit_code) { ExitThread(exit_code); }
 
 }  // namespace threading
 }  // namespace xe
+
+namespace xe {
+namespace threading {
+void SetThreadBlockingWaitSlot(bool* slot) {}
+void BeginSuspendDeferral() {}
+void EndSuspendDeferral() {}
+SuspendDeferralScope::SuspendDeferralScope() {}
+SuspendDeferralScope::~SuspendDeferralScope() {}
+}  // namespace threading
+}  // namespace xe

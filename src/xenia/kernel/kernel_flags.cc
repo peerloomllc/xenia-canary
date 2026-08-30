@@ -14,3 +14,11 @@ DEFINE_bool(headless, false,
             "UI");
 DEFINE_bool(log_high_frequency_kernel_calls, false,
             "Log kernel calls with the kHighFrequency tag.", "Logging");
+DEFINE_string(
+    trace_event_handles, "",
+    "Trace event object operations (create/set/clear/pulse/wait) at info "
+    "level, outside the high-frequency gate. Comma-separated hex handles, or "
+    "'all' for every event object. Each line carries a global sequence number "
+    "and a microsecond timestamp so interleavings between threads can be "
+    "reconstructed.",
+    "Logging");

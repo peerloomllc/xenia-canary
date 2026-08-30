@@ -72,7 +72,17 @@ void HostNotificationWindow::OnDraw(ImGuiIO& io) {
     return;
   }
 
-  ImGui::SetNextWindowPos(notification_position);
+  if (GetPositionId() == 10) {
+    // RIGHT-BOTTOM, the host default: 10 px from the corner, the margin of
+    // the FPS/MUTED indicator in the top-left, anchored by the window's real
+    // size (the estimate above is only for the other positions).
+    const float margin = 10.0f;
+    ImGui::SetNextWindowPos(
+        ImVec2(screen_size.x - margin, screen_size.y - margin),
+        ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+  } else {
+    ImGui::SetNextWindowPos(notification_position);
+  }
 
   ImGui::Begin("Notification Window", NULL, NOTIFY_TOAST_FLAGS);
   {

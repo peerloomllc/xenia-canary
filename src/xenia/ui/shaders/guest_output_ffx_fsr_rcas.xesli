@@ -9,6 +9,8 @@
 
 #include "xesl.xesli"
 
+#include "color_adjust.xesli"
+
 #include "amd_language.xesli"
 
 #if XE_GUEST_OUTPUT_DITHER
@@ -20,6 +22,7 @@ push_const_begin_xe(b0, space0)
   // stages).
   block_offset_member_xe(16, c0.x, int2_xe, xe_fsr_rcas_output_offset)
   block_offset_member_xe(24, c0.z, float, xe_fsr_rcas_sharpness_post_setup)
+  block_offset_member_xe(32, c1.x, float4_xe, xe_fsr_rcas_color_adjust)
 push_const_end_xe
 
 // FIXME(Triang3l): This approach doesn't work for MSL - the texture must be
@@ -52,6 +55,8 @@ entry_inputs_end_code_begin_xe
                pack_half_2x16_xe(float2_xe(sharpness, sharpness)), 0u, 0u);
   float4_xe rcas_color;
   FsrRcasF(rcas_color.r, rcas_color.g, rcas_color.b, pixel_coord, rcas_const);
+  rcas_color.rgb = XeColorAdjust(rcas_color.rgb,
+                                 push_const_xe(xe_fsr_rcas_color_adjust));
   #if XE_GUEST_OUTPUT_DITHER
     // Clamping because on Vulkan, the surface may specify any format, including
     // floating-point.

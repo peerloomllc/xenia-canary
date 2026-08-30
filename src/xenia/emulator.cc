@@ -7,7 +7,14 @@
  ******************************************************************************
  */
 
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <cstdio>
 #include <ranges>
+#include <thread>
+
+#include <lz4.h>
 
 #include "xenia/emulator.h"
 
@@ -18,6 +25,8 @@
 #include "third_party/zarchive/include/zarchive/zarchivewriter.h"
 #include "third_party/zarchive/src/sha_256.h"
 #include "xenia/apu/audio_system.h"
+#include "xenia/apu/audio_driver.h"
+#include "xenia/apu/xma_context.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
@@ -29,11 +38,16 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/mapped_memory.h"
 #include "xenia/base/platform.h"
+#if XE_PLATFORM_LINUX
+#include <pthread.h>
+#endif
 #include "xenia/base/string.h"
 #include "xenia/base/system.h"
 #include "xenia/cpu/backend/code_cache.h"
 #include "xenia/cpu/backend/null_backend.h"
 #include "xenia/cpu/cpu_flags.h"
+#include "xenia/cpu/processor.h"
+#include "xenia/cpu/stack_walker.h"
 #include "xenia/cpu/thread_state.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/graphics_system.h"
@@ -68,6 +82,53 @@
 #include "xenia/cpu/backend/a64/a64_backend.h"
 #endif  // XE_ARCH
 
+DEFINE_int32(stats_log_seconds, 0,
+             "Diagnostic: every N seconds log frames presented, audio frames "
+             "submitted, XMA packets decoded and SDL audio callbacks (with "
+             "how many went out silent). 0 = off.",
+             "General");
+DEFINE_int32(
+    savestate_experiment_save_seconds, 0,
+    "Experiment: N seconds after launch, call Emulator::SaveToFile on the "
+    "path in --savestate_experiment_path from a host thread.",
+    "General");
+DEFINE_int32(
+    savestate_experiment_restore_seconds, 0,
+    "Experiment: N seconds after launch, call Emulator::RestoreFromFile on "
+    "the same path. Must be later than the save.",
+    "General");
+DEFINE_string(savestate_experiment_path, "xenia_experiment.sav",
+              "Experiment: save state path.", "General");
+DEFINE_int32(savestate_experiment_cycles, 1,
+             "Experiment: repeat the save+restore sequence this many times, "
+             "20 s apart.", "General");
+DEFINE_int32(savestate_experiment_restore_repeat, 1,
+             "Experiment: how many times to restore, 20 s apart.", "General");
+DEFINE_string(savestate_experiment_preload_path, "",
+              "Experiment: a state to restore at "
+              "--savestate_experiment_preload_seconds, before the save/restore "
+              "cycle; gets the game somewhere a title-screen timer cannot.",
+              "General");
+DEFINE_int32(savestate_experiment_preload_seconds, 0,
+             "Experiment: when to restore --savestate_experiment_preload_path.",
+             "General");
+DEFINE_bool(savestate_experiment_restore_only, false,
+            "Experiment: skip the save; only restore "
+            "--savestate_experiment_path at "
+            "--savestate_experiment_restore_seconds.",
+            "General");
+DEFINE_bool(savestate_experiment_step_only, false,
+            "Experiment: at --savestate_experiment_save_seconds, only Pause, "
+            "step every guest thread to a safe point and Resume; write no "
+            "file. The smallest reproduction of a save disturbing the game.",
+            "General");
+DEFINE_int32(pause_experiment_pause_seconds, 0,
+             "Experiment: N seconds after launch, call Emulator::Pause() "
+             "from a host thread (what the pause hotkey does).",
+             "General");
+DEFINE_int32(pause_experiment_resume_seconds, 0,
+             "Experiment: N seconds after launch, call Emulator::Resume().",
+             "General");
 DEFINE_double(time_scalar, 1.0,
               "Scalar used to speed or slow time (1x, 2x, 1/2x, etc).",
               "General");
@@ -691,6 +752,14 @@ X_STATUS Emulator::LaunchDefaultModule(const std::filesystem::path& path) {
   return result;
 }
 
+void Emulator::set_content_root(const std::filesystem::path& content_root) {
+  content_root_ = content_root;
+  if (kernel_state_ && kernel_state_->content_manager()) {
+    kernel_state_->content_manager()->set_root_path(content_root);
+  }
+  XELOGI("Content root: {}", content_root_);
+}
+
 X_STATUS Emulator::DataMigration(const uint64_t xuid) {
   uint32_t failure_count = 0;
   const std::string xuid_string = fmt::format("{:016X}", xuid);
@@ -1166,14 +1235,15 @@ X_STATUS Emulator::CreateZarchivePackage(
   return X_STATUS_SUCCESS;
 }
 
-void Emulator::Pause() {
+void Emulator::Pause(bool capture_edram) {
+  XELOGI("anchor xe::FlushLog at {}", reinterpret_cast<void*>(&xe::FlushLog));
   if (paused_) {
     return;
   }
   paused_ = true;
 
   // Don't hold the lock on this (so any waits follow through)
-  graphics_system_->Pause();
+  graphics_system_->Pause(capture_edram);
   audio_system_->Pause();
 
   auto lock = global_critical_region::AcquireDirect();
@@ -1190,11 +1260,22 @@ void Emulator::Pause() {
     }
 
     if (thread->is_running()) {
-      thread->thread()->Suspend(nullptr);
+      uint32_t previous_count = 0;
+      thread->thread()->Suspend(&previous_count);
+      if (previous_count != 0) {
+        XELOGW("Pause: thread {:08X} '{}' was already suspended (count {})",
+               thread->handle(), thread->name(), previous_count);
+      }
+      paused_threads_.push_back(thread);
     }
   }
 
-  XELOGD("! EMULATOR PAUSED !");
+  XELOGI("! EMULATOR PAUSED ! ({} guest threads suspended)",
+         paused_threads_.size());
+  // Listeners may post to the UI thread; never do that while holding the
+  // global critical region.
+  lock.unlock();
+  on_pause_state_changed(true);
 }
 
 void Emulator::Resume() {
@@ -1202,37 +1283,247 @@ void Emulator::Resume() {
     return;
   }
   paused_ = false;
-  XELOGD("! EMULATOR RESUMED !");
 
   graphics_system_->Resume();
   audio_system_->Resume();
 
-  auto threads =
-      kernel_state()->object_table()->GetObjectsByType<kernel::XThread>(
-          kernel::XObject::Type::Thread);
-  for (auto thread : threads) {
-    if (!thread->can_debugger_suspend()) {
-      // Don't pause host threads.
-      continue;
-    }
-
-    if (!thread->is_running()) {
-      thread->thread()->Resume(nullptr);
-    }
+  // Resume exactly the threads Pause() suspended. The previous version
+  // resumed every thread that was *not* running (exited ones) and left the
+  // suspended ones suspended, so the title never came back.
+  for (auto& thread : paused_threads_) {
+    thread->thread()->Resume(nullptr);
   }
+  XELOGI("! EMULATOR RESUMED ! ({} guest threads resumed)",
+         paused_threads_.size());
+  paused_threads_.clear();
+  on_pause_state_changed(false);
 }
 
-bool Emulator::SaveToFile(const std::filesystem::path& path) {
+bool Emulator::StepAllGuestThreads() {
   Pause();
+  auto threads =
+      kernel_state_->object_table()->GetObjectsByType<kernel::XThread>();
+  size_t stepped = 0, failed = 0;
+  for (auto thread : threads) {
+    if (!thread->is_guest_thread() || !thread->is_running()) {
+      continue;
+    }
+    uint32_t pc = processor_->StepToGuestSafePoint(thread->thread_id());
+    XELOGI("STEP EXPERIMENT: thread {:08X} id={} '{}' -> pc {:08X}",
+           thread->handle(), thread->thread_id(), thread->name(), pc);
+    if (pc) {
+      ++stepped;
+    } else {
+      ++failed;
+    }
+  }
+  XELOGI("STEP EXPERIMENT: {} stepped, {} failed", stepped, failed);
+  Resume();
+  return failed == 0;
+}
 
-  filesystem::CreateEmptyFile(path);
-  auto map = MappedMemory::Open(path, MappedMemory::Mode::kReadWrite, 0, 2_GiB);
-  if (!map) {
+namespace {
+
+// Format 2 container: this header, then chunk_count chunks of the serialised
+// state, each preceded by a SaveStateChunkHeader. A chunk whose stored_size
+// equals its raw_size is stored as-is (LZ4 could not shrink it).
+struct SaveStateContainerHeader {
+  uint32_t signature;  // kSaveStateContainerSignature
+  uint32_t version;    // kSaveStateFormatVersion of the writer
+  uint32_t flags;      // kSaveStateFlagLz4
+  uint32_t chunk_size;
+  uint64_t raw_size;  // serialised state size
+  uint32_t chunk_count;
+  uint32_t has_title_id;
+  uint32_t title_id;
+  uint32_t reserved;
+  // Format 3 and later; a format 2 header ends above.
+  uint32_t media_id;
+  uint8_t disc_number;
+  uint8_t disc_count;
+  uint16_t reserved2;
+  // Format 6 and later: the guest clock at the save.
+  uint64_t guest_tick_count;
+  uint64_t guest_system_time;
+};
+constexpr size_t kSaveStateHeaderSizeV2 = 40;
+constexpr size_t kSaveStateHeaderSizeV3 = 48;
+static_assert(sizeof(SaveStateContainerHeader) == 64);
+
+size_t SaveStateHeaderSize(uint32_t version) {
+  if (version >= 6) return sizeof(SaveStateContainerHeader);
+  if (version >= 3) return kSaveStateHeaderSizeV3;
+  return kSaveStateHeaderSizeV2;
+}
+
+// Reads the container header (or the legacy stream's start). The file is
+// left positioned after the header. Returns false if it is not a save state.
+bool ReadSaveStateHeader(FILE* file, SaveStateContainerHeader* header,
+                         uint32_t* out_legacy_title_id,
+                         bool* out_legacy_has_title_id) {
+  uint32_t signature = 0;
+  xe::filesystem::Seek(file, 0, SEEK_SET);
+  if (fread(&signature, sizeof(signature), 1, file) != 1) {
+    return false;
+  }
+  *header = {};
+  if (signature == kEmulatorSaveSignature) {
+    // Legacy: signature, bool has_title_id, u32 title_id.
+    uint8_t has_title_id = 0;
+    uint32_t title_id = 0;
+    if (fread(&has_title_id, 1, 1, file) != 1 ||
+        (has_title_id && fread(&title_id, 4, 1, file) != 1)) {
+      return false;
+    }
+    header->signature = signature;
+    header->version = 1;
+    header->has_title_id = has_title_id;
+    header->title_id = has_title_id ? title_id : 0;
+    if (out_legacy_title_id) *out_legacy_title_id = title_id;
+    if (out_legacy_has_title_id) *out_legacy_has_title_id = has_title_id;
+    return true;
+  }
+  if (signature != kSaveStateContainerSignature) {
+    return false;
+  }
+  xe::filesystem::Seek(file, 0, SEEK_SET);
+  if (fread(header, kSaveStateHeaderSizeV2, 1, file) != 1) {
+    return false;
+  }
+  if (header->version >= 3) {
+    size_t rest = SaveStateHeaderSize(header->version) - kSaveStateHeaderSizeV2;
+    if (fread(reinterpret_cast<uint8_t*>(header) + kSaveStateHeaderSizeV2,
+              rest, 1, file) != 1) {
+      return false;
+    }
+  }
+  return true;
+}
+
+struct SaveStateChunkHeader {
+  uint32_t stored_size;
+  uint32_t raw_size;
+};
+
+constexpr uint32_t kSaveStateFlagLz4 = 1u << 0;
+constexpr uint32_t kSaveStateChunkSize = uint32_t(4_MiB);
+
+int64_t ElapsedMs(std::chrono::steady_clock::time_point since) {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now() - since)
+      .count();
+}
+
+}  // namespace
+
+uint8_t* Emulator::AcquireStateBuffer() {
+  if (!state_buffer_) {
+    for (size_t size : {size_t(4_GiB), size_t(2_GiB)}) {
+      state_buffer_ = reinterpret_cast<uint8_t*>(memory::AllocFixed(
+          nullptr, size, memory::AllocationType::kReserveCommit,
+          memory::PageAccess::kReadWrite));
+      if (state_buffer_) {
+        state_buffer_size_ = size;
+        break;
+      }
+    }
+  }
+  return state_buffer_;
+}
+
+namespace {
+// Logs the saving thread's whereabouts every 10 s until destroyed.
+class SaveWatchdog {
+ public:
+  explicit SaveWatchdog(cpu::Processor* processor) : processor_(processor) {
+#if XE_PLATFORM_LINUX
+    saver_ = pthread_self();
+#endif
+    thread_ = std::thread([this]() { Run(); });
+  }
+  ~SaveWatchdog() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      done_ = true;
+    }
+    cv_.notify_all();
+    thread_.join();
+  }
+
+ private:
+  void Run() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    int seconds = 0;
+    while (!cv_.wait_for(lock, std::chrono::seconds(10),
+                         [this]() { return done_; })) {
+      seconds += 10;
+      lock.unlock();
+      std::string where;
+#if XE_PLATFORM_LINUX
+      uint64_t pcs[32];
+      cpu::StackFrame frames[32];
+      size_t count = processor_->stack_walker()->CaptureStackTrace(
+          reinterpret_cast<void*>(saver_), pcs, 0, xe::countof(pcs), nullptr,
+          nullptr);
+      processor_->stack_walker()->ResolveStack(pcs, frames, count);
+      for (size_t i = 0; i < count; ++i) {
+        bool guest = frames[i].type == cpu::StackFrame::Type::kGuest;
+        where += fmt::format(
+            " [{}:{}{:08X}{}{}]", i, guest ? "g" : "h",
+            guest ? uint64_t(frames[i].guest_pc) : uint64_t(frames[i].host_pc),
+            frames[i].host_symbol.name[0] ? " " : "",
+            frames[i].host_symbol.name);
+      }
+      if (!count) {
+        where = " (saver stack not captured)";
+      }
+#endif
+      XELOGE("SaveToFile watchdog: still paused after {} s{}; saver at{}",
+             seconds, cpu::Processor::DescribeGlobalLockOwner(), where);
+      lock.lock();
+    }
+  }
+
+  cpu::Processor* processor_;
+#if XE_PLATFORM_LINUX
+  pthread_t saver_ = 0;
+#endif
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  bool done_ = false;
+  std::thread thread_;
+};
+}  // namespace
+
+bool Emulator::SaveToFile(const std::filesystem::path& path,
+                          std::function<void()> on_resumed) {
+  std::lock_guard<std::mutex> buffer_lock(state_buffer_mutex_);
+  last_save_error_.clear();
+  // A system dialog (message box, keyboard) completes a guest request from
+  // the host UI thread; a state saved while one is up would wait for that
+  // completion forever.
+  if (kernel_state_ && kernel_state_->xam_state() &&
+      kernel_state_->xam_state()->IsUIActive()) {
+    last_save_error_ = "a system dialog is open; close it first";
+    XELOGE("SaveToFile: {}", last_save_error_);
+    return false;
+  }
+  uint8_t* buffer = AcquireStateBuffer();
+  if (!buffer) {
+    XELOGE("SaveToFile: could not reserve the staging buffer");
     return false;
   }
 
-  // Save the emulator state to a file
-  ByteStream stream(map->data(), map->size());
+  // Serialise into memory while the game is stopped; compress and write
+  // after it is running again. The GPU reads its EDRAM back first.
+  auto t0 = std::chrono::steady_clock::now();
+  // A save that stops making progress freezes the game with it (one hotkey
+  // save stalled after "XThread ... serializing", notes/40). Every 10 s of
+  // pause this logs where the saving thread is and who owns the global
+  // critical region, so the next such stall leaves evidence.
+  SaveWatchdog watchdog(processor_.get());
+  Pause(true);
+  ByteStream stream(buffer, state_buffer_size_);
   stream.Write(kEmulatorSaveSignature);
   stream.Write(title_id_.has_value());
   if (title_id_.has_value()) {
@@ -1241,36 +1532,238 @@ bool Emulator::SaveToFile(const std::filesystem::path& path) {
 
   // It's important we don't hold the global lock here! XThreads need to step
   // forward (possibly through guarded regions) without worry!
-  processor_->Save(&stream);
-  graphics_system_->Save(&stream);
-  audio_system_->Save(&stream);
-  kernel_state_->Save(&stream);
-  memory_->Save(&stream);
-  map->Close(stream.offset());
-
+  save_memory_fixups_.clear();
+  bool ok = processor_->Save(&stream) && graphics_system_->Save(&stream) &&
+            audio_system_->Save(&stream) &&
+            audio_media_player_->Save(&stream) &&  // format 8
+            kernel_state_->Save(&stream);
+  if (ok) {
+    // Threads saved inside RtlEnterCriticalSection's wait: their increment
+    // of the lock count leaves the image (the re-issued call restores it)
+    // and comes back for the live session right after.
+    for (const auto& [address, delta] : save_memory_fixups_) {
+      *memory_->TranslateVirtual<int32_t*>(address) += delta;
+    }
+    XELOGI("SaveToFile: memory section at raw offset {}", stream.offset());
+    ok = memory_->Save(&stream);
+    for (const auto& [address, delta] : save_memory_fixups_) {
+      *memory_->TranslateVirtual<int32_t*>(address) -= delta;
+    }
+    if (!save_memory_fixups_.empty()) {
+      XELOGI("SaveToFile: {} lock count(s) adjusted in the image",
+             save_memory_fixups_.size());
+    }
+    save_memory_fixups_.clear();
+  }
+  if (!ok && last_save_error_.empty()) {
+    last_save_error_ =
+        "a guest thread could not be stopped at a safe point (see the log)";
+  }
+  const uint64_t raw_size = stream.offset();
+  // The guest clock at the save, so a restore continues from it.
+  const uint64_t guest_tick_count = Clock::QueryGuestTickCount();
+  const uint64_t guest_system_time = Clock::QueryGuestSystemTime();
   Resume();
+  const int64_t paused_ms = ElapsedMs(t0);
+  if (on_resumed) {
+    on_resumed();
+  }
+  if (!ok) {
+    XELOGE("SaveToFile: save failed after {} ms paused, previous state kept",
+           paused_ms);
+    return false;
+  }
+
+  // Write to a temporary file and rename at the end, so a failed write
+  // leaves the previous state untouched.
+  auto t1 = std::chrono::steady_clock::now();
+  std::filesystem::path temp_path = path;
+  temp_path += ".tmp";
+  std::error_code ec;
+  FILE* file = filesystem::OpenFile(temp_path, "wb");
+  if (!file) {
+    XELOGE("SaveToFile: could not create {}", temp_path.string());
+    return false;
+  }
+
+  SaveStateContainerHeader header = {};
+  header.signature = kSaveStateContainerSignature;
+  header.version = kSaveStateFormatVersion;
+  header.flags = kSaveStateFlagLz4;
+  header.chunk_size = kSaveStateChunkSize;
+  header.raw_size = raw_size;
+  header.chunk_count =
+      uint32_t((raw_size + kSaveStateChunkSize - 1) / kSaveStateChunkSize);
+  header.has_title_id = title_id_.has_value() ? 1 : 0;
+  header.title_id = title_id_.value_or(0);
+  header.media_id = media_id_;
+  header.disc_number = disc_number_;
+  header.disc_count = disc_count_;
+  header.guest_tick_count = guest_tick_count;
+  header.guest_system_time = guest_system_time;
+
+  bool write_ok = fwrite(&header, sizeof(header), 1, file) == 1;
+  std::vector<uint8_t> compressed(LZ4_compressBound(kSaveStateChunkSize));
+  uint64_t stored_total = 0;
+  for (uint64_t offset = 0; write_ok && offset < raw_size;
+       offset += kSaveStateChunkSize) {
+    SaveStateChunkHeader chunk;
+    chunk.raw_size = uint32_t(std::min<uint64_t>(kSaveStateChunkSize,
+                                                 raw_size - offset));
+    int n = LZ4_compress_default(
+        reinterpret_cast<const char*>(buffer + offset),
+        reinterpret_cast<char*>(compressed.data()), int(chunk.raw_size),
+        int(compressed.size()));
+    const uint8_t* src = buffer + offset;
+    chunk.stored_size = chunk.raw_size;
+    if (n > 0 && uint32_t(n) < chunk.raw_size) {
+      chunk.stored_size = uint32_t(n);
+      src = compressed.data();
+    }
+    write_ok = fwrite(&chunk, sizeof(chunk), 1, file) == 1 &&
+               fwrite(src, 1, chunk.stored_size, file) == chunk.stored_size;
+    stored_total += chunk.stored_size;
+  }
+  write_ok = (fclose(file) == 0) && write_ok;
+
+  if (!write_ok) {
+    XELOGE("SaveToFile: writing {} failed, removed, previous state kept",
+           temp_path.string());
+    std::filesystem::remove(temp_path, ec);
+    return false;
+  }
+  std::filesystem::rename(temp_path, path, ec);
+  if (ec) {
+    XELOGE("SaveToFile: could not rename {} to {}: {}", temp_path.string(),
+           path.string(), ec.message());
+    std::filesystem::remove(temp_path, ec);
+    return false;
+  }
+  XELOGI(
+      "SaveToFile: {} bytes serialised in {} ms paused; {} chunks, {} bytes "
+      "on disk ({:.2f}x), compressed and written in {} ms",
+      raw_size, paused_ms, header.chunk_count, stored_total,
+      stored_total ? double(raw_size) / double(stored_total) : 0.0,
+      ElapsedMs(t1));
   return true;
 }
 
 bool Emulator::RestoreFromFile(const std::filesystem::path& path) {
-  // Restore the emulator state from a file
-  auto map = MappedMemory::Open(path, MappedMemory::Mode::kReadWrite);
-  if (!map) {
+  std::lock_guard<std::mutex> buffer_lock(state_buffer_mutex_);
+  restore_warnings_.clear();
+
+  // Get the serialised stream into memory: a format 1 file is mapped as it
+  // is, a format 2 container is decompressed into the staging buffer. All
+  // of this happens before the running title is touched, so a bad file
+  // fails without terminating the game.
+  std::unique_ptr<MappedMemory> map;
+  uint8_t* data = nullptr;
+  size_t size = 0;
+  uint32_t version = 1;
+
+  FILE* file = filesystem::OpenFile(path, "rb");
+  if (!file) {
+    XELOGE("RestoreFromFile: could not open {}", path.string());
     return false;
   }
-
-  restoring_ = true;
-
-  // Terminate any loaded titles.
-  Pause();
-  kernel_state_->TerminateTitle();
-
-  auto lock = global_critical_region::AcquireDirect();
-  ByteStream stream(map->data(), map->size());
-  if (stream.Read<uint32_t>() != kEmulatorSaveSignature) {
+  SaveStateContainerHeader header = {};
+  if (!ReadSaveStateHeader(file, &header, nullptr, nullptr)) {
+    fclose(file);
+    XELOGE("RestoreFromFile: {} is not a save state", path.string());
     return false;
   }
+  if (header.version == 1) {
+    fclose(file);
+    map = MappedMemory::Open(path, MappedMemory::Mode::kReadWrite);
+    if (!map) {
+      return false;
+    }
+    data = map->data();
+    size = map->size();
+  } else {
+    auto t0 = std::chrono::steady_clock::now();
+    if (header.version > kSaveStateFormatVersion) {
+      fclose(file);
+      XELOGE(
+          "RestoreFromFile: {} is format {}, this build reads up to format {}",
+          path.string(), header.version, kSaveStateFormatVersion);
+      return false;
+    }
+    if (header.flags & ~kSaveStateFlagLz4) {
+      fclose(file);
+      XELOGE("RestoreFromFile: {} uses unknown flags {:08X}", path.string(),
+             header.flags);
+      return false;
+    }
+    SaveStateFileInfo info;
+    info.version = header.version;
+    info.title_id = header.has_title_id ? header.title_id : 0;
+    info.media_id = header.media_id;
+    info.disc_number = header.disc_number;
+    info.disc_count = header.disc_count;
+    info.raw_size = header.raw_size;
+    std::string mismatch = SaveStateMismatch(info);
+    if (!mismatch.empty()) {
+      fclose(file);
+      XELOGE("RestoreFromFile: {}: {}", path.string(), mismatch);
+      return false;
+    }
+    uint8_t* buffer = AcquireStateBuffer();
+    if (!buffer || header.raw_size > state_buffer_size_ ||
+        header.chunk_size == 0 || header.chunk_size > 256_MiB) {
+      fclose(file);
+      XELOGE("RestoreFromFile: {} is {} bytes of state, cannot stage it",
+             path.string(), header.raw_size);
+      return false;
+    }
+    std::vector<uint8_t> compressed(header.chunk_size);
+    uint64_t offset = 0;
+    bool read_ok = true;
+    for (uint32_t i = 0; read_ok && i < header.chunk_count; ++i) {
+      SaveStateChunkHeader chunk;
+      if (fread(&chunk, sizeof(chunk), 1, file) != 1 ||
+          chunk.raw_size > header.chunk_size ||
+          chunk.stored_size > chunk.raw_size ||
+          offset + chunk.raw_size > header.raw_size) {
+        read_ok = false;
+        break;
+      }
+      if (chunk.stored_size == chunk.raw_size) {
+        read_ok = fread(buffer + offset, 1, chunk.raw_size, file) ==
+                  chunk.raw_size;
+      } else {
+        read_ok = fread(compressed.data(), 1, chunk.stored_size, file) ==
+                  chunk.stored_size;
+        if (read_ok) {
+          int n = LZ4_decompress_safe(
+              reinterpret_cast<const char*>(compressed.data()),
+              reinterpret_cast<char*>(buffer + offset), int(chunk.stored_size),
+              int(chunk.raw_size));
+          read_ok = n == int(chunk.raw_size);
+        }
+      }
+      offset += chunk.raw_size;
+    }
+    fclose(file);
+    if (!read_ok || offset != header.raw_size) {
+      XELOGE("RestoreFromFile: {} is corrupt (chunk data at {} of {})",
+             path.string(), offset, header.raw_size);
+      return false;
+    }
+    data = buffer;
+    size = size_t(header.raw_size);
+    version = header.version;
+    XELOGI("RestoreFromFile: {} bytes decompressed from {} chunks in {} ms",
+           size, header.chunk_count, ElapsedMs(t0));
+  }
 
+  // Validate the header before touching the running title: a bad file must
+  // not leave the game terminated and paused.
+  ByteStream stream(data, size);
+  if (size < 16 || stream.Read<uint32_t>() != kEmulatorSaveSignature) {
+    XELOGE("RestoreFromFile: {} is not a save state", path.string());
+    return false;
+  }
   auto has_title_id = stream.Read<bool>();
   std::optional<uint32_t> title_id;
   if (!has_title_id) {
@@ -1281,9 +1774,26 @@ bool Emulator::RestoreFromFile(const std::filesystem::path& path) {
   if (title_id_.has_value() != title_id.has_value() ||
       title_id_.value() != title_id.value()) {
     // Swapping between titles is unsupported at the moment.
-    assert_always();
+    XELOGE("RestoreFromFile: {} is for title {:08X}, not {:08X}", path.string(),
+           title_id.value_or(0), title_id_.value_or(0));
     return false;
   }
+  save_state_version_ = version;
+
+  restoring_ = true;
+  struct TimestampGuard {
+    kernel::KernelState* ks;
+    ~TimestampGuard() { ks->set_timestamp_updates_paused(false); }
+  } timestamp_guard{kernel_state_.get()};
+  // Keep the 1 ms KeTimeStampBundle timer from overwriting the restored
+  // bundle before the guest clock has been read from it (older files).
+  kernel_state_->set_timestamp_updates_paused(true);
+
+  // Terminate any loaded titles.
+  Pause();
+  kernel_state_->TerminateTitle();
+
+  auto lock = global_critical_region::AcquireDirect();
 
   if (!processor_->Restore(&stream)) {
     XELOGE("Could not restore processor!");
@@ -1297,6 +1807,10 @@ bool Emulator::RestoreFromFile(const std::filesystem::path& path) {
     XELOGE("Could not restore audio system!");
     return false;
   }
+  if (header.version >= 8 && !audio_media_player_->Restore(&stream)) {
+    XELOGE("Could not restore the media player!");
+    return false;
+  }
   if (!kernel_state_->Restore(&stream)) {
     XELOGE("Could not restore kernel state!");
     return false;
@@ -1306,15 +1820,84 @@ bool Emulator::RestoreFromFile(const std::filesystem::path& path) {
     return false;
   }
 
-  // Update the main thread.
+  // The state carries the guest memory from before any patch enabled since
+  // the save (a 60 fps patch writes one byte the restore just put back), so
+  // the title's enabled patches go on again, before anything runs.
+  if (patcher_ && kernel_state_) {
+    auto module = kernel_state_->GetExecutableModule();
+    if (module) {
+      // The reloaded module has no hash yet (only the launch path computes
+      // it), and the patch DB matches on it.
+      if (!module->hash().has_value()) {
+        module->CalculateHash();
+      }
+      XELOGI("RestoreFromFile: re-applying patches for {:08X} (hash {:016X})",
+             module->title_id(), module->hash().value_or(0));
+      patcher_->ApplyPatchesForTitle(memory_.get(), module->title_id(),
+                                     module->hash());
+    }
+  }
+
+  // The guest clock (time base, uptime) is per process and otherwise jumps
+  // at a restore: forward within a session (a cutscene then skips to its
+  // end), backwards after a relaunch (the game's timed steps then wait for
+  // the old session's time to come round: minutes on a loading screen).
+  // Continue from the tick count at the save. Only format 6 files carry it;
+  // the guest's KeTimeStampBundle is no use, TerminateTitle drops it and a
+  // fresh one reads this process's uptime.
+  if (header.version >= 6 && header.guest_tick_count) {
+    uint64_t now = Clock::QueryGuestTickCount();
+    Clock::SetGuestTickCount(header.guest_tick_count);
+    kernel_state_->set_timestamp_updates_paused(false);
+    kernel_state_->UpdateKeTimestampBundle();
+    XELOGI("RestoreFromFile: guest clock set to {:.3f} s from the header (was "
+           "{:.3f} s)",
+           double(header.guest_tick_count) / Clock::guest_tick_frequency(),
+           double(now) / Clock::guest_tick_frequency());
+  } else {
+    XELOGW(
+        "RestoreFromFile: format {} file has no guest clock; timed steps in "
+        "the game may stall until the old session's time comes round. Save "
+        "again with this build.",
+        header.version);
+  }
+
+  // Update the main thread, and hand every restored guest thread (created
+  // suspended by XThread::Restore) to Resume(), which only resumes what it
+  // is told about; the threads Pause() stopped were terminated above.
+  // Pause() also suspended the host XThreads (GPU frame limiter, XMA
+  // decoder, audio worker, kernel dispatch). TerminateTitle only removes
+  // guest threads, so put those back before the list is replaced or they
+  // stay parked forever.
+  for (auto& thread : paused_threads_) {
+    if (!thread->is_guest_thread() && thread->thread()) {
+      thread->thread()->Resume(nullptr);
+    }
+  }
+  paused_threads_.clear();
   auto threads =
       kernel_state_->object_table()->GetObjectsByType<kernel::XThread>();
   for (auto thread : threads) {
     if (thread->main_thread()) {
       main_thread_ = thread;
-      break;
+    }
+    // A thread the guest created suspended and never started has a host
+    // thread too, but is not running; the guest's own resume starts it.
+    if (thread->is_guest_thread() && thread->thread() && thread->is_running()) {
+      // A thread another thread had suspended stays parked until the
+      // game's NtResumeThread; one parked in its own NtSuspendThread runs
+      // to re-issue that call.
+      if (thread->suspend_count() > 0 &&
+          !thread->restored_self_suspend_pending()) {
+        XELOGI("RestoreFromFile: thread {:08X} left suspended (guest suspend "
+               "count {})",
+               thread->handle(), thread->suspend_count());
+        continue;
+      }
+      paused_threads_.push_back(thread);
     }
   }
+  XELOGI("RestoreFromFile: {} guest threads restored", paused_threads_.size());
 
   Resume();
 
@@ -1322,6 +1905,51 @@ bool Emulator::RestoreFromFile(const std::filesystem::path& path) {
   restoring_ = false;
 
   return true;
+}
+
+bool Emulator::ReadSaveStateInfo(const std::filesystem::path& path,
+                                 SaveStateFileInfo* out_info) {
+  FILE* file = filesystem::OpenFile(path, "rb");
+  if (!file) {
+    return false;
+  }
+  SaveStateContainerHeader header = {};
+  bool ok = ReadSaveStateHeader(file, &header, nullptr, nullptr);
+  fclose(file);
+  if (!ok) {
+    return false;
+  }
+  *out_info = {};
+  out_info->version = header.version;
+  out_info->title_id = header.has_title_id ? header.title_id : 0;
+  out_info->media_id = header.media_id;
+  out_info->disc_number = header.disc_number;
+  out_info->disc_count = header.disc_count;
+  out_info->raw_size = header.raw_size;
+  return true;
+}
+
+std::string Emulator::SaveStateMismatch(const SaveStateFileInfo& info) const {
+  if (info.title_id != title_id()) {
+    return fmt::format("saved for title {:08X}, {:08X} is running",
+                       info.title_id, title_id());
+  }
+  if (!info.has_disc_info()) {
+    // Format 1 and 2 files carry no disc information; nothing to check.
+    return "";
+  }
+  if (info.disc_count > 1 || disc_count_ > 1) {
+    if (info.disc_number != disc_number_) {
+      return fmt::format("saved on disc {} of {}, disc {} is running",
+                         info.disc_number, info.disc_count, disc_number_);
+    }
+  }
+  if (info.media_id && media_id_ && info.media_id != media_id_) {
+    return fmt::format(
+        "saved from a different disc image (media id {:08X}, running {:08X})",
+        info.media_id, media_id_);
+  }
+  return "";
 }
 
 const std::filesystem::path Emulator::GetNewDiscPath(
@@ -1360,18 +1988,24 @@ bool Emulator::ExceptionCallback(Exception* ex) {
   auto code_base = code_cache->execute_base_address();
   auto code_end = code_base + code_cache->total_size();
 
-  if (!processor()->is_debugger_attached() && debugging::IsDebuggerAttached()) {
-    // If Xenia's debugger isn't attached but another one is, pass it to that
-    // debugger.
-    return false;
-  } else if (processor()->is_debugger_attached()) {
+  const bool in_guest_code = ex->pc() >= code_base && ex->pc() < code_end;
+
+  if (processor()->is_debugger_attached()) {
     // Let the debugger handle this exception. It may decide to continue past
     // it (if it was a stepping breakpoint, etc).
     return processor()->OnUnhandledException(ex);
   }
 
-  if (!(ex->pc() >= code_base && ex->pc() < code_end)) {
-    // Didn't occur in guest code. Let it pass.
+  if (!in_guest_code) {
+    // Didn't occur in guest code. Let it pass. Checked before the debugger
+    // probe below: that reads /proc from inside a signal handler and is
+    // slow, and this path is taken for every fault no other handler wanted.
+    return false;
+  }
+
+  if (debugging::IsDebuggerAttached()) {
+    // Xenia's debugger isn't attached but another one is; pass it to that
+    // debugger.
     return false;
   }
 
@@ -1623,12 +2257,19 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
 
   if (!info) {
     title_id_ = 0;
+    disc_number_ = disc_count_ = 0;
+    media_id_ = 0;
   } else {
     title_id_ = info->title_id;
     auto title_version = info->version();
     if (title_version.value != 0) {
       title_version_ = format_version(title_version);
     }
+    disc_number_ = info->disc_number;
+    disc_count_ = info->disc_count;
+    media_id_ = info->media_id;
+    XELOGI("Title {:08X}: disc {} of {}, media id {:08X}", title_id_.value(),
+           disc_number_, disc_count_, media_id_);
   }
 
   // Try and load the resource database (xex only).
@@ -1827,6 +2468,147 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
   // If the debugger has requested a suspend this will just decrement the
   // suspend count without resuming it until the debugger wants.
   main_thread_->Resume();
+
+  if (cvars::pause_experiment_pause_seconds > 0) {
+    std::thread([this]() {
+      xe::threading::set_name("Pause Experiment");
+      std::this_thread::sleep_for(
+          std::chrono::seconds(cvars::pause_experiment_pause_seconds));
+      auto t0 = std::chrono::steady_clock::now();
+      Pause();
+      XELOGI("PAUSE EXPERIMENT: paused in {} ms",
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - t0)
+                 .count());
+      if (cvars::pause_experiment_resume_seconds >
+          cvars::pause_experiment_pause_seconds) {
+        std::this_thread::sleep_for(
+            std::chrono::seconds(cvars::pause_experiment_resume_seconds -
+                                 cvars::pause_experiment_pause_seconds));
+        t0 = std::chrono::steady_clock::now();
+        Resume();
+        XELOGI("PAUSE EXPERIMENT: resumed in {} ms",
+               std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - t0)
+                   .count());
+      }
+    }).detach();
+  }
+
+  if (cvars::stats_log_seconds > 0) {
+    std::thread([this]() {
+      xe::threading::set_name("Stats Log");
+      const int period = cvars::stats_log_seconds;
+      uint64_t swaps = 0, audio = 0, silent = 0, xma = 0, cbs = 0,
+               starved = 0;
+      auto t0 = std::chrono::steady_clock::now();
+      while (true) {
+        std::this_thread::sleep_for(std::chrono::seconds(period));
+        if (!graphics_system_ || !graphics_system_->command_processor() ||
+            !audio_system_) {
+          continue;
+        }
+        uint64_t s = graphics_system_->command_processor()->swap_count();
+        uint64_t a = audio_system_->submitted_frame_count();
+        uint64_t q = audio_system_->silent_frame_count();
+        uint64_t x = apu::XmaContext::decoded_packet_count_.load();
+        uint64_t c = apu::AudioDriver::callback_count_.load();
+        uint64_t st = apu::AudioDriver::starved_callback_count_.load();
+        double t = std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count();
+        XELOGI(
+            "STATS t={:.0f}s swaps +{} ({:.1f}/s) audio_frames +{} ({:.1f}/s, "
+            "{} silent) xma_packets +{} sdl_callbacks +{} starved +{}{}",
+            t, s - swaps, double(s - swaps) / period, a - audio,
+            double(a - audio) / period, q - silent, x - xma, c - cbs,
+            st - starved, is_title_open() ? "" : " (no title)");
+        swaps = s;
+        audio = a;
+        silent = q;
+        xma = x;
+        cbs = c;
+        starved = st;
+      }
+    }).detach();
+  }
+  if (cvars::savestate_experiment_save_seconds > 0) {
+    std::thread([this]() {
+      xe::threading::set_name("Savestate Experiment");
+      std::filesystem::path path = cvars::savestate_experiment_path;
+      int elapsed = 0;
+      if (cvars::savestate_experiment_preload_seconds > 0 &&
+          !cvars::savestate_experiment_preload_path.empty()) {
+        std::this_thread::sleep_for(
+            std::chrono::seconds(cvars::savestate_experiment_preload_seconds));
+        elapsed = cvars::savestate_experiment_preload_seconds;
+        XELOGI("SAVESTATE EXPERIMENT: preloading {}",
+               cvars::savestate_experiment_preload_path);
+        bool ok = RestoreFromFile(cvars::savestate_experiment_preload_path);
+        XELOGI("SAVESTATE EXPERIMENT: preload {}", ok ? "ok" : "FAILED");
+      }
+      if (cvars::savestate_experiment_save_seconds > elapsed) {
+        std::this_thread::sleep_for(std::chrono::seconds(
+            cvars::savestate_experiment_save_seconds - elapsed));
+      }
+      if (cvars::savestate_experiment_step_only) {
+        XELOGI("SAVESTATE EXPERIMENT: step-only (pause, step all, resume)");
+        auto t0 = std::chrono::steady_clock::now();
+        bool ok = StepAllGuestThreads();
+        XELOGI("SAVESTATE EXPERIMENT: step-only {} in {} ms",
+               ok ? "ok" : "FAILED",
+               std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - t0)
+                   .count());
+        return;
+      }
+      for (int cycle = 0;
+           cycle < std::max(1, cvars::savestate_experiment_cycles); ++cycle) {
+        if (cycle) {
+          std::this_thread::sleep_for(std::chrono::seconds(20));
+          XELOGI("SAVESTATE EXPERIMENT: cycle {}", cycle + 1);
+        }
+        auto t0 = std::chrono::steady_clock::now();
+        int64_t ms = 0;
+        bool ok = true;
+        if (cvars::savestate_experiment_restore_only) {
+          XELOGI("SAVESTATE EXPERIMENT: restore-only, not saving");
+        } else {
+          XELOGI("SAVESTATE EXPERIMENT: saving to {}", path.string());
+          ok = SaveToFile(path);
+          ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - t0)
+                   .count();
+          XELOGI("SAVESTATE EXPERIMENT: save {} in {} ms, {} bytes",
+                 ok ? "ok" : "FAILED", ms,
+                 std::filesystem::exists(path)
+                     ? std::filesystem::file_size(path)
+                     : 0);
+        }
+        if (ok && cvars::savestate_experiment_restore_seconds >
+                      cvars::savestate_experiment_save_seconds) {
+          std::this_thread::sleep_for(std::chrono::seconds(
+              cvars::savestate_experiment_restore_seconds -
+              cvars::savestate_experiment_save_seconds));
+          for (int i = 0; i < std::max(1, cvars::savestate_experiment_restore_repeat);
+               ++i) {
+            if (i) {
+              std::this_thread::sleep_for(std::chrono::seconds(20));
+            }
+            XELOGI("SAVESTATE EXPERIMENT: restoring from {} (#{})", path.string(),
+                   i + 1);
+            t0 = std::chrono::steady_clock::now();
+            ok = RestoreFromFile(path);
+            ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - t0)
+                     .count();
+            XELOGI("SAVESTATE EXPERIMENT: restore #{} {} in {} ms", i + 1,
+                   ok ? "ok" : "FAILED", ms);
+          }
+        }
+      }
+    }).detach();
+  }
 
   return X_STATUS_SUCCESS;
 }

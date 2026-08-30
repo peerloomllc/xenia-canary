@@ -18,6 +18,10 @@ namespace apu {
 
 class AudioDriver {
  public:
+  // --stats_log_seconds: host device callbacks, and those that found no
+  // guest audio at all (silence went out). Counted by the SDL driver.
+  inline static std::atomic<uint64_t> callback_count_{0};
+  inline static std::atomic<uint64_t> starved_callback_count_{0};
   static constexpr uint32_t kFrameFrequencyDefault = 48000;
   static constexpr uint32_t kFrameChannelsDefault = 6;
   static constexpr uint32_t kChannelSamplesDefault = 256;

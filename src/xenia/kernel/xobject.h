@@ -128,6 +128,27 @@ class XObject {
     Device
   };
 
+  static const char* TypeName(Type type) {
+    switch (type) {
+      case Type::Undefined: return "Undefined";
+      case Type::Enumerator: return "Enumerator";
+      case Type::Event: return "Event";
+      case Type::File: return "File";
+      case Type::IOCompletion: return "IOCompletion";
+      case Type::Module: return "Module";
+      case Type::Mutant: return "Mutant";
+      case Type::NotifyListener: return "NotifyListener";
+      case Type::Semaphore: return "Semaphore";
+      case Type::Session: return "Session";
+      case Type::Socket: return "Socket";
+      case Type::SymbolicLink: return "SymbolicLink";
+      case Type::Thread: return "Thread";
+      case Type::Timer: return "Timer";
+      case Type::Device: return "Device";
+    }
+    return "?";
+  }
+
   static bool HasDispatcherHeader(Type type) {
     switch (type) {
       case Type::Event:

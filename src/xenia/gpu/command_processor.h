@@ -182,12 +182,29 @@ class CommandProcessor {
   void LogRegisterSets(uint32_t base_register_index, const uint32_t* values,
                        uint32_t n_values);
 
+  // Frames presented (guest swaps) since start; --stats_log_seconds.
+  uint64_t swap_count() const { return swap_count_.load(); }
   bool is_paused() const { return paused_; }
-  void Pause();
+  // capture_edram: read the EDRAM contents back on the worker thread before
+  // it stops, for a save state (CommandProcessor::Save writes them).
+  void Pause(bool capture_edram = false);
   void Resume();
 
+  // Save states (format 8): the EDRAM contents. The backend fills `out` with
+  // its EDRAM layout (kEdramSizeBytes times the resolution scale) and
+  // uploads it again; both run on the worker thread. Default: no EDRAM.
+  virtual bool CaptureEdramSnapshot(std::vector<uint8_t>& out) {
+    return false;
+  }
+  virtual bool RestoreEdramSnapshotSized(const void* data, size_t size,
+                                         uint32_t scale_x, uint32_t scale_y) {
+    return false;
+  }
+  // Uploads the snapshot Restore() read, if any; worker thread.
+  void RestoreSavedEdramSnapshot();
+
   bool Save(ByteStream* stream);
-  bool Restore(ByteStream* stream);
+  bool Restore(ByteStream* stream, bool has_edram_snapshot);
 
  protected:
   struct IndexBufferInfo {
@@ -488,12 +505,18 @@ class CommandProcessor {
   uint32_t zpd_draw_resolution_scale_x_ = 1;
   uint32_t zpd_draw_resolution_scale_y_ = 1;
 
+
+ public:
+  // The resolution scale in use (Display > Advanced GPU options shows it
+  // next to the configured one).
   uint32_t zpd_draw_resolution_scale_x() const {
     return zpd_draw_resolution_scale_x_;
   }
   uint32_t zpd_draw_resolution_scale_y() const {
     return zpd_draw_resolution_scale_y_;
   }
+
+ protected:
   // Scale area for the segment being closed.
   uint32_t GetZPDScaleArea() const {
     return zpd_active_segment_.scale_area
@@ -540,6 +563,10 @@ class CommandProcessor {
   Shader* active_pixel_shader_ = nullptr;
 
   bool paused_ = false;
+  std::atomic<uint64_t> swap_count_{0};
+  std::vector<uint8_t> edram_snapshot_;
+  uint32_t edram_snapshot_scale_x_ = 1;
+  uint32_t edram_snapshot_scale_y_ = 1;
 
   // By default (such as for tools), post-processing is disabled.
   // "Desired" is for the external thread managing the post-processing effect.

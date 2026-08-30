@@ -1908,7 +1908,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
           switch (guest_output_paint_pipeline_layout_index) {
             case kGuestOutputPaintPipelineLayoutIndexBilinear: {
               effect_constants_size = sizeof(effect_constants.bilinear);
-              effect_constants.bilinear.Initialize(guest_output_flow, i);
+              effect_constants.bilinear.Initialize(guest_output_flow, i,
+                                                   guest_output_paint_config);
             } break;
             case kGuestOutputPaintPipelineLayoutIndexCasSharpen: {
               effect_constants_size = sizeof(effect_constants.cas_sharpen);

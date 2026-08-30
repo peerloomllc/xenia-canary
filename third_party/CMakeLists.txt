@@ -193,6 +193,14 @@ add_library(pugixml STATIC
 target_include_directories(pugixml PUBLIC pugixml/src)
 
 # ==============================================================================
+# soundtouch (time-stretching for fast-forward audio)
+# ==============================================================================
+file(GLOB _soundtouch_sources ${CMAKE_CURRENT_SOURCE_DIR}/soundtouch/source/SoundTouch/*.cpp)
+add_library(soundtouch STATIC ${_soundtouch_sources})
+target_include_directories(soundtouch PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/soundtouch/include)
+target_compile_definitions(soundtouch PUBLIC SOUNDTOUCH_FLOAT_SAMPLES)
+set_target_properties(soundtouch PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # snappy
 # ==============================================================================
 # Generate snappy-stubs-public.h if missing

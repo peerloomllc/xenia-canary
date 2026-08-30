@@ -44,6 +44,11 @@ DEFINE_path(
     "Allows user to load custom font and use it instead of default one.", "UI");
 
 DEFINE_uint32(font_size, 14, "Allows user to set custom font size.", "UI");
+DEFINE_double(ui_scale, 1.0,
+              "Size of the in-window dialogs and notifications: fonts and "
+              "spacing are multiplied by this (1 = as before, 1.5 = half "
+              "again as large). Display > Dialog size changes it in-app.",
+              "UI");
 UPDATE_from_uint32(font_size, 2024, 8, 31, 20, 12);
 
 namespace xe {
@@ -163,8 +168,10 @@ void ImGuiDrawer::Initialize() {
   io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
   io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
-  const float font_size = std::max((float)cvars::font_size, 8.f);
-  const float title_font_size = font_size + 6.f;
+  ui_scale_ = float(std::clamp(cvars::ui_scale, 0.5, 3.0));
+  const float font_size =
+      std::max((float)cvars::font_size, 8.f) * ui_scale_;
+  const float title_font_size = font_size + 6.f * ui_scale_;
 
   InitializeFonts(font_size);
   InitializeFonts(title_font_size);
@@ -228,6 +235,10 @@ void ImGuiDrawer::Initialize() {
       ImVec4(1.00f, 0.60f, 0.00f, 1.00f);
   style.Colors[ImGuiCol_TextSelectedBg] = ImVec4(0.00f, 1.00f, 0.00f, 0.21f);
   style.Colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.20f, 0.20f, 0.20f, 0.35f);
+  // Spacing scales with the fonts; keep the unscaled style for later
+  // changes (ScaleAllSizes compounds).
+  base_style_ = style;
+  style.ScaleAllSizes(ui_scale_);
 
   frame_time_tick_frequency_ = double(Clock::QueryHostTickFrequency());
   last_frame_time_ticks_ = Clock::QueryHostTickCount();
@@ -454,6 +465,13 @@ bool ImGuiDrawer::LoadJapaneseFont(ImGuiIO& io, float font_size) {
   FcCharSet* charset = FcCharSetCreate();
   FcCharSetAddChar(charset, 0x4E00);  // Add a CJK character to the charset
   FcPatternAddCharSet(pattern, FC_CHARSET, charset);
+  // Dear ImGui rasterises with stb_truetype, which cannot load CFF-outline
+  // OpenType fonts or variable-font collections. Fedora's default CJK match
+  // is NotoSansCJK-VF.ttc, exactly that, and one unloadable font fails the
+  // whole atlas build: every ImGui dialog then crashes in NewFrame() on the
+  // first frame it is drawn. Ask fontconfig for TrueType outlines only.
+  FcPatternAddString(pattern, FC_FONTFORMAT,
+                     reinterpret_cast<const FcChar8*>("TrueType"));
 
   // Configure the search
   FcConfigSubstitute(config, pattern, FcMatchPattern);
@@ -470,14 +488,27 @@ bool ImGuiDrawer::LoadJapaneseFont(ImGuiIO& io, float font_size) {
       const char* font_path = reinterpret_cast<const char*>(file);
 
       if (std::filesystem::exists(font_path)) {
-        ImFontConfig jp_font_config;
-        jp_font_config.MergeMode = true;
-        jp_font_config.OversampleH = jp_font_config.OversampleV = 2;
-        jp_font_config.PixelSnapH = true;
+        // Prove stb_truetype can build this file before merging it into the
+        // real atlas, where a failure would take the base font down too.
+        ImFontAtlas trial_atlas;
+        static const ImWchar trial_range[] = {0x4E00, 0x4E01, 0};
+        bool loadable = trial_atlas.AddFontFromFileTTF(font_path, font_size,
+                                                       nullptr, trial_range) &&
+                        trial_atlas.Build();
+        if (loadable) {
+          ImFontConfig jp_font_config;
+          jp_font_config.MergeMode = true;
+          jp_font_config.OversampleH = jp_font_config.OversampleV = 2;
+          jp_font_config.PixelSnapH = true;
 
-        io.Fonts->AddFontFromFileTTF(font_path, font_size, &jp_font_config,
-                                     io.Fonts->GetGlyphRangesJapanese());
-        success = true;
+          io.Fonts->AddFontFromFileTTF(font_path, font_size, &jp_font_config,
+                                       io.Fonts->GetGlyphRangesJapanese());
+          XELOGI("Using CJK font {}", font_path);
+          success = true;
+        } else {
+          XELOGW("CJK font {} cannot be loaded by stb_truetype; skipping",
+                 font_path);
+        }
       }
     }
     FcPatternDestroy(font);
@@ -522,6 +553,31 @@ void ImGuiDrawer::InitializeFonts(const float font_size) {
   }
 
   LoadJapaneseFont(io, font_size);
+}
+
+void ImGuiDrawer::RequestUIScale(float scale) {
+  pending_ui_scale_ = std::clamp(scale, 0.5f, 3.0f);
+}
+
+void ImGuiDrawer::ApplyUIScale(float scale) {
+  if (scale == ui_scale_) {
+    return;
+  }
+  ImGui::SetCurrentContext(internal_state_);
+  ui_scale_ = scale;
+  auto& io = ImGui::GetIO();
+  io.Fonts->TexID = reinterpret_cast<ImTextureID>(nullptr);
+  font_texture_.reset();
+  io.Fonts->Clear();
+  const float font_size = std::max((float)cvars::font_size, 8.f) * ui_scale_;
+  InitializeFonts(font_size);
+  InitializeFonts(font_size + 6.f * ui_scale_);
+  io.Fonts->Build();
+  SetupFontTexture();
+  auto& style = ImGui::GetStyle();
+  style = base_style_;
+  style.ScaleAllSizes(ui_scale_);
+  XELOGI("ImGui: UI scale {:.2f}, font {:.0f} px", ui_scale_, font_size);
 }
 
 void ImGuiDrawer::SetupFontTexture() {
@@ -601,6 +657,12 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   ImGui::SetCurrentContext(internal_state_);
 
   ImGuiIO& io = ImGui::GetIO();
+
+  // Between frames, never inside one: the font atlas and texture change.
+  if (pending_ui_scale_ > 0.0f) {
+    ApplyUIScale(pending_ui_scale_);
+    pending_ui_scale_ = 0.0f;
+  }
 
   uint64_t current_frame_time_ticks = Clock::QueryHostTickCount();
   io.DeltaTime =

@@ -27,6 +27,10 @@
 
 #define XE_ENABLE_GPU_REG_WRITE_LOGGING 1
 #endif
+DEFINE_bool(log_wait_reg_mem, false,
+            "Log what WAIT_REG_MEM packets poll, once a second per address.",
+            "GPU");
+
 DEFINE_bool(
     log_guest_driven_gpu_register_written_values, false,
     "Only does anything in debug builds, if set will log every write to a gpu "
@@ -370,6 +374,14 @@ void CommandProcessor::WorkerThreadMain() {
 
     // Execute. Note that we handle wraparound transparently.
     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+    {
+      // Diagnostic (save states): throttled trace of ring progress.
+      static uint32_t executed_buffers = 0;
+      if ((++executed_buffers % 200) == 1) {
+        XELOGD("CP: buffer #{} rptr={:X} wptr={:X}", executed_buffers,
+               read_ptr_index_, write_ptr_index);
+      }
+    }
 
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
     //     that many indices.
@@ -387,19 +399,38 @@ void CommandProcessor::WorkerThreadMain() {
   ShutdownContext();
 }
 
-void CommandProcessor::Pause() {
+void CommandProcessor::Pause(bool capture_edram) {
   if (paused_) {
     return;
   }
   paused_ = true;
 
   threading::Fence fence;
-  CallInThread([&fence]() {
+  CallInThread([this, &fence, capture_edram]() {
+    if (capture_edram) {
+      edram_snapshot_.clear();
+      if (!CaptureEdramSnapshot(edram_snapshot_)) {
+        edram_snapshot_.clear();
+        XELOGW("Save state: EDRAM contents not captured (see above)");
+      }
+    }
     fence.Signal();
     threading::Thread::GetCurrentThread()->Suspend();
   });
 
   fence.Wait();
+}
+
+void CommandProcessor::RestoreSavedEdramSnapshot() {
+  if (edram_snapshot_.empty()) {
+    return;
+  }
+  if (!RestoreEdramSnapshotSized(edram_snapshot_.data(), edram_snapshot_.size(),
+                                 edram_snapshot_scale_x_,
+                                 edram_snapshot_scale_y_)) {
+    XELOGW("Restore: EDRAM contents not restored; the guest redraws them");
+  }
+  std::vector<uint8_t>().swap(edram_snapshot_);
 }
 
 void CommandProcessor::Resume() {
@@ -421,10 +452,29 @@ bool CommandProcessor::Save(ByteStream* stream) {
   stream->Write<uint32_t>(read_ptr_writeback_ptr_);
   stream->Write<uint32_t>(write_ptr_index_.load());
 
+  // The guest reads registers back (scratch/fence registers above all), so
+  // the register file is part of the state.
+  stream->Write<uint32_t>(uint32_t(RegisterFile::kRegisterCount));
+  stream->Write(register_file_->values,
+                sizeof(register_file_->values[0]) * RegisterFile::kRegisterCount);
+
+  // Format 8: the EDRAM contents read back at the pause (empty when the
+  // backend could not provide them).
+  stream->Write<uint32_t>(edram_snapshot_scale_x_);
+  stream->Write<uint32_t>(edram_snapshot_scale_y_);
+  stream->Write<uint64_t>(edram_snapshot_.size());
+  if (!edram_snapshot_.empty()) {
+    stream->Write(edram_snapshot_.data(), edram_snapshot_.size());
+    XELOGI("Save state: {} bytes of EDRAM ({}x{} scale)",
+           edram_snapshot_.size(), edram_snapshot_scale_x_,
+           edram_snapshot_scale_y_);
+  }
+  std::vector<uint8_t>().swap(edram_snapshot_);
+
   return true;
 }
 
-bool CommandProcessor::Restore(ByteStream* stream) {
+bool CommandProcessor::Restore(ByteStream* stream, bool has_edram_snapshot) {
   assert_true(paused_);
 
   primary_buffer_ptr_ = stream->Read<uint32_t>();
@@ -433,6 +483,31 @@ bool CommandProcessor::Restore(ByteStream* stream) {
   read_ptr_update_freq_ = stream->Read<uint32_t>();
   read_ptr_writeback_ptr_ = stream->Read<uint32_t>();
   write_ptr_index_.store(stream->Read<uint32_t>());
+
+  uint32_t register_count = stream->Read<uint32_t>();
+  if (register_count != RegisterFile::kRegisterCount) {
+    XELOGE("CommandProcessor::Restore - register file size mismatch ({})",
+           register_count);
+    return false;
+  }
+  stream->Read(register_file_->values,
+               sizeof(register_file_->values[0]) * RegisterFile::kRegisterCount);
+
+  std::vector<uint8_t>().swap(edram_snapshot_);
+  if (has_edram_snapshot) {
+    edram_snapshot_scale_x_ = stream->Read<uint32_t>();
+    edram_snapshot_scale_y_ = stream->Read<uint32_t>();
+    uint64_t size = stream->Read<uint64_t>();
+    // 10 MB per unit of scale area; anything else is a corrupt file.
+    if (size > uint64_t(xenos::kEdramSizeBytes) * 49) {
+      XELOGE("CommandProcessor::Restore - EDRAM snapshot of {} bytes", size);
+      return false;
+    }
+    if (size) {
+      edram_snapshot_.resize(size_t(size));
+      stream->Read(edram_snapshot_.data(), edram_snapshot_.size());
+    }
+  }
 
   return true;
 }
@@ -458,6 +533,7 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr,
   // CP_RB_RPTR_ADDR Ring Buffer Read Pointer Address 0x70C
   // ptr = RB_RPTR_ADDR, pointer to write back the address to.
   read_ptr_writeback_ptr_ = ptr;
+  XELOGI("CP: read pointer write-back at {:08X}", ptr);
   // CP_RB_CNTL Ring Buffer Control 0x704
   // block_size = RB_BLKSZ, log2 of number of quadwords read between updates of
   //              the read pointer.

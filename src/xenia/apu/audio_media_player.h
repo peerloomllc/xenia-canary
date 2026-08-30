@@ -11,6 +11,7 @@
 #define XENIA_APU_AUDIO_MEDIA_PLAYER_H_
 
 #include "xenia/apu/audio_driver.h"
+#include "xenia/base/byte_stream.h"
 #include "xenia/apu/audio_system.h"
 #include "xenia/kernel/xam/apps/xmp_app.h"
 
@@ -101,6 +102,12 @@ class AudioMediaPlayer {
 
   void AddPlaylist(uint32_t handle, std::unique_ptr<XmpApp::Playlist> playlist);
   void RemovePlaylist(uint32_t handle);
+
+  // Save states (format 8): the XMP settings the title set and its
+  // playlists. Playback itself is not resumed: a state saved while a song
+  // played restores idle.
+  bool Save(ByteStream* stream);
+  bool Restore(ByteStream* stream);
 
   XmpApp::Song* GetCurrentSong() const { return active_song_; }
 

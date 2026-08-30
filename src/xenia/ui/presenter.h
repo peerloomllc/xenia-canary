@@ -270,6 +270,41 @@ class Presenter {
     bool GetDither() const { return dither_; }
     void SetDither(bool new_dither) { dither_ = new_dither; }
 
+    // Display-space colour adjustment applied in the last paint pass.
+    static constexpr float kBrightnessMin = -1.0f;
+    static constexpr float kBrightnessMax = 1.0f;
+    static constexpr float kBrightnessDefault = 0.0f;
+    static constexpr float kContrastMin = 0.0f;
+    static constexpr float kContrastMax = 2.0f;
+    static constexpr float kContrastDefault = 1.0f;
+    static constexpr float kSaturationMin = 0.0f;
+    static constexpr float kSaturationMax = 2.0f;
+    static constexpr float kSaturationDefault = 1.0f;
+    static constexpr float kGammaMin = 0.5f;
+    static constexpr float kGammaMax = 2.0f;
+    static constexpr float kGammaDefault = 1.0f;
+    float GetBrightness() const { return brightness_; }
+    void SetBrightness(float v) {
+      brightness_ = std::min(kBrightnessMax, std::max(kBrightnessMin, v));
+    }
+    float GetContrast() const { return contrast_; }
+    void SetContrast(float v) {
+      contrast_ = std::min(kContrastMax, std::max(kContrastMin, v));
+    }
+    float GetSaturation() const { return saturation_; }
+    void SetSaturation(float v) {
+      saturation_ = std::min(kSaturationMax, std::max(kSaturationMin, v));
+    }
+    float GetGamma() const { return gamma_; }
+    void SetGamma(float v) {
+      gamma_ = std::min(kGammaMax, std::max(kGammaMin, v));
+    }
+    bool IsColorAdjusted() const {
+      return brightness_ != kBrightnessDefault ||
+             contrast_ != kContrastDefault ||
+             saturation_ != kSaturationDefault || gamma_ != kGammaDefault;
+    }
+
    private:
     // Tools, rather than the emulator itself, must not allow overscan cutoff
     // and must use the kBilinear effect as the image must be as close to the
@@ -280,6 +315,10 @@ class Presenter {
     uint32_t fsr_max_upsampling_passes_ = kFsrMaxUpscalingPassesMax;
     float fsr_sharpness_reduction_ = kFsrSharpnessReductionDefault;
     bool dither_ = false;
+    float brightness_ = kBrightnessDefault;
+    float contrast_ = kContrastDefault;
+    float saturation_ = kSaturationDefault;
+    float gamma_ = kGammaDefault;
   };
 
   Presenter(const Presenter& presenter) = delete;
@@ -492,17 +531,34 @@ class Presenter {
     }
   };
 
+  // Colour adjustment constants (brightness, contrast, saturation, 1/gamma)
+  // for the shaders: the adjustment is done once, in the last pass of the
+  // flow, so every other pass gets the identity.
+  static void InitializeColorAdjust(float color_adjust[4],
+                                    const GuestOutputPaintFlow& flow,
+                                    size_t effect_index,
+                                    const GuestOutputPaintConfig& config) {
+    bool last = effect_index + 1 == flow.effect_count;
+    color_adjust[0] = last ? config.GetBrightness() : 0.0f;
+    color_adjust[1] = last ? config.GetContrast() : 1.0f;
+    color_adjust[2] = last ? config.GetSaturation() : 1.0f;
+    color_adjust[3] = last ? 1.0f / config.GetGamma() : 1.0f;
+  }
+
   struct BilinearConstants {
     int32_t output_offset[2];
     float output_size_inv[2];
+    float color_adjust[4];
 
-    void Initialize(const GuestOutputPaintFlow& flow, size_t effect_index) {
+    void Initialize(const GuestOutputPaintFlow& flow, size_t effect_index,
+                    const GuestOutputPaintConfig& config) {
       flow.GetEffectOutputOffset(effect_index, output_offset[0],
                                  output_offset[1]);
       const std::pair<uint32_t, uint32_t>& output_size =
           flow.effect_output_sizes[effect_index];
       output_size_inv[0] = 1.0f / float(output_size.first);
       output_size_inv[1] = 1.0f / float(output_size.second);
+      InitializeColorAdjust(color_adjust, flow, effect_index, config);
     }
   };
 
@@ -514,6 +570,8 @@ class Presenter {
   struct CasSharpenConstants {
     int32_t output_offset[2];
     float sharpness_post_setup;
+    float padding;
+    float color_adjust[4];
 
     void Initialize(const GuestOutputPaintFlow& flow, size_t effect_index,
                     const GuestOutputPaintConfig& config) {
@@ -521,6 +579,8 @@ class Presenter {
                                  output_offset[1]);
       sharpness_post_setup =
           CalculateCasPostSetupSharpness(config.GetCasAdditionalSharpness());
+      padding = 0.0f;
+      InitializeColorAdjust(color_adjust, flow, effect_index, config);
     }
   };
 
@@ -529,6 +589,8 @@ class Presenter {
     // Input size / output size.
     float input_output_size_ratio[2];
     float sharpness_post_setup;
+    float padding[3];
+    float color_adjust[4];
 
     void Initialize(const GuestOutputPaintFlow& flow, size_t effect_index,
                     const GuestOutputPaintConfig& config) {
@@ -544,6 +606,8 @@ class Presenter {
           float(input_height) / float(output_size.second);
       sharpness_post_setup =
           CalculateCasPostSetupSharpness(config.GetCasAdditionalSharpness());
+      padding[0] = padding[1] = padding[2] = 0.0f;
+      InitializeColorAdjust(color_adjust, flow, effect_index, config);
     }
   };
 
@@ -570,6 +634,8 @@ class Presenter {
   struct FsrRcasConstants {
     int32_t output_offset[2];
     float sharpness_post_setup;
+    float padding;
+    float color_adjust[4];
 
     static float CalculatePostSetupSharpness(float sharpness_reduction_stops) {
       // FsrRcasCon const0.x.
@@ -582,6 +648,8 @@ class Presenter {
                                  output_offset[1]);
       sharpness_post_setup =
           CalculatePostSetupSharpness(config.GetFsrSharpnessReduction());
+      padding = 0.0f;
+      InitializeColorAdjust(color_adjust, flow, effect_index, config);
     }
   };
 

@@ -1,0 +1,28 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2026 Ben Vanik. All rights reserved.                             *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ */
+
+#ifndef XENIA_UI_SHADERS_COLOR_ADJUST_XESLI_
+#define XENIA_UI_SHADERS_COLOR_ADJUST_XESLI_
+
+#include "xesl.xesli"
+
+// Simple display-space colour adjustment for the final guest output pass.
+// params: x = brightness offset (-1..1), y = contrast multiplier around 0.5,
+// z = saturation multiplier (0 = grey, 1 = unchanged), w = 1 / gamma.
+// (0, 1, 1, 1) leaves the colour unchanged.
+float3_xe XeColorAdjust(float3_xe color, float4_xe params) {
+  color = saturate_xe(color + params.x);
+  color = saturate_xe((color - 0.5f) * params.y + 0.5f);
+  float luma = dot(color, float3_xe(0.2126f, 0.7152f, 0.0722f));
+  color = saturate_xe(luma + (color - luma) * params.z);
+  color = pow(color, float3_xe(params.w, params.w, params.w));
+  return color;
+}
+
+#endif  // XENIA_UI_SHADERS_COLOR_ADJUST_XESLI_

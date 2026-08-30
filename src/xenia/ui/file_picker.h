@@ -68,6 +68,12 @@ class FilePicker {
     extensions_ = std::move(extensions);
   }
 
+  // Folder the picker opens in when set (and it exists).
+  const std::filesystem::path& default_path() const { return default_path_; }
+  void set_default_path(std::filesystem::path default_path) {
+    default_path_ = std::move(default_path);
+  }
+
   bool multi_selection() const { return multi_selection_; }
   void set_multi_selection(bool multi_selection) {
     multi_selection_ = multi_selection;
@@ -90,6 +96,7 @@ class FilePicker {
   std::string file_name_;
   std::vector<std::pair<std::string, std::string>> extensions_;
   bool multi_selection_;
+  std::filesystem::path default_path_;
 
   std::vector<std::filesystem::path> selected_files_;
 };
