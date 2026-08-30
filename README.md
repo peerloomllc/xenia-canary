@@ -41,6 +41,15 @@ General questions about Xenia are covered by the upstream
   repository, profiles, console settings.
 * **Game library dashboard**: your scanned games folder with icons, list
   or grid view, playtime, and launch on double-click.
+* **Advanced GPU options**: resolution scale up to 3x, anti-aliasing
+  (FXAA), AMD CAS/FSR scaling and sharpening, colour filters
+  (brightness, contrast, saturation, gamma), all from the Preferences
+  window:
+
+<p align="center">
+    <img src="assets/peerloom/quality.png" width="900" alt="Defaults vs 2x resolution scale with FXAA and CAS sharpening" />
+</p>
+
 * **Linux fixes**: guest threads that never started (games hanging at
   loading screens), kernel timers with past due times never firing
   (silent games), a syscall on every mutex lock, ImGui crashes with CJK
