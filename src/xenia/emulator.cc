@@ -427,6 +427,7 @@ X_STATUS Emulator::TerminateTitle() {
 
   kernel_state_->TerminateTitle();
   title_id_ = std::nullopt;
+  title_module_hash_.reset();
   title_name_ = "";
   title_version_ = "";
   on_terminate();
@@ -1853,15 +1854,22 @@ bool Emulator::RestoreFromFile(const std::filesystem::path& path) {
   if (patcher_ && kernel_state_) {
     auto module = kernel_state_->GetExecutableModule();
     if (module) {
-      // The reloaded module has no hash yet (only the launch path computes
-      // it), and the patch DB matches on it.
-      if (!module->hash().has_value()) {
-        module->CalculateHash();
+      // The patch DB matches on the hash of the unpatched code section,
+      // computed when the title loaded. Hashing the restored memory instead
+      // (as this did before) sees the bytes of every patch that was on at
+      // the save, matches nothing, and re-applies nothing.
+      std::optional<uint64_t> hash = title_module_hash_;
+      if (!hash.has_value()) {
+        if (!module->hash().has_value()) {
+          module->CalculateHash();
+        }
+        hash = module->hash();
+        XELOGW("RestoreFromFile: no launch-time module hash; using the hash "
+               "of the restored code, which may not match the patch DB");
       }
       XELOGI("RestoreFromFile: re-applying patches for {:08X} (hash {:016X})",
-             module->title_id(), module->hash().value_or(0));
-      patcher_->ApplyPatchesForTitle(memory_.get(), module->title_id(),
-                                     module->hash());
+             module->title_id(), hash.value_or(0));
+      patcher_->ApplyPatchesForTitle(memory_.get(), module->title_id(), hash);
     }
   }
 
@@ -2242,6 +2250,7 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
 
   // Reset state.
   title_id_ = std::nullopt;
+  title_module_hash_.reset();
   title_name_ = "";
   title_version_ = "";
   display_window_->SetIcon(nullptr, 0);

@@ -124,6 +124,18 @@ DEFINE_string(ui_experiment_dialog, "",
               "hotkeys, display, console, xmp. For reproducing UI crashes "
               "without a keyboard.",
               "General");
+DEFINE_int32(screenshot_burst_seconds, 0,
+             "Diagnostic: from N seconds after launch, save every new frame's "
+             "guest output as a PNG (screenshot_burst_frames of them) into "
+             "screenshot_burst_dir, named by swap number. For flicker analysis.",
+             "UI");
+DEFINE_int32(screenshot_burst_frames, 30,
+             "Diagnostic: frames to save for --screenshot_burst_seconds.",
+             "UI");
+DEFINE_string(screenshot_burst_dir, "",
+              "Diagnostic: folder for --screenshot_burst_seconds (default "
+              "<exe folder>/screenshots/<title id>/burst).",
+              "UI");
 DEFINE_int32(ui_experiment_seconds, 30,
              "Experiment: delay before --ui_experiment_dialog opens.",
              "General");
@@ -1197,6 +1209,60 @@ bool EmulatorWindow::Initialize() {
   main_menu->AddChild(std::move(help_menu));
 
   window_->SetMainMenu(std::move(main_menu));
+
+  if (cvars::screenshot_burst_seconds > 0) {
+    std::thread([this]() {
+      xe::threading::set_name("Screenshot Burst");
+      std::this_thread::sleep_for(
+          std::chrono::seconds(cvars::screenshot_burst_seconds));
+      auto* gs = emulator()->graphics_system();
+      if (!gs || !gs->command_processor()) {
+        XELOGE("SCREENSHOT BURST: no graphics system");
+        return;
+      }
+      std::filesystem::path dir = cvars::screenshot_burst_dir;
+      if (dir.empty()) {
+        dir = xe::filesystem::GetExecutableFolder() / "screenshots" /
+              fmt::format("{:08X}", emulator()->title_id()) / "burst";
+      }
+      std::filesystem::create_directories(dir);
+      uint64_t last = gs->command_processor()->swap_count();
+      int saved = 0;
+      auto t0 = std::chrono::steady_clock::now();
+      // Readback per frame, PNG encoding after the burst: encoding a 2x
+      // frame takes longer than a frame, and the frames must be consecutive.
+      std::vector<std::pair<uint64_t, xe::ui::RawImage>> captured;
+      captured.reserve(cvars::screenshot_burst_frames);
+      while (saved < cvars::screenshot_burst_frames) {
+        uint64_t now = gs->command_processor()->swap_count();
+        if (now == last) {
+          std::this_thread::sleep_for(std::chrono::microseconds(500));
+          if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(30)) {
+            XELOGW("SCREENSHOT BURST: gave up after 30 s, {} frames saved",
+                   saved);
+            return;
+          }
+          continue;
+        }
+        last = now;
+        app_context().CallInUIThreadSynchronous([this, &captured, now]() {
+          xe::ui::RawImage image;
+          auto* presenter = GetGraphicsSystemPresenter();
+          if (presenter && presenter->CaptureGuestOutput(image)) {
+            captured.emplace_back(now, std::move(image));
+          }
+        });
+        ++saved;
+      }
+      for (auto& [swap, image] : captured) {
+        SaveImage(dir / fmt::format("frame_{:06}.png", swap), image);
+      }
+      XELOGI("SCREENSHOT BURST: {} frames saved to {} (swaps {}..{})",
+             captured.size(), dir.string(),
+             captured.empty() ? 0 : captured.front().first,
+             captured.empty() ? 0 : captured.back().first);
+    }).detach();
+  }
 
   if (!cvars::ui_experiment_dialog.empty()) {
     std::thread([this]() {
