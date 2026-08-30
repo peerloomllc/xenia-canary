@@ -4,71 +4,69 @@
     </a>
 </p>
 
-<h1 align="center">Xenia Canary - Xbox 360 Emulator</h1>
+<h1 align="center">Xenia Canary (PeerLoom)</h1>
+<p align="center">Xbox 360 emulator &mdash; save states, quality-of-life features, fixes</p>
 
-Xenia Canary is an experimental fork of the Xenia emulator. For more information, see the
-[Xenia Canary wiki](https://github.com/xenia-canary/xenia-canary/wiki).
+This is [PeerLoom LLC](https://peerloomllc.com)'s fork of the
+[Xenia Canary](https://github.com/xenia-canary/xenia-canary) Xbox 360
+emulator. It adds save states and a set of quality-of-life features and
+fixes, currently developed and tested on the **native Linux build**
+(Vulkan, SDL audio, GTK UI); bringing the same features to the Windows
+build is planned. It is not affiliated with the Xenia project.
 
-Come chat with us about **emulator-related topics** on [Discord](https://discord.gg/Q9mxZf9).
-For developer chat join `#dev` but stay on topic. Lurking is not only fine, but encouraged!
-Please check the [FAQ](https://github.com/xenia-canary/xenia-canary/wiki/FAQ) page before asking questions.
-We've got jobs/lives/etc, so don't expect instant answers.
+Problems with this fork (save states, the added features, Linux issues)
+belong in [this repository's issues](https://github.com/peerloomllc/xenia-canary/issues).
+General questions about Xenia are covered by the upstream
+[wiki](https://github.com/xenia-canary/xenia-canary/wiki) and
+[FAQ](https://github.com/xenia-canary/xenia-canary/wiki/FAQ).
 
-Discussing illegal activities will get you banned.
+<p align="center">
+    <img src="assets/peerloom/dashboard.png" width="720" alt="Game library dashboard" />
+</p>
 
-## This fork: native Linux work (peerloomllc)
+## Highlights
 
-This is [xenia-canary](https://github.com/xenia-canary/xenia-canary) at
-commit `9d08d64b5` plus fixes and features for the **native Linux build**
-(the Vulkan renderer, SDL audio, GTK UI), developed and tested on Fedora
-with an NVIDIA GPU, mainly with Lost Odyssey, Eternal Sonata and Blue
-Dragon. It is not affiliated with the Xenia project. The pieces that are
-general fixes are offered upstream as separate pull requests; everything
-else lives here. Branch: `linux-native-work`.
+* **Save states**: nine slots per title (per disc for multi-disc games),
+  F8 saves, F10 loads, PageUp/PageDown picks the slot, with thumbnails
+  and an in-game slot table. Guest memory, threads, kernel objects, the
+  guest clock, GPU state and EDRAM, XMA audio decoder state, mounted DLC
+  and the signed-in profile are all in the file. Single-player only.
+* **Pause, fast-forward, slow-motion**: F7 pauses (the game's clock stops
+  with it), numpad + - * change speed with time-stretched audio
+  (SoundTouch), Delete mutes, an FPS overlay; all keys reassignable
+  in-app.
+* **Preferences window**: graphics (output, colour filters, accuracy,
+  performance), audio, input, folders (games, content, save states),
+  per-game patches with lookup and download from the community patch
+  repository, profiles, console settings.
+* **Game library dashboard**: your scanned games folder with icons, list
+  or grid view, playtime, and launch on double-click.
+* **Linux fixes**: guest threads that never started (games hanging at
+  loading screens), kernel timers with past due times never firing
+  (silent games), a syscall on every mutex lock, ImGui crashes with CJK
+  fonts, and more. The generally useful ones are offered upstream as
+  pull requests.
 
-**Fixes**
+The [releases](https://github.com/peerloomllc/xenia-canary/releases) page
+is the changelog.
 
-* Guest threads sometimes never started on Linux (a resume lost between
-  the thread publishing "started" and setting its own suspend count):
-  Lost Odyssey hung at "Loading" about half the time. Upstream PR
-  [#1187](https://github.com/xenia-canary/xenia-canary/pull/1187).
-* Kernel timers with an absolute due time in the past never fired
-  (Eternal Sonata was silent).
-* The Linux mutex made a `gettid` syscall on every lock (39,000/s on the
-  GPU thread); the ring buffer read pointer was published to the guest
-  once per burst instead of as it advanced. Both cost frame rate.
-* Any ImGui dialog crashed the native build when fontconfig picked a CFF
-  CJK font.
-* A title opened in the first seconds after the window appeared
-  deadlocked the UI thread.
+<p align="center">
+    <img src="assets/peerloom/preferences.png" width="720" alt="Preferences window" />
+</p>
 
-**Features**
+## Status
 
-* Save states: F8 saves, F10 loads, PageUp/PageDown pick one of nine
-  slots per title (per disc for multi-disc titles), with a thumbnail and
-  a slot table. LZ4-compressed files; the game pauses for a few hundred
-  milliseconds. Guest memory, threads, kernel objects, the guest clock,
-  GPU registers and EDRAM, XMA decoder state, the media player, mounted
-  DLC and the signed-in profile are in the file. Single-player only;
-  nothing online is saved.
-* Pause (F7), fast-forward and slow-motion (numpad + - *) with
-  time-stretched audio (SoundTouch), mute (Delete), an FPS overlay, all
-  reassignable in-app.
-* A GTK Preferences window (Settings menu): Graphics (output, colour
-  filters, accuracy, performance), Audio, Input, Folders (games, content,
-  save states), Patches (per-game patch toggles, lookup and download from
-  the community patch repository), Profiles, Console.
-* A game library dashboard when no title runs: scanned games folder,
-  icons, list or grid view, launch.
-* Menus: File, Emulation, Settings, Tools, Help; Reset Game and Close
-  Game; the advanced GPU options in a dialog; per-title content listing.
-* Diagnostic flags for guest-side investigation (`--stack_dump_interval_seconds`,
-  `--watch_guest_pointer`, `--find_guest_refs`, `--find_guest_pattern`,
-  `--poke_guest_memory`, `--trace_event_handles`, `--stats_log_seconds`,
-  `--log_wait_reg_mem`); a save-state hang leaves the stalled thread's
-  stack in the log.
+CI | Releases
+-- | --------
+[![Fork Linux AppImage](https://github.com/peerloomllc/xenia-canary/actions/workflows/Fork_Linux_AppImage.yml/badge.svg?branch=linux-native-work)](https://github.com/peerloomllc/xenia-canary/actions/workflows/Fork_Linux_AppImage.yml) | [Latest](https://github.com/peerloomllc/xenia-canary/releases/latest) &middot; [All](https://github.com/peerloomllc/xenia-canary/releases)
 
-**Building on Fedora (44)**
+Each release carries an **AppImage** built on Ubuntu 24.04 (needs glibc
+2.39 or newer and a Vulkan driver; `chmod +x` and run) and a **tarball**
+built on Fedora 44 against its system libraries.
+
+## Building
+
+On Fedora (44):
 
 ```sh
 sudo dnf install clang cmake ninja-build python3 gtk3-devel lz4-devel sdl2-compat-devel \
@@ -80,65 +78,56 @@ export CC=/usr/bin/clang CXX=/usr/bin/clang++
 build/bin/Linux/Release/xenia_canary --gpu=vulkan --apu=sdl
 ```
 
-Other distributions: the same libraries under their own names; see
-[docs/building.md](docs/building.md) for the Ubuntu package list.
-[Releases](https://github.com/peerloomllc/xenia-canary/releases) carry an
-AppImage built on Ubuntu 24.04 (needs glibc 2.39 or newer and a Vulkan
-driver) and a tarball built on Fedora 44 against its system libraries.
+Other distributions need the same libraries under their own names; see
+[docs/building.md](docs/building.md) for the Ubuntu package list and the
+`xb` script.
 
-**Support development**: https://peerloomllc.com/about/
+## Game compatibility
 
----
+The upstream [game compatibility list](https://github.com/xenia-canary/game-compatibility/issues)
+is the per-game status tracker. Reports there reflect upstream builds;
+behaviour specific to this fork (save states, the added features, Linux
+issues) belongs in [our issues](https://github.com/peerloomllc/xenia-canary/issues).
 
-## Status
+## Upstream documentation
 
-Buildbot | Status | Releases
--------- | ------ | --------
-Canary (🪟, 🐧) | [![CI](https://github.com/xenia-canary/xenia-canary/actions/workflows/Orchestrator.yml/badge.svg?branch=canary_experimental)](https://github.com/xenia-canary/xenia-canary/actions/workflows/Orchestrator.yml/badge.svg?branch=canary_experimental) [![Codacy Badge](https://app.codacy.com/project/badge/Grade/cd506034fd8148309a45034925648499)](https://app.codacy.com/gh/xenia-canary/xenia-canary/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade) | [Latest](https://github.com/xenia-canary/xenia-canary/releases/latest) ◦ [All](https://github.com/xenia-canary/xenia-canary/releases) ◦ [Old](https://github.com/xenia-canary/xenia-canary-releases/releases)
+The upstream [Quickstart](https://github.com/xenia-canary/xenia-canary/wiki/Quickstart),
+[FAQ](https://github.com/xenia-canary/xenia-canary/wiki/FAQ) and
+[wiki](https://github.com/xenia-canary/xenia-canary/wiki) apply to this
+fork too.
 
-### Experimental Netplay
+## Contributing
 
-Buildbot | Status | Releases
--------- | ------ | --------
-Windows | [![Codacy Badge](https://app.codacy.com/project/badge/Grade/d814c4b6aa444dcc9c1631e0224b2739)](https://app.codacy.com/gh/AdrianCassar/xenia-canary/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade) | [Latest](https://github.com/AdrianCassar/xenia-canary/releases/latest)
+Pull requests to this fork are welcome, especially on the Linux side.
+Work of general value to the emulator should go to
+[upstream xenia-canary](https://github.com/xenia-canary/xenia-canary),
+as this fork's own fixes do; upstream's
+[contributing guide](https://github.com/xenia-canary/xenia-canary/blob/canary_experimental/.github/CONTRIBUTING.md)
+and [style guide](docs/style_guide.md) apply here as well.
 
-## Quickstart
+## Relationship to upstream
 
-See the [Quickstart](https://github.com/xenia-canary/xenia-canary/wiki/Quickstart) page.
+Based on xenia-canary `9d08d64b5`. General fixes from this fork are
+offered upstream as pull requests
+([#1187](https://github.com/xenia-canary/xenia-canary/pull/1187),
+[#1193](https://github.com/xenia-canary/xenia-canary/pull/1193),
+[#1194](https://github.com/xenia-canary/xenia-canary/pull/1194));
+the branch is rebased onto upstream periodically.
 
-## FAQ
+## Licence
 
-See the [frequently asked questions](https://github.com/xenia-canary/xenia-canary/wiki/FAQ) page.
+BSD 3-Clause, the same as Xenia ([LICENSE](LICENSE)). Third-party
+components include [SoundTouch](https://codeberg.org/soundtouch/soundtouch)
+(LGPL 2.1, `third_party/soundtouch` submodule) and Project Nayuki's
+[QR Code generator](https://github.com/nayuki/QR-Code-generator)
+(MIT, vendored in `third_party/qrcodegen`), alongside upstream's
+third-party set.
 
-## Game Compatibility
+## Support development
 
-See the [Game compatibility list](https://github.com/xenia-canary/game-compatibility/issues)
-for currently tracked games, and feel free to contribute your own updates,
-screenshots, and information there following the [existing conventions](https://github.com/xenia-canary/game-compatibility/blob/canary/README.md).
-
-## Building
-
-See [building.md](docs/building.md) for setup and information about the
-`xb` script. When writing code, check the [style guide](docs/style_guide.md)
-and be sure to run clang-format!
-
-## Contributors Wanted!
-
-Have some spare time, know advanced C++, and want to write an emulator?
-Contribute! There's a ton of work that needs to be done, a lot of which
-is wide open greenfield fun.
-
-**For general rules and guidelines please see [CONTRIBUTING.md](.github/CONTRIBUTING.md).**
-
-Fixes and optimizations are always welcome (please!), but in addition to
-that there are some major work areas still untouched:
-
-* Help work through [missing functionality/bugs in games](https://github.com/xenia-canary/xenia-canary/labels/compat)
-* Reduce the size of Xenia's [huge log files](https://github.com/xenia-canary/xenia-canary/issues/1526)
-* Skilled with Linux? A strong contributor is needed to [help with porting](https://github.com/xenia-canary/xenia-canary/labels/platform-linux)
-
-See more projects [good for contributors](https://github.com/xenia-canary/xenia-canary/labels/good%20first%20issue). It's a good idea to ask on Discord and check the issues page before beginning work on
-something.
+If you receive value from this project, please consider returning value:
+**Help &gt; Support development...** in the emulator, or
+[peerloomllc.com/about](https://peerloomllc.com/about/).
 
 ## Disclaimer
 
