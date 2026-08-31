@@ -456,6 +456,37 @@ bool VulkanCommandProcessor::SetupContext() {
         draw_resolution_scale_x, draw_resolution_scale_y);
   }
 
+  // Dirty region tracking buffers - before the render target cache so its
+  // bounded-transfer setup can reference the buffer.
+  if (cvars::dirty_region_tracking &&
+      device_properties.vertexPipelineStoresAndAtomics) {
+    const VkDeviceSize dirty_bbox_size =
+        sizeof(uint32_t) * 4 * RenderTargetCache::kDirtyBboxSlotCount;
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device, dirty_bbox_size,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            ui::vulkan::util::MemoryPurpose::kDeviceLocal, dirty_bbox_buffer_,
+            dirty_bbox_buffer_memory_)) {
+      XELOGE("Failed to create the dirty bounding box buffer");
+      return false;
+    }
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device, dirty_bbox_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            ui::vulkan::util::MemoryPurpose::kReadback,
+            dirty_bbox_readback_buffer_, dirty_bbox_readback_buffer_memory_)) {
+      XELOGE("Failed to create the dirty bounding box readback buffer");
+      return false;
+    }
+    if (dfn.vkMapMemory(device, dirty_bbox_readback_buffer_memory_, 0,
+                        VK_WHOLE_SIZE, 0,
+                        &dirty_bbox_readback_mapping_) != VK_SUCCESS) {
+      XELOGE("Failed to map the dirty bounding box readback buffer");
+      return false;
+    }
+  }
+
   render_target_cache_ = std::make_unique<VulkanRenderTargetCache>(
       *register_file_, *memory_, trace_writer_, draw_resolution_scale_x,
       draw_resolution_scale_y, *this);
@@ -512,7 +543,8 @@ bool VulkanCommandProcessor::SetupContext() {
     shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount = 3;
   } else {
     dirty_bbox_enabled_ = cvars::dirty_region_tracking &&
-                          device_properties.vertexPipelineStoresAndAtomics;
+                          device_properties.vertexPipelineStoresAndAtomics &&
+                          dirty_bbox_buffer_ != VK_NULL_HANDLE;
     if (dirty_bbox_enabled_) {
       // Dirty bounding box buffer, written by guest vertex shaders.
       shared_memory_and_edram_descriptor_set_layout_bindings[1].binding = 1;
@@ -573,34 +605,6 @@ bool VulkanCommandProcessor::SetupContext() {
             zpd_fsi_counter_sink_buffer_,
             zpd_fsi_counter_sink_buffer_memory_)) {
       XELOGE("Failed to create the ZPD FSI counter sink buffer");
-      return false;
-    }
-  }
-
-  if (dirty_bbox_enabled_) {
-    const VkDeviceSize dirty_bbox_size =
-        sizeof(uint32_t) * 4 * RenderTargetCache::kDirtyBboxSlotCount;
-    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
-            vulkan_device, dirty_bbox_size,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            ui::vulkan::util::MemoryPurpose::kDeviceLocal, dirty_bbox_buffer_,
-            dirty_bbox_buffer_memory_)) {
-      XELOGE("Failed to create the dirty bounding box buffer");
-      return false;
-    }
-    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
-            vulkan_device, dirty_bbox_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            ui::vulkan::util::MemoryPurpose::kReadback,
-            dirty_bbox_readback_buffer_, dirty_bbox_readback_buffer_memory_)) {
-      XELOGE("Failed to create the dirty bounding box readback buffer");
-      return false;
-    }
-    if (dfn.vkMapMemory(device, dirty_bbox_readback_buffer_memory_, 0,
-                        VK_WHOLE_SIZE, 0,
-                        &dirty_bbox_readback_mapping_) != VK_SUCCESS) {
-      XELOGE("Failed to map the dirty bounding box readback buffer");
       return false;
     }
   }
@@ -4343,6 +4347,32 @@ void VulkanCommandProcessor::CheckSubmissionCompletionAndDeviceLoss(
   }
 }
 
+void VulkanCommandProcessor::CaptureDirtyBboxPairProbe(uint32_t source_slot,
+                                                       uint32_t dest_slot) {
+  if (!dirty_bbox_enabled_ || dirty_bbox_pair_probe_pending_ ||
+      dirty_bbox_readback_buffer_ == VK_NULL_HANDLE) {
+    return;
+  }
+  // Two boxes into the tail of the readback buffer (the frame-end diagnostic
+  // copy only writes the slot area it reads, addressed from 0).
+  const VkDeviceSize probe_offset =
+      sizeof(uint32_t) * 4 * (RenderTargetCache::kDirtyBboxSlotCount - 2);
+  VkBufferCopy probe_copies[2];
+  probe_copies[0].srcOffset =
+      VkDeviceSize(source_slot) * (sizeof(uint32_t) * 4);
+  probe_copies[0].dstOffset = probe_offset;
+  probe_copies[0].size = sizeof(uint32_t) * 4;
+  probe_copies[1].srcOffset = VkDeviceSize(dest_slot) * (sizeof(uint32_t) * 4);
+  probe_copies[1].dstOffset = probe_offset + sizeof(uint32_t) * 4;
+  probe_copies[1].size = sizeof(uint32_t) * 4;
+  deferred_command_buffer_.CmdVkCopyBuffer(
+      dirty_bbox_buffer_, dirty_bbox_readback_buffer_, 2, probe_copies);
+  dirty_bbox_pair_probe_pending_ = true;
+  dirty_bbox_pair_probe_submission_ = GetCurrentSubmission();
+  dirty_bbox_pair_probe_slots_[0] = source_slot;
+  dirty_bbox_pair_probe_slots_[1] = dest_slot;
+}
+
 void VulkanCommandProcessor::StartGpuTimeSubmission() {
   gpu_time_active_ = false;
   if (gpu_time_query_pool_ == VK_NULL_HANDLE) {
@@ -4572,6 +4602,32 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
           VK_ACCESS_TRANSFER_WRITE_BIT,
           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     }
+    if (dirty_bbox_pair_probe_pending_ &&
+        completed_submission >= dirty_bbox_pair_probe_submission_) {
+      dirty_bbox_pair_probe_pending_ = false;
+      const ui::vulkan::VulkanDevice* const vulkan_device_probe =
+          GetVulkanDevice();
+      VkMappedMemoryRange probe_range = {};
+      probe_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+      probe_range.memory = dirty_bbox_readback_buffer_memory_;
+      probe_range.offset = 0;
+      probe_range.size = VK_WHOLE_SIZE;
+      vulkan_device_probe->functions().vkInvalidateMappedMemoryRanges(
+          vulkan_device_probe->device(), 1, &probe_range);
+      const uint32_t* probe_boxes =
+          static_cast<const uint32_t*>(dirty_bbox_readback_mapping_) +
+          size_t(RenderTargetCache::kDirtyBboxSlotCount - 2) * 4;
+      for (uint32_t probe_i = 0; probe_i < 2; ++probe_i) {
+        const uint32_t* box = probe_boxes + probe_i * 4;
+        XELOGI(
+            "Dirty bbox pair probe {} slot {}: px x [{}, {}] y [{}, {}]",
+            probe_i ? "dest" : "source", dirty_bbox_pair_probe_slots_[probe_i],
+            65535 - std::min<uint32_t>(box[0], 65535),
+            std::min<uint32_t>(box[2], 65535),
+            65535 - std::min<uint32_t>(box[1], 65535),
+            std::min<uint32_t>(box[3], 65535));
+      }
+    }
     if (dirty_bbox_readback_pending_ &&
         completed_submission >= dirty_bbox_readback_submission_) {
       dirty_bbox_readback_pending_ = false;
@@ -4596,15 +4652,13 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
         if (!(box[0] | box[1] | box[2] | box[3])) {
           continue;
         }
-        float min_x = (65535 - std::min<uint32_t>(box[0], 65535)) / 655.35f;
-        float min_y = (65535 - std::min<uint32_t>(box[1], 65535)) / 655.35f;
-        float max_x = std::min<uint32_t>(box[2], 65535) / 655.35f;
-        float max_y = std::min<uint32_t>(box[3], 65535) / 655.35f;
+        uint32_t min_x = 65535 - std::min<uint32_t>(box[0], 65535);
+        uint32_t min_y = 65535 - std::min<uint32_t>(box[1], 65535);
+        uint32_t max_x = std::min<uint32_t>(box[2], 65535);
+        uint32_t max_y = std::min<uint32_t>(box[3], 65535);
         ++logged;
-        XELOGI(
-            "Dirty bbox slot {}: raw {:04X} {:04X} {:04X} {:04X} -> "
-            "x [{:.1f}%, {:.1f}%] y [{:.1f}%, {:.1f}%]",
-            slot, box[0], box[1], box[2], box[3], min_x, max_x, min_y, max_y);
+        XELOGI("Dirty bbox slot {}: px x [{}, {}] y [{}, {}]", slot, min_x,
+               max_x, min_y, max_y);
       }
     }
 
@@ -5670,12 +5724,42 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
 
   // Dirty region tracking: the bounding box slot of the bound depth / stencil
   // render target (depth only in the first stage).
-  uint32_t dirty_bbox_slot =
-      dirty_bbox_enabled_
-          ? render_target_cache_->last_update_used_depth_dirty_bbox_slot()
-          : UINT32_MAX;
+  uint32_t dirty_bbox_slot = UINT32_MAX;
+  if (dirty_bbox_enabled_) {
+    // Only draws that can actually write depth or stencil dirty the box; a
+    // depth test alone changes nothing (this is what makes the copy back
+    // from a test-only pass collapsible).
+    bool depth_written =
+        normalized_depth_control.z_write_enable != 0 ||
+        (normalized_depth_control.stencil_enable &&
+         (regs.Get<reg::RB_STENCILREFMASK>().stencilwritemask ||
+          (normalized_depth_control.backface_enable &&
+           regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF)
+               .stencilwritemask)));
+    if (depth_written) {
+      dirty_bbox_slot =
+          render_target_cache_->last_update_used_depth_dirty_bbox_slot();
+    }
+  }
   dirty |= system_constants_.dirty_bbox_slot != dirty_bbox_slot;
   system_constants_.dirty_bbox_slot = dirty_bbox_slot;
+  if (dirty_bbox_enabled_) {
+    // px = ndc * scale + offset for the current host viewport.
+    float bbox_px_scale_x = float(viewport_info.xy_extent[0]) * 0.5f;
+    float bbox_px_scale_y = float(viewport_info.xy_extent[1]) * 0.5f;
+    float bbox_px_offset_x = float(viewport_info.xy_offset[0]) +
+                             bbox_px_scale_x;
+    float bbox_px_offset_y = float(viewport_info.xy_offset[1]) +
+                             bbox_px_scale_y;
+    dirty |= system_constants_.dirty_bbox_px_scale[0] != bbox_px_scale_x ||
+             system_constants_.dirty_bbox_px_scale[1] != bbox_px_scale_y ||
+             system_constants_.dirty_bbox_px_offset[0] != bbox_px_offset_x ||
+             system_constants_.dirty_bbox_px_offset[1] != bbox_px_offset_y;
+    system_constants_.dirty_bbox_px_scale[0] = bbox_px_scale_x;
+    system_constants_.dirty_bbox_px_scale[1] = bbox_px_scale_y;
+    system_constants_.dirty_bbox_px_offset[0] = bbox_px_offset_x;
+    system_constants_.dirty_bbox_px_offset[1] = bbox_px_offset_y;
+  }
 
   uint32_t edram_tile_dwords_scaled =
       xenos::kEdramTileWidthSamples * xenos::kEdramTileHeightSamples *

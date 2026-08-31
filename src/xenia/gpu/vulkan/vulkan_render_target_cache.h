@@ -498,6 +498,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   enum TransferUsedDescriptorSet : uint32_t {
     // Ordered from the least to the most frequently changed.
+    // Dirty bounding box buffer for bounded transfers, set only when dirty
+    // region tracking is enabled - kept lowest so the vertex shader's set
+    // index is always 0 when present.
+    kTransferUsedDescriptorSetDirtyBbox,
     kTransferUsedDescriptorSetHostDepthBuffer,
     kTransferUsedDescriptorSetHostDepthStencilTextures,
     kTransferUsedDescriptorSetDepthStencilTextures,
@@ -506,6 +510,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
     kTransferUsedDescriptorSetCount,
 
+    kTransferUsedDescriptorSetDirtyBboxBit =
+        uint32_t(1) << kTransferUsedDescriptorSetDirtyBbox,
     kTransferUsedDescriptorSetHostDepthBufferBit =
         uint32_t(1) << kTransferUsedDescriptorSetHostDepthBuffer,
     kTransferUsedDescriptorSetHostDepthStencilTexturesBit =
@@ -519,6 +525,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // 32-bit push constants (for simplicity of size calculation and to avoid
   // std140 packing issues).
   enum TransferUsedPushConstantDword : uint32_t {
+    // Bounded transfer slots (source | dest << 16), UINT32_MAX for a full
+    // transfer; used only with dirty region tracking - kept lowest so the
+    // vertex shader always reads push constant offset 0.
+    kTransferUsedPushConstantDwordBoundedSlots,
     kTransferUsedPushConstantDwordHostDepthAddress,
     kTransferUsedPushConstantDwordAddress,
     // Changed 8 times per transfer.
@@ -526,6 +536,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
     kTransferUsedPushConstantDwordCount,
 
+    kTransferUsedPushConstantDwordBoundedSlotsBit =
+        uint32_t(1) << kTransferUsedPushConstantDwordBoundedSlots,
     kTransferUsedPushConstantDwordHostDepthAddressBit =
         uint32_t(1) << kTransferUsedPushConstantDwordHostDepthAddress,
     kTransferUsedPushConstantDwordAddressBit =
@@ -935,6 +947,19 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool>
       transfer_vertex_buffer_pool_;
   VkShaderModule transfer_passthrough_vertex_shader_ = VK_NULL_HANDLE;
+
+  // Dirty region tracking: bounded transfers (set only when enabled).
+  bool dirty_bbox_transfers_enabled_ = false;
+  TransferPipelineLayoutInfo transfer_pipeline_layout_infos_runtime_[size_t(
+      TransferPipelineLayoutIndex::kCount)];
+  // Builds the transfer vertex shader that passes coordinates through but
+  // collapses the whole draw when the bounded pair's dirty box union is
+  // empty (push constant dword 0: source | dest << 16 slots, UINT32_MAX
+  // for an unbounded transfer).
+  VkShaderModule BuildBoundedTransferVertexShader();
+  VkShaderModule transfer_bounded_vertex_shader_ = VK_NULL_HANDLE;
+  VkDescriptorPool dirty_bbox_descriptor_pool_ = VK_NULL_HANDLE;
+  VkDescriptorSet dirty_bbox_descriptor_set_ = VK_NULL_HANDLE;
   VkPipelineLayout transfer_pipeline_layouts_[size_t(
       TransferPipelineLayoutIndex::kCount)] = {};
   // VK_NULL_HANDLE if failed to create.

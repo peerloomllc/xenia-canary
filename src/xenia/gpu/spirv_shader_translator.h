@@ -278,7 +278,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
         uint32_t edram_stencil_back_reference_masks;
         uint32_t edram_stencil_back_func_ops;
-      };
+      
+    // Dirty region tracking: transform from host NDC to render target pixels
+    // for the current viewport (px = ndc * scale + offset).
+    float dirty_bbox_px_scale[2];
+    float dirty_bbox_px_offset[2];
+  };
       struct {
         uint32_t edram_stencil_front[2];
         uint32_t edram_stencil_back[2];
@@ -1025,6 +1030,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdramRTClamp,
     kSystemConstantEdramBlendConstant,
     kSystemConstantTextureIntegerScaleBits,
+    kSystemConstantDirtyBboxPxScale,
+    kSystemConstantDirtyBboxPxOffset,
   };
   spv::Id uniform_system_constants_;
   spv::Id uniform_clip_plane_constants_;

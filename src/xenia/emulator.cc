@@ -2544,6 +2544,7 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
       uint64_t draws = 0, passes = 0, rtxfers = 0, resolves = 0,
                resolve_px = 0;
       uint64_t rtxfer_bound = 0;
+      uint64_t rtxfer_pushed = 0;
       uint64_t gpu_total_ns = 0, gpu_xfer_ns = 0, gpu_resolve_ns = 0;
       uint64_t scissor_area = 0;
       uint64_t frag_invocations = 0;
@@ -2564,6 +2565,7 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
         uint64_t rp = gpu::CommandProcessor::stats_render_pass_count_.load();
         uint64_t tx = gpu::RenderTargetCache::stats_transfer_count_.load();
         uint64_t txb = gpu::RenderTargetCache::stats_transfer_bounded_eligible_.load();
+        uint64_t txp = gpu::RenderTargetCache::stats_transfer_bounded_pushed_.load();
         uint64_t rv = gpu::RenderTargetCache::stats_resolve_count_.load();
         uint64_t rvp = gpu::RenderTargetCache::stats_resolve_pixels_.load();
         uint64_t gt = gpu::CommandProcessor::stats_gpu_total_ns_.load();
@@ -2577,13 +2579,13 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
         XELOGI(
             "STATS t={:.0f}s guest={:.1f}s swaps +{} ({:.1f}/s) audio_frames "
             "+{} ({:.1f}/s, {} silent) xma_packets +{} sdl_callbacks +{} "
-            "starved +{} draws +{} passes +{} rt_transfers +{} (boundable +{}) resolves +{} ({:.1f} MPix) gpu_ms +{:.0f} (xfer {:.0f}, resolve {:.0f}) scissor_kpx/draw {:.0f} frag +{:.0f}M{}",
+            "starved +{} draws +{} passes +{} rt_transfers +{} (boundable +{} pushed +{}) resolves +{} ({:.1f} MPix) gpu_ms +{:.0f} (xfer {:.0f}, resolve {:.0f}) scissor_kpx/draw {:.0f} frag +{:.0f}M{}",
             t,
             double(Clock::QueryGuestTickCount()) / Clock::guest_tick_frequency(),
             s - swaps, double(s - swaps) / period, a - audio,
             double(a - audio) / period, q - silent, x - xma, c - cbs,
             st - starved, d - draws, rp - passes, tx - rtxfers,
-            txb - rtxfer_bound, rv - resolves,
+            txb - rtxfer_bound, txp - rtxfer_pushed, rv - resolves,
             double(rvp - resolve_px) / 1e6,
             double(gt - gpu_total_ns) / 1e6, double(gx - gpu_xfer_ns) / 1e6,
             double(gr - gpu_resolve_ns) / 1e6,
@@ -2599,6 +2601,7 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
         passes = rp;
         rtxfers = tx;
         rtxfer_bound = txb;
+        rtxfer_pushed = txp;
         resolves = rv;
         resolve_px = rvp;
         swaps = s;

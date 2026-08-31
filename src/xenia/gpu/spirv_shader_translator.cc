@@ -338,6 +338,10 @@ void SpirvShaderTranslator::StartTranslation() {
       {"texture_integer_scale_bits",
        offsetof(SystemConstants, texture_integer_scale_bits),
        type_uint4_array_8},
+      {"dirty_bbox_px_scale", offsetof(SystemConstants, dirty_bbox_px_scale),
+       type_float2_},
+      {"dirty_bbox_px_offset",
+       offsetof(SystemConstants, dirty_bbox_px_offset), type_float2_},
   };
   id_vector_temp_.clear();
   id_vector_temp_.reserve(xe::countof(system_constants));
@@ -2373,26 +2377,42 @@ void SpirvShaderTranslator::CompleteVertexShaderDirtyBbox(
   spv::Id inv_w = builder_->createNoContractionBinOp(
       spv::OpFDiv, type_float_, const_float_1_, position_w);
   spv::Id const_uint_65535 = builder_->makeUintConstant(65535);
+  // Transform NDC into render target pixels with the current viewport
+  // (boxes must be comparable across draws with different viewports), clamp
+  // to the quantization range.
   spv::Id quantized[2];
   for (uint32_t axis = 0; axis < 2; ++axis) {
     spv::Id ndc = builder_->createNoContractionBinOp(
         spv::OpFMul, type_float_,
         builder_->createCompositeExtract(position, type_float_, axis), inv_w);
-    // [-1, 1] -> [0, 1], clamped.
-    spv::Id unorm = builder_->createTriBuiltinCall(
-        type_float_, ext_inst_glsl_std_450_, GLSLstd450NClamp,
-        builder_->createNoContractionBinOp(
-            spv::OpFAdd, type_float_,
-            builder_->createNoContractionBinOp(
-                spv::OpFMul, type_float_, ndc,
-                builder_->makeFloatConstant(0.5f)),
-            builder_->makeFloatConstant(0.5f)),
-        const_float_0_, const_float_1_);
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(
+        builder_->makeIntConstant(kSystemConstantDirtyBboxPxScale));
+    id_vector_temp_.push_back(builder_->makeIntConstant(int(axis)));
+    spv::Id px_scale = builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassUniform,
+                                    uniform_system_constants_,
+                                    id_vector_temp_),
+        spv::NoPrecision);
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(
+        builder_->makeIntConstant(kSystemConstantDirtyBboxPxOffset));
+    id_vector_temp_.push_back(builder_->makeIntConstant(int(axis)));
+    spv::Id px_offset = builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassUniform,
+                                    uniform_system_constants_,
+                                    id_vector_temp_),
+        spv::NoPrecision);
+    spv::Id pixels = builder_->createNoContractionBinOp(
+        spv::OpFAdd, type_float_,
+        builder_->createNoContractionBinOp(spv::OpFMul, type_float_, ndc,
+                                           px_scale),
+        px_offset);
     quantized[axis] = builder_->createUnaryOp(
         spv::OpConvertFToU, type_uint_,
-        builder_->createNoContractionBinOp(
-            spv::OpFMul, type_float_, unorm,
-            builder_->makeFloatConstant(65535.0f)));
+        builder_->createTriBuiltinCall(
+            type_float_, ext_inst_glsl_std_450_, GLSLstd450NClamp, pixels,
+            const_float_0_, builder_->makeFloatConstant(65535.0f)));
   }
   // Four atomic max values: inverted minimums first (so a zeroed buffer means
   // an empty box), then maximums.

@@ -212,6 +212,7 @@ namespace gpu {
 
 std::atomic<uint64_t> RenderTargetCache::stats_transfer_count_{0};
 std::atomic<uint64_t> RenderTargetCache::stats_transfer_bounded_eligible_{0};
+std::atomic<uint64_t> RenderTargetCache::stats_transfer_bounded_pushed_{0};
 std::atomic<uint64_t> RenderTargetCache::stats_resolve_count_{0};
 std::atomic<uint64_t> RenderTargetCache::stats_resolve_pixels_{0};
 

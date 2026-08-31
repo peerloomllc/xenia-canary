@@ -30,6 +30,8 @@
 #include "xenia/gpu/xenos.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
 
+DECLARE_bool(dirty_region_tracking);
+
 DEFINE_bool(
     log_rt_transfer_map, false,
     "Every ~5 seconds, log the most frequent render target ownership "
@@ -300,7 +302,8 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   descriptor_set_layout_bindings[0].descriptorCount = 1;
   descriptor_set_layout_bindings[0].stageFlags =
-      VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
+      VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
+      VK_SHADER_STAGE_COMPUTE_BIT;
   descriptor_set_layout_bindings[0].pImmutableSamplers = nullptr;
   VkDescriptorSetLayoutCreateInfo descriptor_set_layout_create_info;
   descriptor_set_layout_create_info.sType =
@@ -664,12 +667,94 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
       return false;
     }
 
+    // Bounded transfers (dirty region tracking): adjust the layout infos and
+    // build the bounding vertex shader and the bbox descriptor set.
+    dirty_bbox_transfers_enabled_ =
+        cvars::dirty_region_tracking &&
+        vulkan_device->properties().vertexPipelineStoresAndAtomics &&
+        command_processor_.dirty_bbox_buffer() != VK_NULL_HANDLE;
+    for (size_t i = 0; i < size_t(TransferPipelineLayoutIndex::kCount); ++i) {
+      transfer_pipeline_layout_infos_runtime_[i] =
+          kTransferPipelineLayoutInfos[i];
+      if (dirty_bbox_transfers_enabled_) {
+        transfer_pipeline_layout_infos_runtime_[i].used_descriptor_sets |=
+            kTransferUsedDescriptorSetDirtyBboxBit;
+        transfer_pipeline_layout_infos_runtime_[i].used_push_constant_dwords |=
+            kTransferUsedPushConstantDwordBoundedSlotsBit;
+      }
+    }
+    if (dirty_bbox_transfers_enabled_) {
+      transfer_bounded_vertex_shader_ = BuildBoundedTransferVertexShader();
+      if (transfer_bounded_vertex_shader_ == VK_NULL_HANDLE) {
+        dirty_bbox_transfers_enabled_ = false;
+        for (size_t i = 0; i < size_t(TransferPipelineLayoutIndex::kCount);
+             ++i) {
+          transfer_pipeline_layout_infos_runtime_[i] =
+              kTransferPipelineLayoutInfos[i];
+        }
+      }
+    }
+    if (dirty_bbox_transfers_enabled_) {
+      VkDescriptorPoolSize dirty_bbox_pool_size;
+      dirty_bbox_pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      dirty_bbox_pool_size.descriptorCount = 1;
+      VkDescriptorPoolCreateInfo dirty_bbox_pool_create_info = {};
+      dirty_bbox_pool_create_info.sType =
+          VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+      dirty_bbox_pool_create_info.maxSets = 1;
+      dirty_bbox_pool_create_info.poolSizeCount = 1;
+      dirty_bbox_pool_create_info.pPoolSizes = &dirty_bbox_pool_size;
+      if (dfn.vkCreateDescriptorPool(device, &dirty_bbox_pool_create_info,
+                                     nullptr,
+                                     &dirty_bbox_descriptor_pool_) !=
+          VK_SUCCESS) {
+        dirty_bbox_transfers_enabled_ = false;
+      } else {
+        VkDescriptorSetAllocateInfo dirty_bbox_set_allocate_info = {};
+        dirty_bbox_set_allocate_info.sType =
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dirty_bbox_set_allocate_info.descriptorPool =
+            dirty_bbox_descriptor_pool_;
+        dirty_bbox_set_allocate_info.descriptorSetCount = 1;
+        dirty_bbox_set_allocate_info.pSetLayouts =
+            &descriptor_set_layout_storage_buffer_;
+        if (dfn.vkAllocateDescriptorSets(device, &dirty_bbox_set_allocate_info,
+                                         &dirty_bbox_descriptor_set_) !=
+            VK_SUCCESS) {
+          dirty_bbox_transfers_enabled_ = false;
+        } else {
+          VkDescriptorBufferInfo dirty_bbox_buffer_info;
+          dirty_bbox_buffer_info.buffer =
+              command_processor_.dirty_bbox_buffer();
+          dirty_bbox_buffer_info.offset = 0;
+          dirty_bbox_buffer_info.range = VK_WHOLE_SIZE;
+          VkWriteDescriptorSet dirty_bbox_write = {};
+          dirty_bbox_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+          dirty_bbox_write.dstSet = dirty_bbox_descriptor_set_;
+          dirty_bbox_write.dstBinding = 0;
+          dirty_bbox_write.descriptorCount = 1;
+          dirty_bbox_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+          dirty_bbox_write.pBufferInfo = &dirty_bbox_buffer_info;
+          dfn.vkUpdateDescriptorSets(device, 1, &dirty_bbox_write, 0, nullptr);
+        }
+      }
+      if (!dirty_bbox_transfers_enabled_) {
+        for (size_t i = 0; i < size_t(TransferPipelineLayoutIndex::kCount);
+             ++i) {
+          transfer_pipeline_layout_infos_runtime_[i] =
+              kTransferPipelineLayoutInfos[i];
+        }
+      }
+    }
+
     // Transfer pipeline layouts.
     VkDescriptorSetLayout transfer_pipeline_layout_descriptor_set_layouts
         [kTransferUsedDescriptorSetCount];
     VkPushConstantRange transfer_pipeline_layout_push_constant_range;
     transfer_pipeline_layout_push_constant_range.stageFlags =
-        VK_SHADER_STAGE_FRAGMENT_BIT;
+        dirty_bbox_transfers_enabled_
+            ? (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
+            : VK_SHADER_STAGE_FRAGMENT_BIT;
     transfer_pipeline_layout_push_constant_range.offset = 0;
     VkPipelineLayoutCreateInfo transfer_pipeline_layout_create_info;
     transfer_pipeline_layout_create_info.sType =
@@ -682,7 +767,7 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
         &transfer_pipeline_layout_push_constant_range;
     for (size_t i = 0; i < size_t(TransferPipelineLayoutIndex::kCount); ++i) {
       const TransferPipelineLayoutInfo& transfer_pipeline_layout_info =
-          kTransferPipelineLayoutInfos[i];
+          transfer_pipeline_layout_infos_runtime_[i];
       transfer_pipeline_layout_create_info.setLayoutCount = 0;
       uint32_t transfer_pipeline_layout_descriptor_sets_remaining =
           transfer_pipeline_layout_info.used_descriptor_sets;
@@ -696,6 +781,7 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
             VK_NULL_HANDLE;
         switch (TransferUsedDescriptorSet(
             transfer_pipeline_layout_descriptor_set_index)) {
+          case kTransferUsedDescriptorSetDirtyBbox:
           case kTransferUsedDescriptorSetHostDepthBuffer:
             transfer_pipeline_layout_descriptor_set_layout =
                 descriptor_set_layout_storage_buffer_;
@@ -992,6 +1078,10 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
   }
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
                                          transfer_passthrough_vertex_shader_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
+                                         transfer_bounded_vertex_shader_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
+                                         dirty_bbox_descriptor_pool_);
   transfer_vertex_buffer_pool_.reset();
 
   for (size_t i = 0; i < xe::countof(host_depth_store_pipelines_); ++i) {
@@ -2645,7 +2735,7 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
 
   const TransferModeInfo& mode = kTransferModes[size_t(key.mode)];
   const TransferPipelineLayoutInfo& pipeline_layout_info =
-      kTransferPipelineLayoutInfos[size_t(mode.pipeline_layout)];
+      transfer_pipeline_layout_infos_runtime_[size_t(mode.pipeline_layout)];
 
   // If not dest_is_color, it's depth, or stencil bit - 40-sample columns are
   // swapped as opposed to color source.
@@ -4420,7 +4510,9 @@ VkPipeline const* VulkanRenderTargetCache::GetTransferPipelines(
   shader_stages[0].pNext = nullptr;
   shader_stages[0].flags = 0;
   shader_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-  shader_stages[0].module = transfer_passthrough_vertex_shader_;
+  shader_stages[0].module = dirty_bbox_transfers_enabled_
+                                ? transfer_bounded_vertex_shader_
+                                : transfer_passthrough_vertex_shader_;
   shader_stages[0].pName = "main";
   shader_stages[0].pSpecializationInfo = nullptr;
   shader_stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -5017,6 +5109,11 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
   VkDescriptorSet last_descriptor_set_color_texture = VK_NULL_HANDLE;
   TransferAddressConstant last_host_depth_address_constant;
   TransferAddressConstant last_address_constant;
+  uint32_t last_bounded_slots_constant = UINT32_MAX;
+  VkShaderStageFlags transfer_push_constant_stages =
+      dirty_bbox_transfers_enabled_
+          ? (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
+          : VK_SHADER_STAGE_FRAGMENT_BIT;
 
   for (uint32_t i = 0; i < render_target_count; ++i) {
     RenderTarget* dest_rt = render_targets[i];
@@ -5352,7 +5449,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         TransferPipelineLayoutIndex transfer_pipeline_layout_index =
             transfer_mode_info.pipeline_layout;
         const TransferPipelineLayoutInfo& transfer_pipeline_layout_info =
-            kTransferPipelineLayoutInfos[size_t(
+            transfer_pipeline_layout_infos_runtime_[size_t(
                 transfer_pipeline_layout_index)];
         uint32_t transfer_sample_pipeline_count =
             vulkan_device->properties().sampleRateShading
@@ -5502,6 +5599,27 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         if (transfer_pipeline_layout_info.used_push_constant_dwords &
             kTransferUsedPushConstantDwordAddressBit) {
           RenderTargetKey source_rt_key = source_vulkan_rt.key();
+          if (dirty_bbox_transfers_enabled_) {
+            uint32_t bounded_slots_constant = UINT32_MAX;
+            for (const DirtyBoxPair& bounded_pair : dirty_box_pairs) {
+              if (bounded_pair.dest == dest_rt &&
+                  bounded_pair.source == it->transfer.source) {
+                if (bounded_pair.was_eligible) {
+                  bounded_slots_constant =
+                      (source_vulkan_rt.dirty_bbox_slot() & 0xFFFFu) |
+                      (dest_vulkan_rt.dirty_bbox_slot() << 16);
+                  stats_transfer_bounded_pushed_.fetch_add(
+                      1, std::memory_order_relaxed);
+                }
+                break;
+              }
+            }
+            if (last_bounded_slots_constant != bounded_slots_constant) {
+              last_bounded_slots_constant = bounded_slots_constant;
+              transfer_push_constants_set &=
+                  ~kTransferUsedPushConstantDwordBoundedSlotsBit;
+            }
+          }
           TransferAddressConstant address_constant;
           address_constant.dest_pitch = dest_pitch_tiles;
           address_constant.source_pitch = source_rt_key.GetPitchTiles();
@@ -5521,6 +5639,14 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         uint32_t transfer_descriptor_sets_unbound =
             transfer_pipeline_layout_info.used_descriptor_sets &
             ~transfer_descriptor_sets_bound;
+        if (transfer_descriptor_sets_unbound &
+            kTransferUsedDescriptorSetDirtyBboxBit) {
+          command_buffer.CmdVkBindDescriptorSets(
+              VK_PIPELINE_BIND_POINT_GRAPHICS, transfer_pipeline_layout, 0, 1,
+              &dirty_bbox_descriptor_set_, 0, nullptr);
+          transfer_descriptor_sets_bound |=
+              kTransferUsedDescriptorSetDirtyBboxBit;
+        }
         if (transfer_descriptor_sets_unbound &
             kTransferUsedDescriptorSetHostDepthBufferBit) {
           command_buffer.CmdVkBindDescriptorSets(
@@ -5567,9 +5693,17 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             transfer_pipeline_layout_info.used_push_constant_dwords &
             ~transfer_push_constants_set;
         if (transfer_push_constants_unset &
+            kTransferUsedPushConstantDwordBoundedSlotsBit) {
+          command_buffer.CmdVkPushConstants(
+              transfer_pipeline_layout, transfer_push_constant_stages, 0,
+              sizeof(uint32_t), &last_bounded_slots_constant);
+          transfer_push_constants_set |=
+              kTransferUsedPushConstantDwordBoundedSlotsBit;
+        }
+        if (transfer_push_constants_unset &
             kTransferUsedPushConstantDwordHostDepthAddressBit) {
           command_buffer.CmdVkPushConstants(
-              transfer_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+              transfer_pipeline_layout, transfer_push_constant_stages,
               sizeof(uint32_t) *
                   xe::bit_count(
                       transfer_pipeline_layout_info.used_push_constant_dwords &
@@ -5581,7 +5715,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         if (transfer_push_constants_unset &
             kTransferUsedPushConstantDwordAddressBit) {
           command_buffer.CmdVkPushConstants(
-              transfer_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+              transfer_pipeline_layout, transfer_push_constant_stages,
               sizeof(uint32_t) *
                   xe::bit_count(
                       transfer_pipeline_layout_info.used_push_constant_dwords &
@@ -5601,7 +5735,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             if (transfer_is_stencil_bit) {
               uint32_t transfer_stencil_bit = uint32_t(1) << k;
               command_buffer.CmdVkPushConstants(
-                  transfer_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+                  transfer_pipeline_layout, transfer_push_constant_stages,
                   sizeof(uint32_t) *
                       xe::bit_count(
                           transfer_pipeline_layout_info
@@ -5736,10 +5870,29 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
     command_processor_.PushBufferMemoryBarrier(
         dirty_bbox_buffer, 0, VK_WHOLE_SIZE,
         VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        VK_ACCESS_SHADER_WRITE_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
     command_processor_.SubmitBarriers(true);
     DeferredCommandBuffer& reset_command_buffer =
         command_processor_.deferred_command_buffer();
+    {
+      static uint32_t probe_rotation = 0;
+      uint32_t eligible_count = 0;
+      for (const DirtyBoxPair& pair : dirty_box_pairs) {
+        eligible_count += uint32_t(pair.was_eligible);
+      }
+      if (eligible_count) {
+        uint32_t probe_target = probe_rotation++ % eligible_count;
+        uint32_t eligible_seen = 0;
+        for (const DirtyBoxPair& pair : dirty_box_pairs) {
+          if (pair.was_eligible && eligible_seen++ == probe_target) {
+            command_processor_.CaptureDirtyBboxPairProbe(
+                pair.source->dirty_bbox_slot(), pair.dest->dirty_bbox_slot());
+            break;
+          }
+        }
+      }
+    }
     bool record_syncs = !resolve_clear_needed;
     for (const DirtyBoxPair& pair : dirty_box_pairs) {
       reset_command_buffer.CmdVkFillBuffer(
@@ -5785,6 +5938,153 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         VK_ACCESS_TRANSFER_WRITE_BIT,
         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
   }
+}
+
+VkShaderModule VulkanRenderTargetCache::BuildBoundedTransferVertexShader() {
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+
+  SpirvBuilder builder(spv::Spv_1_0,
+                       (SpirvShaderTranslator::kSpirvMagicToolId << 16) | 1,
+                       nullptr);
+  builder.addCapability(spv::CapabilityShader);
+  builder.setMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
+  builder.setSource(spv::SourceLanguageUnknown, 0);
+
+  spv::Id type_void = builder.makeVoidType();
+  spv::Id type_bool = builder.makeBoolType();
+  spv::Id type_int = builder.makeIntType(32);
+  spv::Id type_uint = builder.makeUintType(32);
+  spv::Id type_float = builder.makeFloatType(32);
+  spv::Id type_float2 = builder.makeVectorType(type_float, 2);
+  spv::Id type_float4 = builder.makeVectorType(type_float, 4);
+
+  std::vector<spv::Id> main_interface;
+
+  // Input: float2 position at location 0 (the transfer rectangle vertices).
+  spv::Id in_position = builder.createVariable(
+      spv::NoPrecision, spv::StorageClassInput, type_float2, "xe_in_position");
+  builder.addDecoration(in_position, spv::DecorationLocation, 0);
+  main_interface.push_back(in_position);
+
+  // Output: gl_Position.
+  spv::Id out_position = builder.createVariable(
+      spv::NoPrecision, spv::StorageClassOutput, type_float4, "gl_Position");
+  builder.addDecoration(out_position, spv::DecorationBuiltIn,
+                        static_cast<int>(spv::BuiltIn::Position));
+  main_interface.push_back(out_position);
+
+  // Push constant: dword 0 = bounded slots.
+  spv::Id type_push = builder.makeStructType({type_uint},
+                                             "XeTransferBoundedPush");
+  builder.addMemberName(type_push, 0, "bounded_slots");
+  builder.addMemberDecoration(type_push, 0, spv::DecorationOffset, 0);
+  builder.addDecoration(type_push, spv::DecorationBlock);
+  spv::Id push_constants = builder.createVariable(
+      spv::NoPrecision, spv::StorageClassPushConstant, type_push,
+      "xe_transfer_bounded_push");
+
+  // The dirty bounding box buffer: uint[] at set 0 binding 0.
+  spv::Id type_bbox_array = builder.makeRuntimeArray(type_uint);
+  builder.addDecoration(type_bbox_array, spv::DecorationArrayStride,
+                        sizeof(uint32_t));
+  spv::Id type_bbox = builder.makeStructType({type_bbox_array}, "XeDirtyBbox");
+  builder.addMemberName(type_bbox, 0, "bbox");
+  builder.addMemberDecoration(type_bbox, 0, spv::DecorationNonWritable);
+  builder.addMemberDecoration(type_bbox, 0, spv::DecorationOffset, 0);
+  builder.addDecoration(type_bbox, spv::DecorationBufferBlock);
+  spv::Id buffer_bbox = builder.createVariable(
+      spv::NoPrecision, spv::StorageClassUniform, type_bbox, "xe_dirty_bbox");
+  builder.addDecoration(buffer_bbox, spv::DecorationDescriptorSet, 0);
+  builder.addDecoration(buffer_bbox, spv::DecorationBinding, 0);
+
+  spv::Block* main_entry;
+  std::vector<std::vector<spv::Decoration>> main_precisions;
+  std::vector<spv::Id> main_param_types;
+  spv::Function* main_function =
+      builder.makeFunctionEntry(spv::NoPrecision, type_void, "main",
+                                main_param_types, main_precisions, &main_entry);
+
+  spv::Id const_int_0 = builder.makeIntConstant(0);
+  spv::Id const_uint_max = builder.makeUintConstant(UINT32_MAX);
+  spv::Id const_uint_65535 = builder.makeUintConstant(65535);
+
+  spv::Id position2 = builder.createLoad(in_position, spv::NoPrecision);
+
+  spv::Id slots = builder.createLoad(
+      builder.createAccessChain(spv::StorageClassPushConstant, push_constants,
+                                {const_int_0}),
+      spv::NoPrecision);
+
+  // visible = slots == UINT32_MAX (unbounded) || !(both boxes empty).
+  // A box is empty when its minimum exceeds its maximum on either axis
+  // (an untouched slot is all zeros: minimum 65535, maximum 0). Minimums are
+  // stored inverted (65535 - minimum), so empty on an axis is
+  // (65535 - inverted_min) > max.
+  auto box_empty = [&](spv::Id slot) {
+    spv::Id base = builder.createBinOp(spv::OpIMul, type_uint, slot,
+                                       builder.makeUintConstant(4));
+    spv::Id words[4];
+    for (uint32_t j = 0; j < 4; ++j) {
+      spv::Id index = builder.createBinOp(spv::OpIAdd, type_uint, base,
+                                          builder.makeUintConstant(j));
+      words[j] = builder.createLoad(
+          builder.createAccessChain(
+              spv::StorageClassUniform, buffer_bbox,
+              {const_int_0,
+               builder.createUnaryOp(spv::OpBitcast, type_int, index)}),
+          spv::NoPrecision);
+    }
+    spv::Id min_x = builder.createBinOp(spv::OpISub, type_uint,
+                                        const_uint_65535, words[0]);
+    spv::Id min_y = builder.createBinOp(spv::OpISub, type_uint,
+                                        const_uint_65535, words[1]);
+    spv::Id empty_x =
+        builder.createBinOp(spv::OpUGreaterThan, type_bool, min_x, words[2]);
+    spv::Id empty_y =
+        builder.createBinOp(spv::OpUGreaterThan, type_bool, min_y, words[3]);
+    return builder.createBinOp(spv::OpLogicalOr, type_bool, empty_x, empty_y);
+  };
+
+  spv::Id unbounded = builder.createBinOp(spv::OpIEqual, type_bool, slots,
+                                          const_uint_max);
+  spv::Id source_slot = builder.createBinOp(
+      spv::OpBitwiseAnd, type_uint, slots, builder.makeUintConstant(0xFFFF));
+  spv::Id dest_slot = builder.createBinOp(spv::OpShiftRightLogical, type_uint,
+                                          slots,
+                                          builder.makeUintConstant(16));
+  spv::Id union_empty = builder.createBinOp(
+      spv::OpLogicalAnd, type_bool, box_empty(source_slot),
+      box_empty(dest_slot));
+  spv::Id collapse = builder.createBinOp(
+      spv::OpLogicalAnd, type_bool,
+      builder.createUnaryOp(spv::OpLogicalNot, type_bool, unbounded),
+      union_empty);
+
+  spv::Id const_float_0 = builder.makeFloatConstant(0.0f);
+  spv::Id const_float_1 = builder.makeFloatConstant(1.0f);
+  spv::Id x = builder.createCompositeExtract(position2, type_float, 0);
+  spv::Id y = builder.createCompositeExtract(position2, type_float, 1);
+  x = builder.createTriOp(spv::OpSelect, type_float, collapse, const_float_0,
+                          x);
+  y = builder.createTriOp(spv::OpSelect, type_float, collapse, const_float_0,
+                          y);
+  spv::Id result = builder.createCompositeConstruct(
+      type_float4, {x, y, const_float_0, const_float_1});
+  builder.createStore(result, out_position);
+
+  builder.leaveFunction();
+  spv::Instruction* entry_point =
+      builder.addEntryPoint(spv::ExecutionModelVertex, main_function, "main");
+  for (spv::Id interface_id : main_interface) {
+    entry_point->addIdOperand(interface_id);
+  }
+
+  std::vector<unsigned int> shader_code;
+  builder.dump(shader_code);
+  return ui::vulkan::util::CreateShaderModule(
+      vulkan_device, reinterpret_cast<const uint32_t*>(shader_code.data()),
+      sizeof(uint32_t) * shader_code.size());
 }
 
 VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {

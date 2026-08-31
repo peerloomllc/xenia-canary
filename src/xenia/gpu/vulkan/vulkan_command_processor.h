@@ -616,6 +616,16 @@ class VulkanCommandProcessor final : public CommandProcessor {
   uint64_t dirty_bbox_readback_submission_ = 0;
   bool dirty_bbox_readback_pending_ = false;
   uint64_t dirty_bbox_frame_counter_ = 0;
+  // Pair-box probe: one eligible pair's two boxes captured right before
+  // their reset at a transfer, for --log_dirty_bbox.
+  bool dirty_bbox_pair_probe_pending_ = false;
+  uint64_t dirty_bbox_pair_probe_submission_ = 0;
+  uint32_t dirty_bbox_pair_probe_slots_[2] = {};
+  // Public entry for the render target cache.
+ public:
+  void CaptureDirtyBboxPairProbe(uint32_t source_slot, uint32_t dest_slot);
+
+ private:
 
   VkQueryPool gpu_time_query_pool_ = VK_NULL_HANDLE;
   static constexpr uint32_t kGpuStatPoolQueries = 64;

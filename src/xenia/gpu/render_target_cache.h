@@ -66,6 +66,7 @@ class RenderTargetCache {
 
   static std::atomic<uint64_t> stats_transfer_count_;
   static std::atomic<uint64_t> stats_transfer_bounded_eligible_;
+  static std::atomic<uint64_t> stats_transfer_bounded_pushed_;
   static std::atomic<uint64_t> stats_resolve_count_;
   static std::atomic<uint64_t> stats_resolve_pixels_;
 
