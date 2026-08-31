@@ -37,6 +37,10 @@ int main(int argc_pre_gtk, char** argv_pre_gtk) {
     std::fputs("Failed to initialize GTK+\n", stderr);
     return EXIT_FAILURE;
   }
+  // F10 is GTK's "activate the menu bar" key; Xenia uses it as a hotkey
+  // (load state), and both firing at once opened the File menu on every
+  // load. Alt+<mnemonic> still opens the menus.
+  g_object_set(gtk_settings_get_default(), "gtk-menu-bar-accel", "", nullptr);
 
   int result;
 

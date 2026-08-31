@@ -737,6 +737,10 @@ void EmulatorApp::EmulatorThread() {
   app_context().CallInUIThread(
       [this]() { emulator_window_->OnEmulatorInitialized(); });
 
+  // Set-up is complete: launches queued by the window may go ahead.
+  app_context().CallInUIThread(
+      [this]() { emulator_window_->OnEmulatorReady(); });
+
   // Grab path from the flag or unnamed argument.
   std::filesystem::path path;
   if (!cvars::target.empty()) {

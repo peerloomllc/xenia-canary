@@ -75,6 +75,7 @@ struct PatchFileEntry {
   std::string title_name;
   std::vector<uint64_t> hashes;
   std::vector<PatchInfoEntry> patch_info;
+  std::filesystem::path file_path;
 };
 
 enum class PatchDataType {
@@ -102,6 +103,10 @@ class PatchDB {
   ~PatchDB();
 
   void LoadPatches();
+  // Drop the loaded list and read the folder again (force: even with
+  // apply_patches off, for listing).
+  void Reload(bool force = false);
+  const std::filesystem::path& patches_root() const { return patches_root_; }
 
   PatchFileEntry ReadPatchFile(const std::filesystem::path& file_path) const;
 
@@ -134,6 +139,7 @@ class PatchDB {
 
   std::vector<PatchFileEntry> loaded_patches_;
   std::filesystem::path patches_root_;
+  bool loading_forced_ = false;
 };
 }  // namespace patcher
 }  // namespace xe

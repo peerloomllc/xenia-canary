@@ -44,6 +44,11 @@ DEFINE_path(
     "Allows user to load custom font and use it instead of default one.", "UI");
 
 DEFINE_uint32(font_size, 14, "Allows user to set custom font size.", "UI");
+DEFINE_double(ui_scale, 1.0,
+              "Size of the in-window dialogs and notifications: fonts and "
+              "spacing are multiplied by this (1 = as before, 1.5 = half "
+              "again as large). Display > Dialog size changes it in-app.",
+              "UI");
 UPDATE_from_uint32(font_size, 2024, 8, 31, 20, 12);
 
 namespace xe {
@@ -163,8 +168,10 @@ void ImGuiDrawer::Initialize() {
   io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
   io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
-  const float font_size = std::max((float)cvars::font_size, 8.f);
-  const float title_font_size = font_size + 6.f;
+  ui_scale_ = float(std::clamp(cvars::ui_scale, 0.5, 3.0));
+  const float font_size =
+      std::max((float)cvars::font_size, 8.f) * ui_scale_;
+  const float title_font_size = font_size + 6.f * ui_scale_;
 
   InitializeFonts(font_size);
   InitializeFonts(title_font_size);
@@ -228,6 +235,10 @@ void ImGuiDrawer::Initialize() {
       ImVec4(1.00f, 0.60f, 0.00f, 1.00f);
   style.Colors[ImGuiCol_TextSelectedBg] = ImVec4(0.00f, 1.00f, 0.00f, 0.21f);
   style.Colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.20f, 0.20f, 0.20f, 0.35f);
+  // Spacing scales with the fonts; keep the unscaled style for later
+  // changes (ScaleAllSizes compounds).
+  base_style_ = style;
+  style.ScaleAllSizes(ui_scale_);
 
   frame_time_tick_frequency_ = double(Clock::QueryHostTickFrequency());
   last_frame_time_ticks_ = Clock::QueryHostTickCount();
@@ -544,6 +555,31 @@ void ImGuiDrawer::InitializeFonts(const float font_size) {
   LoadJapaneseFont(io, font_size);
 }
 
+void ImGuiDrawer::RequestUIScale(float scale) {
+  pending_ui_scale_ = std::clamp(scale, 0.5f, 3.0f);
+}
+
+void ImGuiDrawer::ApplyUIScale(float scale) {
+  if (scale == ui_scale_) {
+    return;
+  }
+  ImGui::SetCurrentContext(internal_state_);
+  ui_scale_ = scale;
+  auto& io = ImGui::GetIO();
+  io.Fonts->TexID = reinterpret_cast<ImTextureID>(nullptr);
+  font_texture_.reset();
+  io.Fonts->Clear();
+  const float font_size = std::max((float)cvars::font_size, 8.f) * ui_scale_;
+  InitializeFonts(font_size);
+  InitializeFonts(font_size + 6.f * ui_scale_);
+  io.Fonts->Build();
+  SetupFontTexture();
+  auto& style = ImGui::GetStyle();
+  style = base_style_;
+  style.ScaleAllSizes(ui_scale_);
+  XELOGI("ImGui: UI scale {:.2f}, font {:.0f} px", ui_scale_, font_size);
+}
+
 void ImGuiDrawer::SetupFontTexture() {
   if (font_texture_ || !immediate_drawer_) {
     return;
@@ -621,6 +657,12 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   ImGui::SetCurrentContext(internal_state_);
 
   ImGuiIO& io = ImGui::GetIO();
+
+  // Between frames, never inside one: the font atlas and texture change.
+  if (pending_ui_scale_ > 0.0f) {
+    ApplyUIScale(pending_ui_scale_);
+    pending_ui_scale_ = 0.0f;
+  }
 
   uint64_t current_frame_time_ticks = Clock::QueryHostTickCount();
   io.DeltaTime =

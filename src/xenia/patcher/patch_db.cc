@@ -27,8 +27,19 @@ PatchDB::PatchDB(const std::filesystem::path patches_root) {
 
 PatchDB::~PatchDB() {}
 
+void PatchDB::Reload(bool force) {
+  loaded_patches_.clear();
+  if (force && !cvars::apply_patches) {
+    loading_forced_ = true;
+    LoadPatches();
+    loading_forced_ = false;
+    return;
+  }
+  LoadPatches();
+}
+
 void PatchDB::LoadPatches() {
-  if (!cvars::apply_patches) {
+  if (!cvars::apply_patches && !loading_forced_) {
     return;
   }
 
@@ -79,6 +90,7 @@ PatchFileEntry PatchDB::ReadPatchFile(
   }
 
   patch_file.title_id = strtoul(title_id->get().c_str(), NULL, 16);
+  patch_file.file_path = file_path;
   patch_file.title_name = title_name->get();
   ReadHashes(patch_file, hashes_node);
 

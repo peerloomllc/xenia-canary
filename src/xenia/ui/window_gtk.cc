@@ -8,6 +8,7 @@
  */
 
 #include <X11/Xlib-xcb.h>
+#include <X11/Xlib.h>
 #include <gdk/gdkx.h>
 #include <xcb/xcb.h>
 
@@ -37,6 +38,14 @@ GTKWindow::GTKWindow(WindowedAppContext& app_context,
              desired_logical_height) {}
 
 GTKWindow::~GTKWindow() {
+  if (menu_cancel_timeout_) {
+    g_source_remove(menu_cancel_timeout_);
+    menu_cancel_timeout_ = 0;
+  }
+  if (menu_focus_poll_) {
+    g_source_remove(menu_focus_poll_);
+    menu_focus_poll_ = 0;
+  }
   EnterDestructor();
   if (window_) {
     // Set window_ to null to ignore events from now on since this ui::GTKWindow
@@ -71,7 +80,12 @@ bool GTKWindow::OpenImpl() {
   // client area of the window occupying all the window space not taken by the
   // main menu.
   drawing_area_ = gtk_drawing_area_new();
-  gtk_box_pack_end(GTK_BOX(box_), drawing_area_, true, true, 0);
+  // The drawing area sits in an overlay so a widget (the game library)
+  // can cover it while no title runs without unmapping its X window,
+  // which the Vulkan surface is bound to.
+  overlay_ = gtk_overlay_new();
+  gtk_container_add(GTK_CONTAINER(overlay_), drawing_area_);
+  gtk_box_pack_end(GTK_BOX(box_), overlay_, true, true, 0);
   // The desired size is the client (drawing) area size. Let GTK auto-size the
   // entire window around it (as well as the width of the menu actually if it
   // happens to be bigger - the desired size in the Window will be updated later
@@ -99,6 +113,16 @@ bool GTKWindow::OpenImpl() {
 
   // Finally show all the widgets in the window, including the main menu.
   gtk_widget_show_all(window_);
+  // While a menu is open, check every 250 ms that the X input focus is
+  // still under this window; a Wayland application taking focus does not
+  // break the popup's grab, so GTK would leave the menu open.
+  menu_focus_poll_ = g_timeout_add(
+      250,
+      +[](gpointer data) -> gboolean {
+        static_cast<GTKWindow*>(data)->CancelMenuIfUnfocused();
+        return G_SOURCE_CONTINUE;
+      },
+      this);
 
   // Remove the size request after finishing the initial layout because it makes
   // it impossible to make the window smaller.
@@ -296,6 +320,138 @@ std::unique_ptr<Surface> GTKWindow::CreateSurfaceImpl(
 }
 
 void GTKWindow::RequestPaintImpl() { gtk_widget_queue_draw(drawing_area_); }
+
+void GTKWindow::CancelMenuIfUnfocused() {
+  const auto* main_menu = dynamic_cast<const GTKMenuItem*>(GetMainMenu());
+  if (!main_menu || !main_menu->handle() ||
+      !GTK_IS_MENU_SHELL(main_menu->handle())) {
+    return;
+  }
+  GtkMenuShell* bar = GTK_MENU_SHELL(main_menu->handle());
+  // A menu is open when one of the menu bar's own submenus is visible
+  // (the bar's selected item is cleared once the submenu takes over).
+  // Other popups of the process, a combo box dropdown in the Preferences
+  // window for instance, are not our business.
+  bool popup_visible = false;
+  GList* items = gtk_container_get_children(GTK_CONTAINER(bar));
+  for (GList* l = items; l; l = l->next) {
+    if (!GTK_IS_MENU_ITEM(l->data)) {
+      continue;
+    }
+    GtkWidget* submenu = gtk_menu_item_get_submenu(GTK_MENU_ITEM(l->data));
+    if (submenu && gtk_widget_get_visible(submenu)) {
+      popup_visible = true;
+      break;
+    }
+  }
+  g_list_free(items);
+  if (!popup_visible) {
+    menu_open_seen_ = false;
+    return;
+  }
+  // A window moved or resized by its frame (a title-bar drag) keeps the
+  // focus, but the popup would stay where it was, floating; close it.
+  {
+    GdkWindow* toplevel = window_ ? gtk_widget_get_window(window_) : nullptr;
+    int x = 0, y = 0, w = 0, h = 0;
+    if (toplevel) {
+      gdk_window_get_origin(toplevel, &x, &y);
+      w = gdk_window_get_width(toplevel);
+      h = gdk_window_get_height(toplevel);
+    }
+    if (!menu_open_seen_) {
+      menu_open_seen_ = true;
+      menu_open_x_ = x;
+      menu_open_y_ = y;
+      menu_open_w_ = w;
+      menu_open_h_ = h;
+    } else if (x != menu_open_x_ || y != menu_open_y_ || w != menu_open_w_ ||
+               h != menu_open_h_) {
+      XELOGI("Menu closed: window moved or resized while it was open");
+      menu_open_seen_ = false;
+      gtk_menu_shell_cancel(bar);
+      return;
+    }
+  }
+  // GTK's own notion of the active window does not update when a Wayland
+  // native application takes focus (the popup's grab is never broken), so
+  // ask X: with focus elsewhere, the focus window is None/PointerRoot or
+  // not under this toplevel.
+  GdkWindow* gdk_window = window_ ? gtk_widget_get_window(window_) : nullptr;
+  if (!gdk_window || !GDK_IS_X11_WINDOW(gdk_window)) {
+    return;
+  }
+  Display* xdisplay = GDK_WINDOW_XDISPLAY(gdk_window);
+  ::Window ours = gdk_x11_window_get_xid(gdk_window);
+  // Every realized toplevel of this process counts as ours (the
+  // Preferences window, the dashboard's popups).
+  std::vector<::Window> our_windows = {ours};
+  GList* toplevels = gtk_window_list_toplevels();
+  for (GList* l = toplevels; l; l = l->next) {
+    GdkWindow* other = GTK_IS_WIDGET(l->data)
+                           ? gtk_widget_get_window(GTK_WIDGET(l->data))
+                           : nullptr;
+    if (other && GDK_IS_X11_WINDOW(other)) {
+      our_windows.push_back(gdk_x11_window_get_xid(other));
+    }
+  }
+  g_list_free(toplevels);
+  ::Window focus = None;
+  int revert = 0;
+  XGetInputFocus(xdisplay, &focus, &revert);
+  bool under_ours = false;
+  ::Window w = focus;
+  while (w != None && w != PointerRoot) {
+    if (std::find(our_windows.begin(), our_windows.end(), w) !=
+        our_windows.end()) {
+      under_ours = true;
+      break;
+    }
+    ::Window root = None, parent = None, *children = nullptr;
+    unsigned int count = 0;
+    if (!XQueryTree(xdisplay, w, &root, &parent, &children, &count)) {
+      break;
+    }
+    if (children) {
+      XFree(children);
+    }
+    if (w == root) {
+      break;
+    }
+    w = parent;
+  }
+  if (!under_ours) {
+    XELOGI("Menu closed: X input focus {:X} is not under this window {:X}",
+           uint64_t(focus), uint64_t(ours));
+    gtk_menu_shell_cancel(bar);
+  }
+}
+
+void GTKWindow::SetIdleWidget(GtkWidget* widget) {
+  if (!overlay_ || idle_widget_) {
+    return;
+  }
+  idle_widget_ = widget;
+  gtk_widget_set_halign(widget, GTK_ALIGN_FILL);
+  gtk_widget_set_valign(widget, GTK_ALIGN_FILL);
+  gtk_overlay_add_overlay(GTK_OVERLAY(overlay_), widget);
+  gtk_widget_set_no_show_all(widget, TRUE);
+  gtk_widget_hide(widget);
+}
+
+void GTKWindow::ShowIdleWidget(bool show) {
+  if (!idle_widget_) {
+    return;
+  }
+  idle_widget_shown_ = show;
+  if (show) {
+    gtk_widget_set_no_show_all(idle_widget_, FALSE);
+    gtk_widget_show_all(idle_widget_);
+    gtk_widget_set_no_show_all(idle_widget_, TRUE);
+  } else {
+    gtk_widget_hide(idle_widget_);
+  }
+}
 
 void GTKWindow::HandleSizeUpdate(
     WindowDestructionReceiver& destruction_receiver) {
@@ -693,6 +849,24 @@ gboolean GTKWindow::WindowEventHandler(GdkEvent* event) {
 
     case GDK_FOCUS_CHANGE: {
       auto focus_event = reinterpret_cast<const GdkEventFocus*>(event);
+      if (!focus_event->in) {
+        // Under XWayland an open menu popup survives the focus moving to
+        // another application (its grab is not broken). Once the focus
+        // change has settled, close the menu if none of our windows is
+        // active any more.
+        if (menu_cancel_timeout_) {
+          g_source_remove(menu_cancel_timeout_);
+        }
+        menu_cancel_timeout_ = g_timeout_add(
+            150,
+            +[](gpointer data) -> gboolean {
+              auto* window = static_cast<GTKWindow*>(data);
+              window->menu_cancel_timeout_ = 0;
+              window->CancelMenuIfUnfocused();
+              return G_SOURCE_REMOVE;
+            },
+            this);
+      }
       WindowDestructionReceiver destruction_receiver(this);
       OnFocusUpdate(bool(focus_event->in), destruction_receiver);
       if (destruction_receiver.IsWindowDestroyedOrClosed()) {
@@ -745,6 +919,7 @@ gboolean GTKWindow::DrawingAreaEventHandler(GdkEvent* event) {
     } break;
 
     case GDK_CONFIGURE: {
+      CancelMenuIfUnfocused();  // also closes a menu the window moved under
       if (batched_size_update_depth_) {
         batched_size_update_contained_configure_ = true;
       } else {
