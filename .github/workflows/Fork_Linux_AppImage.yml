@@ -69,5 +69,9 @@ jobs:
           mv "$file" "$name"
           chmod +x "$name"
           sha256sum "$name" > "$name.sha256"
+          # The .zsync is made here, over the final file name, so its
+          # Filename header matches the released asset.
+          sudo apt-get -y install zsync
+          zsyncmake -u "$name" "$name"
           gh release upload "${{ github.ref_name }}" "$name" "$name.sha256" \
-            --repo "${{ github.repository }}" --clobber
+            "$name.zsync" --repo "${{ github.repository }}" --clobber

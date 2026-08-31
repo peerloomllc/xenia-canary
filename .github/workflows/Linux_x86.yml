@@ -122,6 +122,12 @@ jobs:
           # BSD-3 asks binary distributions to carry the notice.
           cp ${GITHUB_WORKSPACE}/LICENSE ${APPDIR}/LICENSE
 
+          # Embed update information so AppImageUpdate (zsync) can update in
+          # place from the latest release's matching .zsync asset.
+          owner="${GITHUB_REPOSITORY%/*}"; repo="${GITHUB_REPOSITORY#*/}"
+          export UPDATE_INFORMATION="gh-releases-zsync|${owner}|${repo}|latest|xenia_canary_*-x86_64.AppImage.zsync"
+          export LDAI_UPDATE_INFORMATION="$UPDATE_INFORMATION"
+
           # Build AppImage with linuxdeploy (requires absolute paths)
           linuxdeploy --appdir $APPDIR \
             --executable $binary \
