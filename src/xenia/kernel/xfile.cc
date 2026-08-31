@@ -15,6 +15,7 @@
 
 #include "xenia/base/byte_stream.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/xam/content_manager.h"
 
 namespace xe {
 namespace kernel {
@@ -406,6 +407,30 @@ object_ref<XFile> XFile::Restore(KernelState* kernel_state,
   auto res = kernel_state->file_system()->OpenFile(
       nullptr, abs_path, vfs::FileDisposition::kOpen, access, is_directory,
       false, &vfs_file, &action);
+  if (XFAILED(res)) {
+    // A \Device\Content\<N>\ path can carry a device number from an older
+    // session: the state was saved after its packages were remounted under
+    // new numbers, while this file kept the path it was opened with. Look
+    // for the same file on the packages mounted now.
+    const std::string_view content_prefix = "\\Device\\Content\\";
+    if (abs_path.rfind(content_prefix, 0) == 0) {
+      auto rest = std::string_view(abs_path).substr(content_prefix.size());
+      auto slash_pos = rest.find('\\');
+      if (slash_pos != std::string_view::npos) {
+        auto remapped = kernel_state->content_manager()->ResolveOnAnyPackage(
+            rest.substr(slash_pos + 1));
+        if (!remapped.empty()) {
+          res = kernel_state->file_system()->OpenFile(
+              nullptr, remapped, vfs::FileDisposition::kOpen, access,
+              is_directory, false, &vfs_file, &action);
+          if (XSUCCEEDED(res)) {
+            XELOGW("XFile {:08X}: {} reopened as {} on restore",
+                   file->handle(), abs_path, remapped);
+          }
+        }
+      }
+    }
+  }
   if (XFAILED(res)) {
     XELOGE("XFile {:08X}: could not reopen {} on restore: {:08X}",
            file->handle(), abs_path, res);

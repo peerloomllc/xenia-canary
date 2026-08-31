@@ -254,6 +254,48 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
       return;
     }
   }
+
+  // No installed handler claimed the fault. Returning retries the faulting
+  // instruction, which is right for the transient races the handlers decline
+  // (a write watch another thread cleared between the fault and the check).
+  // But a fault that repeats unclaimed at the same instruction and address is
+  // a real crash - a stray dereference in host code - and retrying it spins
+  // forever, with whatever locks the thread holds. Count the repeats and,
+  // past a limit no transient race survives, restore the original
+  // disposition so the re-raised signal kills the process visibly.
+  uint64_t fault_pc = 0;
+#if XE_ARCH_AMD64
+  fault_pc = uint64_t(mcontext.gregs[REG_RIP]);
+#elif XE_ARCH_ARM64
+  fault_pc = uint64_t(mcontext.pc);
+#endif
+  static thread_local uint64_t last_unclaimed_pc = 0;
+  static thread_local uint64_t last_unclaimed_address = 0;
+  static thread_local uint32_t unclaimed_repeats = 0;
+  uint64_t fault_address = uint64_t(uintptr_t(signal_info->si_addr));
+  if (fault_pc == last_unclaimed_pc &&
+      fault_address == last_unclaimed_address) {
+    if (++unclaimed_repeats >= 100) {
+      char message[128];
+      int length = snprintf(message, sizeof(message),
+                            "Unhandled signal %d looping at pc=%llx "
+                            "address=%llx; raising the default action\n",
+                            signal_number, (unsigned long long)fault_pc,
+                            (unsigned long long)fault_address);
+      if (length > 0) {
+        [[maybe_unused]] auto ignored =
+            write(STDERR_FILENO, message, size_t(length));
+      }
+      sigaction(signal_number,
+                signal_number == SIGILL ? &original_sigill_handler_
+                                        : &original_sigsegv_handler_,
+                nullptr);
+    }
+  } else {
+    last_unclaimed_pc = fault_pc;
+    last_unclaimed_address = fault_address;
+    unclaimed_repeats = 0;
+  }
 }
 
 void ExceptionHandler::Install(Handler fn, void* data) {

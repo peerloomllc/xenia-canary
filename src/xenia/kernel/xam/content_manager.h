@@ -109,6 +109,12 @@ class ContentManager {
   bool Save(ByteStream* stream);
   bool Restore(ByteStream* stream);
 
+  // A file path saved as \Device\Content\<N>\<rest> can carry a device
+  // number from an older session (the package was remounted under a new
+  // number before the state was saved). Find <rest> on any package mounted
+  // now; returns the full device path of the first match, or empty.
+  std::string ResolveOnAnyPackage(const std::string_view relative_path);
+
   void CloseOpenedFilesFromContent(const std::string_view root_name);
 
   const std::filesystem::path& root_path() const { return root_path_; }

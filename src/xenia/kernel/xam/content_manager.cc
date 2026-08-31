@@ -541,6 +541,18 @@ bool ContentManager::Restore(ByteStream* stream) {
   return true;
 }
 
+std::string ContentManager::ResolveOnAnyPackage(
+    const std::string_view relative_path) {
+  auto global_lock = global_critical_region_.Acquire();
+  for (auto& [device_path, package] : mounted_packages_) {
+    std::string candidate = device_path + std::string(relative_path);
+    if (kernel_state_->file_system()->ResolvePath(candidate)) {
+      return candidate;
+    }
+  }
+  return {};
+}
+
 X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
   auto global_lock = global_critical_region_.Acquire();
 
@@ -671,6 +683,11 @@ void ContentManager::CloseOpenedFilesFromContent(
   }
 
   for (const object_ref<XFile>& file : all_files_handles) {
+    if (!file->file()) {
+      // Restored from a save state and never reopened (XFile::Restore keeps
+      // the handle alive as unresolved): no live entry to compare or close.
+      continue;
+    }
     std::string file_path = file->entry()->absolute_path();
     bool is_file_inside_content = utf8::starts_with(file_path, resolved_path);
 
