@@ -4660,6 +4660,22 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
     const Transfer::Rectangle* resolve_clear_rectangle) {
   assert_true(GetPath() == Path::kHostRenderTargets);
 
+  // Dirty region tracking: unique (destination, source) pairs this call
+  // copies between, with the union of their tile ranges. After the copies,
+  // the two hold identical contents on the range: their boxes reset and a
+  // PairSync records the sync; a future copy between them while neither
+  // side changed outside its box may be bounded by the box union.
+  struct DirtyBoxPair {
+    RenderTarget* dest;
+    RenderTarget* source;
+    uint32_t start_tiles;
+    uint32_t end_tiles;
+    bool host_depth_involved;
+    bool was_eligible;
+  };
+  std::vector<DirtyBoxPair> dirty_box_pairs;
+  bool dirty_box_tracking = command_processor_.dirty_bbox_tracking_enabled();
+
   if (render_target_transfers) {
     uint64_t transfer_total = 0;
     for (uint32_t i = 0; i < render_target_count; ++i) {
@@ -4668,6 +4684,53 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
     if (transfer_total) {
       stats_transfer_count_.fetch_add(transfer_total,
                                       std::memory_order_relaxed);
+    }
+    if (dirty_box_tracking && transfer_total) {
+      for (uint32_t i = 0; i < render_target_count; ++i) {
+        if (!render_targets[i]) {
+          continue;
+        }
+        for (const Transfer& transfer : render_target_transfers[i]) {
+          DirtyBoxPair* pair = nullptr;
+          for (DirtyBoxPair& existing_pair : dirty_box_pairs) {
+            if (existing_pair.dest == render_targets[i] &&
+                existing_pair.source == transfer.source) {
+              pair = &existing_pair;
+              break;
+            }
+          }
+          if (pair) {
+            pair->start_tiles = std::min(pair->start_tiles,
+                                         transfer.start_tiles);
+            pair->end_tiles = std::max(pair->end_tiles, transfer.end_tiles);
+            pair->host_depth_involved |= transfer.host_depth_source != nullptr;
+          } else {
+            dirty_box_pairs.push_back({render_targets[i], transfer.source,
+                                       transfer.start_tiles,
+                                       transfer.end_tiles,
+                                       transfer.host_depth_source != nullptr,
+                                       false});
+          }
+        }
+      }
+      for (DirtyBoxPair& pair : dirty_box_pairs) {
+        if (pair.host_depth_involved) {
+          continue;
+        }
+        for (const RenderTarget::PairSync& pair_sync :
+             pair.dest->pair_syncs) {
+          if (pair_sync.valid && pair_sync.peer == pair.source->key() &&
+              pair_sync.start_tiles <= pair.start_tiles &&
+              pair_sync.end_tiles >= pair.end_tiles &&
+              pair_sync.self_epoch == pair.dest->box_epoch() &&
+              pair_sync.peer_epoch == pair.source->box_epoch()) {
+            pair.was_eligible = true;
+            stats_transfer_bounded_eligible_.fetch_add(
+                1, std::memory_order_relaxed);
+            break;
+          }
+        }
+      }
     }
     if (cvars::log_rt_transfer_map && transfer_total) {
       // GPU command processor thread only - no synchronization needed.
@@ -5661,6 +5724,67 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                                            &resolve_clear_rect);
     }
   }
+
+  if (dirty_box_tracking && !dirty_box_pairs.empty()) {
+    // The copies just made each pair's contents identical on the range:
+    // reset both sides' dirty boxes and re-arm the pair sync records so the
+    // next copy between them may be bounded. A resolve clear in this same
+    // call modifies destinations behind the vertex shaders' backs, so with
+    // one present the epochs are bumped without records - the next copy is
+    // full and re-establishes the sync.
+    const VkBuffer dirty_bbox_buffer = command_processor_.dirty_bbox_buffer();
+    command_processor_.PushBufferMemoryBarrier(
+        dirty_bbox_buffer, 0, VK_WHOLE_SIZE,
+        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    command_processor_.SubmitBarriers(true);
+    DeferredCommandBuffer& reset_command_buffer =
+        command_processor_.deferred_command_buffer();
+    bool record_syncs = !resolve_clear_needed;
+    for (const DirtyBoxPair& pair : dirty_box_pairs) {
+      reset_command_buffer.CmdVkFillBuffer(
+          dirty_bbox_buffer,
+          VkDeviceSize(pair.dest->dirty_bbox_slot()) * (sizeof(uint32_t) * 4),
+          sizeof(uint32_t) * 4, 0);
+      reset_command_buffer.CmdVkFillBuffer(
+          dirty_bbox_buffer,
+          VkDeviceSize(pair.source->dirty_bbox_slot()) *
+              (sizeof(uint32_t) * 4),
+          sizeof(uint32_t) * 4, 0);
+      pair.dest->set_box_epoch(NextDirtyBoxEpoch());
+      pair.source->set_box_epoch(NextDirtyBoxEpoch());
+      if (!record_syncs) {
+        continue;
+      }
+      auto put_sync = [&](RenderTarget& record_holder, RenderTarget& peer) {
+        for (RenderTarget::PairSync& pair_sync : record_holder.pair_syncs) {
+          if (pair_sync.valid && pair_sync.peer == peer.key() &&
+              pair_sync.start_tiles == pair.start_tiles &&
+              pair_sync.end_tiles == pair.end_tiles) {
+            pair_sync.self_epoch = record_holder.box_epoch();
+            pair_sync.peer_epoch = peer.box_epoch();
+            return;
+          }
+        }
+        RenderTarget::PairSync& pair_sync =
+            record_holder.pair_syncs[record_holder.pair_sync_next++ %
+                                     xe::countof(record_holder.pair_syncs)];
+        pair_sync.peer = peer.key();
+        pair_sync.start_tiles = pair.start_tiles;
+        pair_sync.end_tiles = pair.end_tiles;
+        pair_sync.self_epoch = record_holder.box_epoch();
+        pair_sync.peer_epoch = peer.box_epoch();
+        pair_sync.valid = true;
+      };
+      put_sync(*pair.dest, *pair.source);
+      put_sync(*pair.source, *pair.dest);
+    }
+    command_processor_.PushBufferMemoryBarrier(
+        dirty_bbox_buffer, 0, VK_WHOLE_SIZE,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+  }
 }
 
 VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
@@ -6294,6 +6418,9 @@ uint32_t VulkanRenderTargetCache::PrepareEdramSnapshotRead() {
 
 bool VulkanRenderTargetCache::RestoreEdramSnapshot(const void* data,
                                                    size_t size) {
+  // Contents change behind the vertex shaders' backs: invalidate all
+  // dirty-box pair syncs.
+  BumpAllDirtyBoxEpochs();
 
   const VkDeviceSize expected_size = VkDeviceSize(xenos::kEdramSizeBytes) *
                                      draw_resolution_scale_x() *

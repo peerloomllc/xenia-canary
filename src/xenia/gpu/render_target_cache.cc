@@ -211,6 +211,7 @@ namespace xe {
 namespace gpu {
 
 std::atomic<uint64_t> RenderTargetCache::stats_transfer_count_{0};
+std::atomic<uint64_t> RenderTargetCache::stats_transfer_bounded_eligible_{0};
 std::atomic<uint64_t> RenderTargetCache::stats_resolve_count_{0};
 std::atomic<uint64_t> RenderTargetCache::stats_resolve_pixels_{0};
 
@@ -510,6 +511,14 @@ uint32_t RenderTargetCache::Transfer::AddRectangle(const Rectangle& rectangle,
 }
 
 RenderTargetCache::~RenderTargetCache() { ShutdownCommon(); }
+
+void RenderTargetCache::BumpAllDirtyBoxEpochs() {
+  for (const auto& render_target_pair : render_targets_) {
+    if (render_target_pair.second) {
+      render_target_pair.second->set_box_epoch(NextDirtyBoxEpoch());
+    }
+  }
+}
 
 void RenderTargetCache::InitializeCommon() {
   assert_true(ownership_ranges_.empty());
@@ -1503,6 +1512,7 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(
     if (render_target) {
       render_target->set_dirty_bbox_slot(dirty_bbox_next_slot_);
       dirty_bbox_next_slot_ = (dirty_bbox_next_slot_ + 1) % kDirtyBboxSlotCount;
+      render_target->set_box_epoch(NextDirtyBoxEpoch());
     }
     uint32_t width = key.GetWidth();
     uint32_t height =

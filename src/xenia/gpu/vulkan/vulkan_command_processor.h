@@ -191,6 +191,10 @@ class VulkanCommandProcessor final : public CommandProcessor {
     VulkanCommandProcessor& command_processor_;
   };
 
+    // Dirty region tracking accessors for the render target cache.
+  bool dirty_bbox_tracking_enabled() const { return dirty_bbox_enabled_; }
+  VkBuffer dirty_bbox_buffer() const { return dirty_bbox_buffer_; }
+
     uint64_t GetCurrentSubmission() const {
     return completion_timeline_.GetUpcomingSubmission();
   }

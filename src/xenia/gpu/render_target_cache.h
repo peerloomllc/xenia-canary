@@ -49,6 +49,13 @@ class RenderTargetCache {
   // Dirty region tracking bounding box slot count (buffer is 4 uint32 each).
   static constexpr uint32_t kDirtyBboxSlotCount = 4096;
 
+  // A new epoch value for dirty-box bookkeeping (monotonic).
+  uint32_t NextDirtyBoxEpoch() { return ++dirty_box_epoch_source_; }
+
+  // Contents of every render target changed through an uninstrumented path
+  // (an EDRAM snapshot load): invalidate all pair-sync records.
+  void BumpAllDirtyBoxEpochs();
+
   // The dirty bounding box slot of the depth / stencil render target the last
   // Update() bound, or UINT32_MAX.
   uint32_t last_update_used_depth_dirty_bbox_slot() const {
@@ -58,6 +65,7 @@ class RenderTargetCache {
   }
 
   static std::atomic<uint64_t> stats_transfer_count_;
+  static std::atomic<uint64_t> stats_transfer_bounded_eligible_;
   static std::atomic<uint64_t> stats_resolve_count_;
   static std::atomic<uint64_t> stats_resolve_pixels_;
 
@@ -385,12 +393,33 @@ class RenderTargetCache {
     uint32_t dirty_bbox_slot() const { return dirty_bbox_slot_; }
     void set_dirty_bbox_slot(uint32_t slot) { dirty_bbox_slot_ = slot; }
 
+    // Dirty region tracking pair-sync bookkeeping. box_epoch changes every
+    // time this render target's dirty box is reset or its contents change
+    // through a path vertex shaders don't instrument (a resolve clear, an
+    // EDRAM snapshot load, recreation). A PairSync records that this render
+    // target held identical contents to a peer for an EDRAM tile range at
+    // specific epochs on both sides; a copy between the two while both
+    // epochs still match may be bounded by the union of their dirty boxes.
+    uint32_t box_epoch() const { return box_epoch_; }
+    void set_box_epoch(uint32_t epoch) { box_epoch_ = epoch; }
+    struct PairSync {
+      RenderTargetKey peer;
+      uint32_t start_tiles = 0;
+      uint32_t end_tiles = 0;
+      uint32_t self_epoch = 0;
+      uint32_t peer_epoch = 0;
+      bool valid = false;
+    };
+    PairSync pair_syncs[2];
+    uint32_t pair_sync_next = 0;
+
    protected:
     RenderTarget(RenderTargetKey key) : key_(key) {}
 
    private:
     RenderTargetKey key_;
     uint32_t dirty_bbox_slot_ = UINT32_MAX;
+    uint32_t box_epoch_ = 0;
   };
 
   struct Transfer {
@@ -787,6 +816,9 @@ class RenderTargetCache {
       last_update_used_render_targets_[1 + xenos::kMaxColorRenderTargets];
   // Next dirty bounding box slot to assign to a created render target.
   uint32_t dirty_bbox_next_slot_ = 0;
+  // Monotonic dirty-box epoch source, shared by all render targets so a
+  // recreated render target can never match a stale PairSync record.
+  uint32_t dirty_box_epoch_source_ = 0;
   // Render targets used by the draw call with the last successful update or
   // previous updates, unless a different or a totally new one was bound (or
   // surface info was changed), to avoid unneeded render target switching (which
