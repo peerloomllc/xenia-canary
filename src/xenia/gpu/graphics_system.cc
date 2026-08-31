@@ -9,6 +9,8 @@
 
 #include "xenia/gpu/graphics_system.h"
 
+#include <algorithm>
+
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
@@ -191,6 +193,14 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
                 if (!cvars::vsync && normalized_framerate_limit > 0) {
                   sleep_duration_ns = 1000000000 / normalized_framerate_limit;
                 }
+                // The Windows branch paces vblanks on the guest clock, which
+                // the time scalar stretches, so 2x there really is twice the
+                // vblanks. This branch sleeps in host time; apply the scalar
+                // here so fast-forward and slow-motion work on Linux too.
+                const double scalar = std::clamp(Clock::guest_time_scalar(),
+                                                 1.0 / 16.0, 16.0);
+                sleep_duration_ns =
+                    static_cast<uint64_t>(sleep_duration_ns / scalar);
                 threading::NanoSleep(sleep_duration_ns);
               } else {
                 xe::threading::Sleep(std::chrono::milliseconds(1));
