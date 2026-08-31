@@ -14,3 +14,12 @@
 DECLARE_bool(mute)
 
 #endif  // XENIA_APU_APU_FLAGS_H_
+DECLARE_string(fast_forward_audio);
+DECLARE_string(slow_motion_audio);
+
+namespace xe {
+namespace apu {
+// Sets --mute at runtime as a config override (saved with the config).
+void SetMuteOverride(bool mute);
+}  // namespace apu
+}  // namespace xe
