@@ -4356,7 +4356,8 @@ void VulkanCommandProcessor::CheckSubmissionCompletionAndDeviceLoss(
 bool VulkanCommandProcessor::CaptureDirtyBboxPairProbe(
     uint32_t source_slot, uint32_t dest_slot, const char* gate,
     uint32_t start_tiles, uint32_t end_tiles, uint32_t dest_width,
-    uint32_t dest_height, uint32_t range_height) {
+    uint32_t dest_height, uint32_t range_height, uint32_t source_width,
+    uint32_t source_height) {
   if (!dirty_bbox_enabled_ || dirty_bbox_pair_probe_pending_ ||
       dirty_bbox_readback_buffer_ == VK_NULL_HANDLE) {
     return false;
@@ -4385,6 +4386,8 @@ bool VulkanCommandProcessor::CaptureDirtyBboxPairProbe(
   dirty_bbox_pair_probe_dest_extent_[0] = dest_width;
   dirty_bbox_pair_probe_dest_extent_[1] = dest_height;
   dirty_bbox_pair_probe_range_height_ = range_height;
+  dirty_bbox_pair_probe_source_extent_[0] = source_width;
+  dirty_bbox_pair_probe_source_extent_[1] = source_height;
   // The viewport the last box-writing draw used: the space the box is in,
   // scale * 2 being the extent.
   dirty_bbox_pair_probe_viewport_[0] =
@@ -4656,23 +4659,74 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
         probe_empty[probe_i] = probe_min_x[probe_i] > probe_max_x[probe_i] ||
                                probe_min_y[probe_i] > probe_max_y[probe_i];
       }
-      // Union area as a fraction of what the copy has to cover: the
-      // destination's host width by the rows the tile range spans.
-      uint32_t union_min_x = std::min(probe_min_x[0], probe_min_x[1]);
-      uint32_t union_min_y = std::min(probe_min_y[0], probe_min_y[1]);
-      uint32_t union_max_x = std::max(probe_max_x[0], probe_max_x[1]);
-      uint32_t union_max_y = std::max(probe_max_y[0], probe_max_y[1]);
-      double copied_area = double(dirty_bbox_pair_probe_dest_extent_[0]) *
-                           double(dirty_bbox_pair_probe_range_height_);
+      // The two boxes are in their own targets' host pixels, and the two
+      // targets of an MSAA-changing copy do not share a pixel space (a
+      // 4xMSAA source of this pair is 1760 wide where the 1xMSAA
+      // destination is 880). Put the source box into destination pixels
+      // before the union, or the fraction compares one space against the
+      // other - which is what made an earlier reading of this pair report
+      // 7.4% and over 100% for the same copy.
+      double source_to_dest_x =
+          dirty_bbox_pair_probe_source_extent_[0]
+              ? double(dirty_bbox_pair_probe_dest_extent_[0]) /
+                    double(dirty_bbox_pair_probe_source_extent_[0])
+              : 1.0;
+      double source_to_dest_y =
+          dirty_bbox_pair_probe_source_extent_[1]
+              ? double(dirty_bbox_pair_probe_dest_extent_[1]) /
+                    double(dirty_bbox_pair_probe_source_extent_[1])
+              : 1.0;
+      double union_min_x_d = 0.0, union_min_y_d = 0.0;
+      double union_max_x_d = 0.0, union_max_y_d = 0.0;
+      bool union_empty = true;
+      auto probe_add_box = [&](uint32_t box_index, double scale_x,
+                               double scale_y) {
+        if (probe_empty[box_index]) {
+          return;
+        }
+        double box_min_x = double(probe_min_x[box_index]) * scale_x;
+        double box_min_y = double(probe_min_y[box_index]) * scale_y;
+        double box_max_x = double(probe_max_x[box_index] + 1) * scale_x;
+        double box_max_y = double(probe_max_y[box_index] + 1) * scale_y;
+        if (union_empty) {
+          union_min_x_d = box_min_x;
+          union_min_y_d = box_min_y;
+          union_max_x_d = box_max_x;
+          union_max_y_d = box_max_y;
+          union_empty = false;
+          return;
+        }
+        union_min_x_d = std::min(union_min_x_d, box_min_x);
+        union_min_y_d = std::min(union_min_y_d, box_min_y);
+        union_max_x_d = std::max(union_max_x_d, box_max_x);
+        union_max_y_d = std::max(union_max_y_d, box_max_y);
+      };
+      probe_add_box(0, source_to_dest_x, source_to_dest_y);
+      probe_add_box(1, 1.0, 1.0);
+      // Only the part inside the region this copy covers counts: the box
+      // spans the whole target, the copy takes a range of its rows.
+      double copied_width = double(dirty_bbox_pair_probe_dest_extent_[0]);
+      double copied_height = double(dirty_bbox_pair_probe_range_height_);
+      double clamped_min_x = std::max(union_min_x_d, 0.0);
+      double clamped_min_y = std::max(union_min_y_d, 0.0);
+      double clamped_max_x = std::min(union_max_x_d, copied_width);
+      double clamped_max_y = std::min(union_max_y_d, copied_height);
+      double copied_area = copied_width * copied_height;
       double union_fraction = 0.0;
-      if (!(probe_empty[0] && probe_empty[1]) && copied_area > 0.0) {
-        union_fraction = double(union_max_x - union_min_x + 1) *
-                         double(union_max_y - union_min_y + 1) / copied_area;
+      if (!union_empty && copied_area > 0.0 && clamped_max_x > clamped_min_x &&
+          clamped_max_y > clamped_min_y) {
+        union_fraction = (clamped_max_x - clamped_min_x) *
+                         (clamped_max_y - clamped_min_y) / copied_area;
       }
+      uint32_t union_min_x = uint32_t(std::max(union_min_x_d, 0.0));
+      uint32_t union_min_y = uint32_t(std::max(union_min_y_d, 0.0));
+      uint32_t union_max_x = uint32_t(std::max(union_max_x_d, 0.0));
+      uint32_t union_max_y = uint32_t(std::max(union_max_y_d, 0.0));
       XELOGI(
           "Dirty bbox pair probe ({}) tiles [{}, {}): source slot {} px x "
           "[{}, {}] y [{}, {}]{} | dest slot {} px x [{}, {}] y [{}, {}]{} | "
-          "union {} = {:.1f}% of the copied {}x{} | dest host {}x{} | "
+          "union in dest px [{}, {}] x [{}, {}] {} = {:.1f}% of the copied "
+          "{}x{} | source host {}x{} | dest host {}x{} | "
           "viewport {:.0f}x{:.0f}",
           dirty_bbox_pair_probe_gate_, dirty_bbox_pair_probe_tiles_[0],
           dirty_bbox_pair_probe_tiles_[1], dirty_bbox_pair_probe_slots_[0],
@@ -4680,9 +4734,12 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
           probe_empty[0] ? " EMPTY" : "", dirty_bbox_pair_probe_slots_[1],
           probe_min_x[1], probe_max_x[1], probe_min_y[1], probe_max_y[1],
           probe_empty[1] ? " EMPTY" : "",
-          (probe_empty[0] && probe_empty[1]) ? "EMPTY" : "non-empty",
+          union_min_x, union_max_x, union_min_y, union_max_y,
+          union_empty ? "EMPTY" : "non-empty",
           union_fraction * 100.0, dirty_bbox_pair_probe_dest_extent_[0],
           dirty_bbox_pair_probe_range_height_,
+          dirty_bbox_pair_probe_source_extent_[0],
+          dirty_bbox_pair_probe_source_extent_[1],
           dirty_bbox_pair_probe_dest_extent_[0],
           dirty_bbox_pair_probe_dest_extent_[1],
           dirty_bbox_pair_probe_viewport_[0],

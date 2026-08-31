@@ -4975,26 +4975,33 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         command_processor_.deferred_command_buffer();
     constexpr VkDeviceSize kBoxSize = sizeof(uint32_t) * 4;
     {
-      // With the transfer map diagnostic on, probe the ineligible big pairs
-      // (tiles >= 1440, the D24S8 ping-pong) instead: their boxes at copy
-      // time say whether a bounded copy was available at all.
-      const bool probe_ineligible_big = cvars::log_rt_transfer_map;
+      // With the transfer map diagnostic on, probe the big pairs (tiles >=
+      // 1440, the D24S8 ping-pong) instead, in both directions and whether
+      // or not they were eligible: their boxes at copy time say how much of
+      // a bounded copy was available. Restricting this to the ineligible
+      // ones sampled only one direction of the ping-pong, since the other
+      // direction is eligible and was skipped.
+      const bool probe_big = cvars::log_rt_transfer_map;
       auto probe_wanted = [&](const DirtyBoxPair& pair) {
-        return probe_ineligible_big
-                   ? (!pair.was_eligible && pair.start_tiles >= 1440 &&
-                      pair.end_tiles - pair.start_tiles >= 250)
-                   : pair.was_eligible;
+        return probe_big ? (pair.start_tiles >= 1440 &&
+                            pair.end_tiles - pair.start_tiles >= 250)
+                         : pair.was_eligible;
       };
-      // Only one probe is in flight at a time, so without skipping it would
-      // always sample the first copy after a frame ends. Skip one more each
-      // time, walking the copies of a frame across frames.
+      // Only one probe is in flight at a time. Sampling the first wanted pair
+      // of whatever call finds the readback free locks onto one phase of the
+      // frame: it reported the same copy on 1558 of 1560 samples. So skip a
+      // scattered number of wanted pairs between probes, and only count down
+      // that skip on calls where a probe could actually have been taken -
+      // counting it down while one is in flight let the readback swallow the
+      // whole skip and put the sampling back on the same phase.
       static uint32_t probe_skip_remaining = 0;
       static uint32_t probe_skip_next = 0;
+      const bool probe_free = !command_processor_.dirty_bbox_pair_probe_pending();
       uint32_t wanted_count = 0;
       for (const DirtyBoxPair& pair : dirty_box_pairs) {
         wanted_count += uint32_t(probe_wanted(pair));
       }
-      if (wanted_count) {
+      if (wanted_count && probe_free) {
         for (const DirtyBoxPair& pair : dirty_box_pairs) {
           if (!probe_wanted(pair)) {
             continue;
@@ -5018,13 +5025,24 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                   ? (pair.end_tiles - pair.start_tiles) /
                         probe_dest_key.pitch_tiles_at_32bpp
                   : 0;
+          // The source's own host extent, to convert its box into the
+          // destination's pixels: the two sides of an MSAA-changing copy do
+          // not share a pixel space.
+          RenderTargetKey probe_source_key = pair.source->key();
+          uint32_t probe_source_width =
+              probe_source_key.GetWidth() * GetKeyScaleX(probe_source_key);
+          uint32_t probe_source_height =
+              GetRenderTargetHeight(probe_source_key.pitch_tiles_at_32bpp,
+                                    probe_source_key.msaa_samples) *
+              GetKeyScaleY(probe_source_key);
           if (command_processor_.CaptureDirtyBboxPairProbe(
                   pair.source->dirty_bbox_slot(), pair.dest->dirty_bbox_slot(),
                   pair.was_eligible ? "eligible" : pair.gate, pair.start_tiles,
                   pair.end_tiles, probe_dest_width, probe_dest_height,
                   probe_range_rows * xenos::kEdramTileHeightSamples *
-                      GetKeyScaleY(probe_dest_key))) {
-            probe_skip_next = (probe_skip_next + 1) % 64;
+                      GetKeyScaleY(probe_dest_key),
+                  probe_source_width, probe_source_height)) {
+            probe_skip_next = (probe_skip_next * 7 + 3) % 61;
             probe_skip_remaining = probe_skip_next;
           }
           break;

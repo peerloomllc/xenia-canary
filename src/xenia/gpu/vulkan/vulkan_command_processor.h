@@ -624,6 +624,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
   const char* dirty_bbox_pair_probe_gate_ = "eligible";
   uint32_t dirty_bbox_pair_probe_tiles_[2] = {};
   uint32_t dirty_bbox_pair_probe_dest_extent_[2] = {};
+  uint32_t dirty_bbox_pair_probe_source_extent_[2] = {};
   uint32_t dirty_bbox_pair_probe_range_height_ = 0;
   float dirty_bbox_pair_probe_viewport_[2] = {};
   // --log_dirty_bbox_draws: what dirtied a box since it was last zeroed, so a
@@ -646,13 +647,19 @@ class VulkanCommandProcessor final : public CommandProcessor {
  public:
   // True when the probe was taken (only one is in flight at a time), so the
   // caller can walk which copy of a frame it samples.
+  // A probe already taken and not yet read back: no other can be captured.
+  bool dirty_bbox_pair_probe_pending() const {
+    return dirty_bbox_pair_probe_pending_;
+  }
   bool CaptureDirtyBboxPairProbe(uint32_t source_slot, uint32_t dest_slot,
                                  const char* gate = "eligible",
                                  uint32_t start_tiles = 0,
                                  uint32_t end_tiles = 0,
                                  uint32_t dest_width = 0,
                                  uint32_t dest_height = 0,
-                                 uint32_t range_height = 0);
+                                 uint32_t range_height = 0,
+                                 uint32_t source_width = 0,
+                                 uint32_t source_height = 0);
   // The boxes for these slots are about to be zeroed: the draws recorded
   // against them no longer describe what a box holds.
   void ClearDirtyBboxDrawLog(uint32_t slot) {
