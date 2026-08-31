@@ -4602,11 +4602,9 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
         float max_y = std::min<uint32_t>(box[3], 65535) / 655.35f;
         ++logged;
         XELOGI(
-            "Dirty bbox slot {}: x [{:.1f}%, {:.1f}%] y [{:.1f}%, {:.1f}%] "
-            "area {:.1f}%",
-            slot, min_x, min_y, max_x, max_y,
-            std::max(0.0f, (max_x - min_x)) * std::max(0.0f, (max_y - min_y)) /
-                100.0f);
+            "Dirty bbox slot {}: raw {:04X} {:04X} {:04X} {:04X} -> "
+            "x [{:.1f}%, {:.1f}%] y [{:.1f}%, {:.1f}%]",
+            slot, box[0], box[1], box[2], box[3], min_x, max_x, min_y, max_y);
       }
     }
 

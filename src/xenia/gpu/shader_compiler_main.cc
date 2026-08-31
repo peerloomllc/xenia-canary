@@ -118,6 +118,9 @@ int shader_compiler_main(const std::vector<std::string>& args) {
 
   std::unique_ptr<ShaderTranslator> translator;
   SpirvShaderTranslator::Features spirv_features(true);
+  // Include the dirty region tracking vertex instrumentation in offline
+  // translations so it can be inspected.
+  spirv_features.dirty_bbox_vertex_binding = 1;
   if (cvars::shader_output_type == "spirv" ||
       cvars::shader_output_type == "spirvtext") {
     translator = std::make_unique<SpirvShaderTranslator>(
