@@ -9,6 +9,9 @@
 
 #include "xenia/kernel/xiocompletion.h"
 
+#include "xenia/base/logging.h"
+#include "xenia/kernel/kernel_state.h"
+
 namespace xe {
 namespace kernel {
 
@@ -18,7 +21,48 @@ XIOCompletion::XIOCompletion(KernelState* kernel_state)
   assert_not_null(notification_semaphore_);
 }
 
+XIOCompletion::XIOCompletion() : XObject(kObjectType) {
+  notification_semaphore_ = threading::Semaphore::Create(0, kMaxNotifications);
+  assert_not_null(notification_semaphore_);
+}
+
 XIOCompletion::~XIOCompletion() = default;
+
+bool XIOCompletion::Save(ByteStream* stream) {
+  if (!SaveObject(stream)) {
+    return false;
+  }
+  std::unique_lock<std::mutex> lock(notification_lock_);
+  // Pending notifications, oldest first.
+  std::queue<IONotification> copy = notifications_;
+  stream->Write<uint32_t>(uint32_t(copy.size()));
+  while (!copy.empty()) {
+    stream->Write(&copy.front(), sizeof(IONotification));
+    copy.pop();
+  }
+  XELOGD("XIOCompletion {:08X}: {} pending notification(s)", handle(),
+         notifications_.size());
+  return true;
+}
+
+object_ref<XIOCompletion> XIOCompletion::Restore(KernelState* kernel_state,
+                                                 ByteStream* stream) {
+  auto port = new XIOCompletion();
+  port->kernel_state_ = kernel_state;
+  if (!port->RestoreObject(stream)) {
+    delete port;
+    return nullptr;
+  }
+  uint32_t count = stream->Read<uint32_t>();
+  for (uint32_t i = 0; i < count; ++i) {
+    IONotification notification;
+    stream->Read(&notification, sizeof(notification));
+    port->QueueNotification(notification);
+  }
+  XELOGI("XIOCompletion {:08X} restored with {} pending notification(s)",
+         port->handle(), count);
+  return object_ref<XIOCompletion>(port);
+}
 
 void XIOCompletion::QueueNotification(IONotification& notification) {
   std::unique_lock<std::mutex> lock(notification_lock_);

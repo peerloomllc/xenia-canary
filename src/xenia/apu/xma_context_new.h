@@ -65,7 +65,13 @@ class XmaContextNew : public XmaContext {
   void Disable();
   void Release();
 
+  void SaveState(ByteStream* stream);
+  bool RestoreState(ByteStream* stream, uint32_t size);
+
  private:
+  // Recreate the codec context: closed when sample_rate is 0, otherwise
+  // opened fresh for the rate and channel count.
+  bool ResetCodec(int sample_rate, int channels);
   void ClearLocked(XMA_CONTEXT_DATA* data);
   static void SwapInputBuffer(XMA_CONTEXT_DATA* data);
   // Convert sampling rate from ID to frequency.

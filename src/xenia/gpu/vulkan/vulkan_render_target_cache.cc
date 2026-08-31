@@ -1026,6 +1026,11 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
                                          edram_storage_buffer_descriptor_pool_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                         edram_snapshot_upload_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                         edram_snapshot_upload_buffer_memory_);
+  edram_snapshot_upload_buffer_size_ = 0;
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
                                          edram_buffer_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
                                          edram_buffer_memory_);
@@ -1946,7 +1951,9 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
         VkSampleCountFlagBits(uint32_t(1) << uint32_t(key.msaa_samples));
   }
   image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-  image_create_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+  // Transfer destination for save state EDRAM snapshot uploads.
+  image_create_info.usage =
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
   image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   image_create_info.queueFamilyIndexCount = 0;
   image_create_info.pQueueFamilyIndices = nullptr;
@@ -6205,6 +6212,144 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
   }
   dump_pipelines_.emplace(key, pipeline);
   return pipeline;
+}
+
+uint32_t VulkanRenderTargetCache::PrepareEdramSnapshotRead() {
+  const uint32_t size = xenos::kEdramSizeBytes * draw_resolution_scale_x() *
+                        draw_resolution_scale_y();
+  command_processor_.EndRenderPass();
+  if (GetPath() == Path::kHostRenderTargets) {
+    // Every host render target's contents into edram_buffer_.
+    DumpRenderTargets(0, xenos::kEdramTileCount, 1, xenos::kEdramTileCount,
+                      false);
+  }
+  UseEdramBuffer(EdramBufferUsage::kTransferRead);
+  command_processor_.SubmitBarriers(true);
+  return size;
+}
+
+bool VulkanRenderTargetCache::RestoreEdramSnapshot(const void* data,
+                                                   size_t size) {
+  const VkDeviceSize expected_size = VkDeviceSize(xenos::kEdramSizeBytes) *
+                                     draw_resolution_scale_x() *
+                                     draw_resolution_scale_y();
+  if (size != expected_size) {
+    XELOGE("EDRAM snapshot: {} bytes, expected {}", size, expected_size);
+    return false;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (edram_snapshot_upload_buffer_size_ < expected_size) {
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                           edram_snapshot_upload_buffer_);
+    ui::vulkan::util::DestroyAndNullHandle(
+        dfn.vkFreeMemory, device, edram_snapshot_upload_buffer_memory_);
+    edram_snapshot_upload_buffer_size_ = 0;
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device, expected_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            ui::vulkan::util::MemoryPurpose::kUpload,
+            edram_snapshot_upload_buffer_,
+            edram_snapshot_upload_buffer_memory_)) {
+      XELOGE("EDRAM snapshot: could not create the {} byte upload buffer",
+             expected_size);
+      return false;
+    }
+    edram_snapshot_upload_buffer_size_ = expected_size;
+  }
+  void* mapping = nullptr;
+  if (dfn.vkMapMemory(device, edram_snapshot_upload_buffer_memory_, 0,
+                      expected_size, 0, &mapping) != VK_SUCCESS ||
+      !mapping) {
+    XELOGE("EDRAM snapshot: could not map the upload buffer");
+    return false;
+  }
+  command_processor_.EndRenderPass();
+  if (GetPath() == Path::kPixelShaderInterlock) {
+    std::memcpy(mapping, data, size_t(expected_size));
+    dfn.vkUnmapMemory(device, edram_snapshot_upload_buffer_memory_);
+    UseEdramBuffer(EdramBufferUsage::kTransferWrite);
+    command_processor_.SubmitBarriers(true);
+    VkBufferCopy copy_region = {};
+    copy_region.size = expected_size;
+    command_processor_.deferred_command_buffer().CmdVkCopyBuffer(
+        edram_snapshot_upload_buffer_, edram_buffer_, 1, &copy_region);
+    // Nothing drawn since: the next usage switch is a full barrier.
+    PixelShaderInterlockFullEdramBarrierPlaced();
+    XELOGI("EDRAM snapshot: {} bytes uploaded to the EDRAM buffer",
+           expected_size);
+    return true;
+  }
+  // Host render targets: a 1280-sample-wide k_32_FLOAT render target that
+  // covers all of EDRAM and now owns every tile; the guest's next render
+  // targets get their contents transferred out of it.
+  RenderTarget* render_target =
+      PrepareFullEdram1280xRenderTargetForSnapshotRestoration(
+          xenos::ColorRenderTargetFormat::k_32_FLOAT);
+  if (!render_target) {
+    dfn.vkUnmapMemory(device, edram_snapshot_upload_buffer_memory_);
+    XELOGE("EDRAM snapshot: no full-EDRAM render target");
+    return false;
+  }
+  // EDRAM is tile-major: 80x16 samples of 32 bits per tile, and with a
+  // resolution scale each tile is 80*sx by 16*sy samples, row-major
+  // inside the tile (the layout the dump shader writes). Lay the tiles
+  // out as image rows, 16 tiles per row.
+  constexpr uint32_t kPitchTiles = 16;
+  constexpr uint32_t kSampleBytes = sizeof(uint32_t);
+  const uint32_t scale_x = draw_resolution_scale_x();
+  const uint32_t scale_y = draw_resolution_scale_y();
+  const uint32_t tile_width = xenos::kEdramTileWidthSamples * scale_x;
+  const uint32_t tile_height = xenos::kEdramTileHeightSamples * scale_y;
+  const uint32_t tile_row_bytes = tile_width * kSampleBytes;
+  const uint32_t image_width = kPitchTiles * tile_width;
+  const uint32_t image_row_bytes = image_width * kSampleBytes;
+  constexpr uint32_t kTileRows = xenos::kEdramTileCount / kPitchTiles;
+  const uint32_t image_height = kTileRows * tile_height;
+  assert_true(uint64_t(image_row_bytes) * image_height == expected_size);
+  const uint8_t* source = static_cast<const uint8_t*>(data);
+  uint8_t* destination = static_cast<uint8_t*>(mapping);
+  for (uint32_t tile_row = 0; tile_row < kTileRows; ++tile_row) {
+    for (uint32_t tile_x = 0; tile_x < kPitchTiles; ++tile_x) {
+      for (uint32_t sample_row = 0; sample_row < tile_height; ++sample_row) {
+        uint32_t image_row = tile_row * tile_height + sample_row;
+        std::memcpy(destination + size_t(image_row) * image_row_bytes +
+                        size_t(tile_x) * tile_row_bytes,
+                    source, tile_row_bytes);
+        source += tile_row_bytes;
+      }
+    }
+  }
+  const uint32_t kImageWidth = image_width;
+  const uint32_t kImageHeight = image_height;
+  dfn.vkUnmapMemory(device, edram_snapshot_upload_buffer_memory_);
+  auto& vulkan_rt = *static_cast<VulkanRenderTarget*>(render_target);
+  command_processor_.PushImageMemoryBarrier(
+      vulkan_rt.image(),
+      ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT),
+      vulkan_rt.current_stage_mask(), VK_PIPELINE_STAGE_TRANSFER_BIT,
+      vulkan_rt.current_access_mask(), VK_ACCESS_TRANSFER_WRITE_BIT,
+      vulkan_rt.current_layout(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+  vulkan_rt.SetUsage(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                     VK_ACCESS_TRANSFER_WRITE_BIT,
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+  command_processor_.SubmitBarriers(true);
+  VkBufferImageCopy copy_region = {};
+  copy_region.bufferRowLength = kImageWidth;
+  copy_region.bufferImageHeight = kImageHeight;
+  copy_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  copy_region.imageSubresource.layerCount = 1;
+  copy_region.imageExtent.width = kImageWidth;
+  copy_region.imageExtent.height = kImageHeight;
+  copy_region.imageExtent.depth = 1;
+  command_processor_.deferred_command_buffer().CmdVkCopyBufferToImage(
+      edram_snapshot_upload_buffer_, vulkan_rt.image(),
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy_region);
+  XELOGI("EDRAM snapshot: {} bytes uploaded to a full-EDRAM render target "
+         "({}x{}, scale {}x{})",
+         expected_size, kImageWidth, kImageHeight, scale_x, scale_y);
+  return true;
 }
 
 void VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base,

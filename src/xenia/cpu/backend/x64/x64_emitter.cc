@@ -20,6 +20,8 @@
 #include "xenia/base/debugging.h"
 #include "xenia/base/literals.h"
 #include "xenia/base/logging.h"
+
+#include <atomic>
 #include "xenia/base/math.h"
 #include "xenia/base/memory.h"
 #include "xenia/base/profiling.h"
@@ -677,7 +679,26 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
   assert_not_null(fn);
   auto x64_fn = static_cast<X64Function*>(fn);
   uint64_t addr = reinterpret_cast<uint64_t>(x64_fn->machine_code());
-
+  {
+    // Diagnostic: how often calls come through the resolver at all.
+    static std::atomic<uint64_t> resolves{0};
+    uint64_t n = ++resolves;
+    if ((n % 100000) == 1) {
+      XELOGI("ResolveFunction thunk: {} calls so far (target {:08X})", n,
+             static_cast<uint32_t>(target_address));
+    }
+  }
+  // Point the indirection slot at the code so the next call is direct. The
+  // slot is normally written when the function is placed, but reloading the
+  // executable module (a save-state restore does that) resets the whole
+  // table to the resolver while already-compiled functions keep their
+  // entries and are never placed again - every call to them then came back
+  // here, under the global lock, and the game slowed to a crawl.
+  if (fn->address() == static_cast<uint32_t>(target_address)) {
+    auto backend = static_cast<X64Backend*>(thread_state->processor()->backend());
+    backend->code_cache()->AddIndirection(
+        static_cast<uint32_t>(target_address), static_cast<uint32_t>(addr));
+  }
   return addr;
 }
 

@@ -660,6 +660,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_XE_SWAP(uint32_t packet,
   uint32_t frontbuffer_height = reader_.ReadAndSwap<uint32_t>();
   reader_.AdvanceRead((count - 4) * sizeof(uint32_t));
 
+  swap_count_.fetch_add(1, std::memory_order_relaxed);
   COMMAND_PROCESSOR::IssueSwap(frontbuffer_ptr, frontbuffer_width,
                                frontbuffer_height);
 
@@ -719,6 +720,23 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
   // Save-state restores have stalled here.
   auto wait_started = std::chrono::steady_clock::now();
   bool wait_logged = false;
+  if (cvars::log_wait_reg_mem) {
+    // Diagnostic (60 fps patches): what the guest makes the GPU wait on,
+    // throttled to one line per second per poll address.
+    static std::map<uint32_t, std::pair<std::chrono::steady_clock::time_point,
+                                        uint32_t>>
+        last_logged;
+    auto& entry = last_logged[poll_reg_addr];
+    ++entry.second;
+    if (wait_started - entry.first > std::chrono::seconds(1)) {
+      XELOGI("WAIT_REG_MEM {} {:08X} mask={:08X} ref={:08X} wait_info={:X} "
+             "wait={:X} value_now={:08X} ({} in the last second)",
+             is_memory ? "mem" : "reg", poll_reg_addr, mask, ref, wait_info,
+             wait, uint32_t(value_ref), entry.second);
+      entry.first = wait_started;
+      entry.second = 0;
+    }
+  }
 
   do {
     uint32_t value = value_ref;

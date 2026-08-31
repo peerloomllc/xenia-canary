@@ -220,6 +220,10 @@ class BaseHeap {
 
   bool Save(ByteStream* stream);
   bool Restore(ByteStream* stream);
+  // Page table only (no page contents), for heaps that alias another heap's
+  // memory. Restore re-applies each allocated page's guest protection.
+  bool SavePageTable(ByteStream* stream);
+  bool RestorePageTable(ByteStream* stream);
 
   void Reset();
 
@@ -313,6 +317,11 @@ class PhysicalHeap : public BaseHeap {
   // invalidate_unwatched the callbacks are raised even when no watch is armed
   // for a caller that knows the range is about to change rather than one
   // reacting to a fault.
+  // Forgets every access watch (a save-state restore rewrote the page
+  // protections). Watchers must treat all their data as invalid afterwards
+  // so their next request re-arms the pages.
+  void ResetAccessCallbacks();
+
   bool TriggerCallbacks(global_unique_lock_type global_lock_locked_once,
                         uint32_t virtual_address, uint32_t length,
                         bool is_write, bool unwatch_exact_range,

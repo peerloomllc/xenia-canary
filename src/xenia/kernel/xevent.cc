@@ -23,6 +23,11 @@ XEvent::~XEvent() = default;
 void XEvent::Initialize(bool manual_reset, bool initial_state) {
   assert_false(event_);
 
+  // Recorded for Save(): without it every NtCreateEvent event was written
+  // as auto-reset and came back from a save state consuming its waiters'
+  // signals, which deadlocked the frame hand-off on restore.
+  manual_reset_ = manual_reset;
+
   CreateNative<X_KEVENT>();
 
   if (manual_reset) {
@@ -86,21 +91,11 @@ bool XEvent::Save(ByteStream* stream) {
   XELOGD("XEvent {:08X} ({})", handle(), manual_reset_ ? "manual" : "auto");
   SaveObject(stream);
 
-  bool signaled = true;
-  auto result =
-      xe::threading::Wait(event_.get(), false, std::chrono::milliseconds(0));
-  if (result == xe::threading::WaitResult::kSuccess) {
-    signaled = true;
-  } else if (result == xe::threading::WaitResult::kTimeout) {
-    signaled = false;
-  } else {
-    assert_always();
-  }
-
-  if (signaled) {
-    // Reset the event in-case it's an auto-reset.
-    event_->Set();
-  }
+  // Query rather than probe with a zero-timeout wait: a wait would consume
+  // an auto-reset signal (and re-setting it wakes waiters), and it needs the
+  // event's lock, which a thread stopped by Pause() may be holding.
+  auto info = event_->Query();
+  bool signaled = info.state != 0;
 
   stream->Write<bool>(signaled);
   stream->Write<bool>(manual_reset_);

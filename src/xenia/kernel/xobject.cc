@@ -13,9 +13,12 @@
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
+#include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
 #include "xenia/kernel/xenumerator.h"
 #include "xenia/kernel/xevent.h"
 #include "xenia/kernel/xfile.h"
+#include "xenia/kernel/xtimer.h"
+#include "xenia/kernel/xiocompletion.h"
 #include "xenia/kernel/xmodule.h"
 #include "xenia/kernel/xmutant.h"
 #include "xenia/kernel/xnotifylistener.h"
@@ -135,7 +138,7 @@ object_ref<XObject> XObject::Restore(KernelState* kernel_state, Type type,
     case Type::File:
       return XFile::Restore(kernel_state, stream);
     case Type::IOCompletion:
-      break;
+      return XIOCompletion::Restore(kernel_state, stream);
     case Type::Module:
       return XModule::Restore(kernel_state, stream);
     case Type::Mutant:
@@ -153,7 +156,7 @@ object_ref<XObject> XObject::Restore(KernelState* kernel_state, Type type,
     case Type::Thread:
       return XThread::Restore(kernel_state, stream);
     case Type::Timer:
-      break;
+      return XTimer::Restore(kernel_state, stream);
     case Type::Undefined:
       break;
   }
@@ -188,12 +191,34 @@ uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
   }
 }
 
+namespace {
+// NT satisfies an alertable wait at once with STATUS_USER_APC when a user
+// APC is already pending. Without this the APC waited for the next host-side
+// alert, which a thread restored from a save state never gets: the APC
+// record is in guest memory (saved), the alert that NtQueueApcThread sent
+// the host thread is not, and the restored thread re-enters its wait from
+// the start.
+X_STATUS DeliverPendingUserApcs(uint32_t alertable) {
+  if (!alertable) {
+    return X_STATUS_SUCCESS;
+  }
+  auto thread = XThread::GetCurrentThread();
+  if (!thread || !thread->is_guest_thread()) {
+    return X_STATUS_SUCCESS;
+  }
+  return xboxkrnl::xeProcessUserApcs(nullptr);
+}
+}  // namespace
+
 X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode,
                        uint32_t alertable, uint64_t* opt_timeout) {
   auto wait_handle = GetWaitHandle();
   if (!wait_handle) {
     // Object doesn't support waiting.
     return X_STATUS_SUCCESS;
+  }
+  if (DeliverPendingUserApcs(alertable) == X_STATUS_USER_APC) {
+    return X_STATUS_USER_APC;
   }
 
   auto timeout_ms =
@@ -271,6 +296,9 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects,
   for (size_t i = 0; i < count; ++i) {
     wait_handles[i] = objects[i]->GetWaitHandle();
     assert_not_null(wait_handles[i]);
+  }
+  if (DeliverPendingUserApcs(alertable) == X_STATUS_USER_APC) {
+    return X_STATUS_USER_APC;
   }
 
   auto timeout_ms =

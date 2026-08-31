@@ -9,6 +9,8 @@
 
 #include "xenia/base/clock.h"
 
+#include "xenia/base/threading.h"
+
 #include <mutex>
 
 #include "xenia/base/assert.h"
@@ -66,6 +68,7 @@ static tick_mutex_type tick_mutex_;
 static void RecomputeGuestSystemTimeRatio() {
   std::pair<uint64_t, uint64_t> frac(uint64_t(10000000), guest_tick_frequency_);
   reduce_fraction(frac);
+  threading::SuspendDeferralScope no_suspend;
   std::lock_guard<tick_mutex_type> lock(tick_mutex_);
   guest_system_time_ratio_ = frac;
 }
@@ -86,6 +89,7 @@ void RecomputeGuestTickScalar() {
   // Keep this a rational calculation and reduce the fraction
   reduce_fraction(frac);
 
+  threading::SuspendDeferralScope no_suspend;
   std::lock_guard<tick_mutex_type> lock(tick_mutex_);
   guest_tick_ratio_ = frac;
 }
@@ -100,6 +104,7 @@ uint64_t UpdateGuestClock() {
     return host_tick_count * guest_tick_ratio_.first / guest_tick_ratio_.second;
   }
 
+  threading::SuspendDeferralScope no_suspend;
   std::unique_lock<tick_mutex_type> lock(tick_mutex_, std::defer_lock);
   if (lock.try_lock()) {
     // Translate host tick count to guest tick count.
@@ -158,6 +163,7 @@ void Clock::set_guest_time_scalar(double scalar) {
 }
 
 std::pair<uint64_t, uint64_t> Clock::guest_tick_ratio() {
+  threading::SuspendDeferralScope no_suspend;
   std::lock_guard<tick_mutex_type> lock(tick_mutex_);
   return guest_tick_ratio_;
 }
@@ -199,6 +205,12 @@ uint32_t Clock::QueryGuestUptimeMillis() {
   return static_cast<uint32_t>(
       std::min<uint64_t>(QueryGuestSystemTimeOffset() / 10000,
                          std::numeric_limits<uint32_t>::max()));
+}
+
+void Clock::SetGuestTickCount(uint64_t ticks) {
+  std::lock_guard<tick_mutex_type> lock(tick_mutex_);
+  last_host_tick_count_ = Clock::QueryHostTickCount();
+  last_guest_tick_count_ = ticks;
 }
 
 void Clock::SetGuestSystemTime(uint64_t system_time) {

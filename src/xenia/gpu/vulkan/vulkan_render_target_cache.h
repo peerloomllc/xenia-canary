@@ -114,6 +114,16 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   VkBuffer edram_buffer() const { return edram_buffer_; }
 
+  // Save states. PrepareEdramSnapshotRead dumps the host render targets into
+  // edram_buffer_ (host render target path) and readies the buffer for a
+  // transfer read; returns its size in bytes, 0 on failure. Submission must
+  // be open. RestoreEdramSnapshot uploads a snapshot of that size: into
+  // edram_buffer_ on the interlock path, or into a render target covering
+  // all of EDRAM that then owns every tile (host render targets, unscaled
+  // only, as the trace viewer does).
+  uint32_t PrepareEdramSnapshotRead();
+  bool RestoreEdramSnapshot(const void* data, size_t size);
+
   // Performs the resolve to a shared memory area according to the current
   // register values, and also clears the render targets if needed. Must be in a
   // frame for calling. copy_dest_info_out, if not null, receives the
@@ -292,6 +302,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   VkDeviceMemory edram_buffer_memory_ = VK_NULL_HANDLE;
   VkBuffer edram_buffer_ = VK_NULL_HANDLE;
+  // Host-visible staging for RestoreEdramSnapshot, kept for reuse.
+  VkBuffer edram_snapshot_upload_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory edram_snapshot_upload_buffer_memory_ = VK_NULL_HANDLE;
+  VkDeviceSize edram_snapshot_upload_buffer_size_ = 0;
   EdramBufferUsage edram_buffer_usage_;
   EdramBufferModificationStatus edram_buffer_modification_status_ =
       EdramBufferModificationStatus::kUnmodified;

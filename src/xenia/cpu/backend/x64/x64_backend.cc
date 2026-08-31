@@ -568,13 +568,17 @@ uint64_t X64Backend::CalculateNextHostInstruction(ThreadDebugInfo* thread_info,
 }
 
 void X64Backend::InstallBreakpoint(Breakpoint* breakpoint) {
-  breakpoint->ForEachHostAddress([breakpoint](uint64_t host_address) {
+  size_t installed = 0;
+  breakpoint->ForEachHostAddress([breakpoint, &installed](uint64_t host_address) {
+    ++installed;
     auto ptr = reinterpret_cast<void*>(host_address);
     auto original_bytes = xe::load_and_swap<uint16_t>(ptr);
     assert_true(original_bytes != 0x0F0B);
     xe::store_and_swap<uint16_t>(ptr, 0x0F0B);
     breakpoint->backend_data().emplace_back(host_address, original_bytes);
   });
+  XELOGI("InstallBreakpoint: guest {:08X} -> {} host address(es)",
+         breakpoint->guest_address(), installed);
 }
 
 void X64Backend::InstallBreakpoint(Breakpoint* breakpoint, Function* fn) {

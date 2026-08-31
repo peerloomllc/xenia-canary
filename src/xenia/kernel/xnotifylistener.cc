@@ -92,9 +92,12 @@ bool XNotifyListener::DequeueNotification(XNotificationID id,
 bool XNotifyListener::Save(ByteStream* stream) {
   SaveObject(stream);
 
-  stream->Write(mask_);
-  stream->Write(max_version_);
-  stream->Write(notifications_.size());
+  // Must mirror Restore(): u64 mask, u32 is_system, u32 max_version, then
+  // a size_t count.
+  stream->Write<uint64_t>(mask_);
+  stream->Write<uint32_t>(uint32_t(is_system_));
+  stream->Write<uint32_t>(max_version_);
+  stream->Write<size_t>(notifications_.size());
   for (auto pair : notifications_) {
     stream->Write<uint32_t>(pair.first);
     stream->Write<uint32_t>(pair.second);

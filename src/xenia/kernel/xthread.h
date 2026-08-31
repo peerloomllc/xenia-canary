@@ -490,7 +490,26 @@ class XThread : public XObject, public cpu::Thread {
   // Performs self-suspension: increments suspend_count and blocks until
   // another thread calls Resume() and suspend_count reaches 0.
   // Returns the previous suspend_count value.
-  uint32_t SelfSuspend();
+  // already_counted: a restore re-issued the NtSuspendThread the thread was
+  // parked in when it was saved; the guest suspend count in the restored
+  // memory already includes it.
+  uint32_t SelfSuspend(bool already_counted = false);
+  // Save states (format 9): the thread was saved parked in its own
+  // NtSuspendThread; the call is re-issued on restore.
+  void set_saved_in_self_suspend(bool value) { saved_in_self_suspend_ = value; }
+  bool restored_self_suspend_pending() const {
+    return restored_self_suspend_pending_;
+  }
+  bool TakeRestoredSelfSuspend() {
+    bool pending = restored_self_suspend_pending_;
+    restored_self_suspend_pending_ = false;
+    return pending;
+  }
+  // Title termination: a thread waiting in SelfSuspend must leave the wait
+  // before it is terminated (killing it inside pthread_cond_wait leaves the
+  // suspend mutex taken and corrupts the thread object).
+  bool in_self_suspend() const { return in_self_suspend_; }
+  void AbortSelfSuspend();
 #endif
 
   xe::threading::Thread* thread() { return thread_.get(); }
@@ -531,6 +550,10 @@ class XThread : public XObject, public cpu::Thread {
   bool guest_thread_ = false;
   bool main_thread_ = false;  // Entry-point thread
   bool running_ = false;
+  bool saved_in_self_suspend_ = false;
+  bool restored_self_suspend_pending_ = false;
+  std::atomic<bool> in_self_suspend_{false};
+  bool self_suspend_abort_ = false;
 
   int32_t priority_ = 0;       // current effective priority (may be decayed)
   int32_t base_priority_ = 0;  // priority floor — decay never goes below this

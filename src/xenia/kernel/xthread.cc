@@ -957,14 +957,31 @@ X_STATUS XThread::Suspend(uint32_t* out_suspend_count) {
 }
 
 #if !XE_PLATFORM_WIN32
-uint32_t XThread::SelfSuspend() {
+uint32_t XThread::SelfSuspend(bool already_counted) {
   auto guest_thread = guest_object<X_KTHREAD>();
   std::unique_lock<std::mutex> lock(suspend_mutex_);
   uint32_t previous = guest_thread->suspend_count;
-  guest_thread->suspend_count++;
-  suspend_cv_.wait(
-      lock, [guest_thread]() { return guest_thread->suspend_count == 0; });
+  if (already_counted) {
+    // Re-issued by a restore: the count was taken before the save.
+    previous = previous ? previous - 1 : 0;
+    XELOGI("XThread {:08X}: parked again in NtSuspendThread after a restore "
+           "(guest suspend count {})",
+           handle(), uint32_t(guest_thread->suspend_count));
+  } else {
+    guest_thread->suspend_count++;
+  }
+  in_self_suspend_ = true;
+  suspend_cv_.wait(lock, [this, guest_thread]() {
+    return guest_thread->suspend_count == 0 || self_suspend_abort_;
+  });
+  in_self_suspend_ = false;
   return previous;
+}
+
+void XThread::AbortSelfSuspend() {
+  std::lock_guard<std::mutex> lock(suspend_mutex_);
+  self_suspend_abort_ = true;
+  suspend_cv_.notify_all();
 }
 #endif  // !XE_PLATFORM_WIN32
 
@@ -1040,6 +1057,11 @@ struct ThreadSavedState {
     uint8_t vscr_sat;
     uint32_t pc;
   } context;
+
+  // Scheduling state; a restored thread otherwise runs at the defaults.
+  int32_t priority;
+  int32_t base_priority;
+  uint8_t active_cpu;
 };
 
 bool XThread::Save(ByteStream* stream) {
@@ -1048,11 +1070,29 @@ bool XThread::Save(ByteStream* stream) {
     return false;
   }
 
-  XELOGD("XThread {:08X} serializing...", handle());
+  XELOGI("XThread {:08X} serializing...", handle());
 
   uint32_t pc = 0;
   if (running_) {
-    pc = emulator()->processor()->StepToGuestSafePoint(thread_id_);
+    bool parked = false;
+    std::pair<uint32_t, int32_t> fixup = {0, 0};
+    pc = emulator()->processor()->StepToGuestSafePoint(
+        thread_id_, false, suspend_count(), &parked,
+        [this]() { return in_self_suspend(); }, &fixup);
+    if (pc && fixup.first) {
+      emulator()->AddSaveMemoryFixup(fixup.first, fixup.second);
+    }
+    if (!pc && in_self_suspend()) {
+      // Caught between calling NtSuspendThread on itself and parking: the
+      // step to the return address can never complete. It is parked now,
+      // so save it at the call like any self-suspended thread.
+      XELOGI("XThread {:08X}: parked in its own NtSuspendThread during the "
+             "step; saving it at the call",
+             handle());
+      pc = emulator()->processor()->StepToGuestSafePoint(
+          thread_id_, false, std::max<uint32_t>(suspend_count(), 1), &parked);
+    }
+    saved_in_self_suspend_ = parked;
     if (!pc) {
       XELOGE("XThread {:08X} failed to save: could not step to a safe point!",
              handle());
@@ -1066,7 +1106,7 @@ bool XThread::Save(ByteStream* stream) {
   }
 
   stream->Write(kThreadSaveSignature);
-  stream->Write(thread_name_);
+  stream->Write(std::string_view(thread_name_));
 
   ThreadSavedState state;
   state.thread_id = thread_id_;
@@ -1080,6 +1120,9 @@ bool XThread::Save(ByteStream* stream) {
   state.stack_limit = stack_limit_;
   state.stack_alloc_base = stack_alloc_base_;
   state.stack_alloc_size = stack_alloc_size_;
+  state.priority = priority_;
+  state.base_priority = base_priority_;
+  state.active_cpu = pcr_address_ ? active_cpu() : 0;
 
   if (running_) {
     // Context information
@@ -1106,6 +1149,36 @@ bool XThread::Save(ByteStream* stream) {
   }
 
   stream->Write(&state, sizeof(ThreadSavedState));
+
+  // Format 5 trailer: how the thread stands, and its creation parameters. A
+  // thread the guest created suspended and has not started yet (running_ is
+  // only set on its first instruction) is not the same as one that exited,
+  // and needs the parameters to be started later by the guest's resume.
+  uint8_t life = 0;  // 0 running, 1 never started, 2 exited
+  if (!running_) {
+    auto kthread = guest_object<X_KTHREAD>();
+    bool exited = !thread_ || (kthread && kthread->terminated);
+    life = exited ? 2 : 1;
+  }
+  stream->Write<uint8_t>(life);
+  stream->Write(&creation_params_, sizeof(creation_params_));
+  // Format 9: parked in its own NtSuspendThread (re-issued on restore).
+  stream->Write<uint8_t>(saved_in_self_suspend_ ? 1 : 0);
+  if (saved_in_self_suspend_) {
+    XELOGI("XThread {:08X}: saved parked in NtSuspendThread (guest suspend "
+           "count {})",
+           handle(), suspend_count());
+  }
+  saved_in_self_suspend_ = false;
+  if (life) {
+    auto kthread = guest_object<X_KTHREAD>();
+    XELOGI(
+        "XThread {:08X} saved as {} (host thread {}, terminated {}, guest "
+        "suspend count {})",
+        handle(), life == 1 ? "created but never started" : "exited",
+        thread_ ? "yes" : "no", kthread ? kthread->terminated : 0xFF,
+        kthread ? kthread->suspend_count : 0xFF);
+  }
   return true;
 }
 
@@ -1131,6 +1204,10 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state,
 
   ThreadSavedState state;
   stream->Read(&state, sizeof(ThreadSavedState));
+  XELOGI("XThread::Restore handle={:08X} id={} '{}' running={} pc={:08X} "
+         "stack={:08X}",
+         thread->handle(), state.thread_id, thread->thread_name_,
+         state.is_running, state.context.pc, state.stack_base);
   thread->thread_id_ = state.thread_id;
   thread->main_thread_ = state.is_main_thread;
   thread->running_ = state.is_running;
@@ -1142,6 +1219,27 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state,
   thread->stack_limit_ = state.stack_limit;
   thread->stack_alloc_base_ = state.stack_alloc_base;
   thread->stack_alloc_size_ = state.stack_alloc_size;
+  thread->priority_ = state.priority;
+  thread->base_priority_ = state.base_priority;
+
+  uint8_t life = state.is_running ? 0 : 2;
+  if (kernel_state->emulator()->save_state_version() >= 5) {
+    life = stream->Read<uint8_t>();
+    stream->Read(&thread->creation_params_, sizeof(thread->creation_params_));
+  }
+  if (kernel_state->emulator()->save_state_version() >= 9) {
+    thread->restored_self_suspend_pending_ = stream->Read<uint8_t>() != 0;
+  }
+
+  // The saved name already carries the " (handle)" suffix set_name adds;
+  // strip it so a name does not grow by one suffix per restore.
+  {
+    auto& n = thread->thread_name_;
+    size_t p = n.rfind(" (");
+    if (p != std::string::npos && n.size() == p + 12 && n.back() == ')') {
+      n.resize(p);
+    }
+  }
 
   // Register now that we know our thread ID.
   kernel_state->RegisterThread(thread);
@@ -1172,6 +1270,15 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state,
     context->xer_so = state.context.xer_so;
     context->vscr_sat = state.context.vscr_sat;
 
+    // A user APC queued just before the save (an async read's completion,
+    // for instance) is in the restored guest list; the host-side alert that
+    // went with it is gone. The wait the thread re-enters delivers it.
+    if (auto kthread = thread->guest_object<X_KTHREAD>()) {
+      if (!kthread->apc_lists[1].empty(kernel_state->memory())) {
+        XELOGI("XThread {:08X}: user APC pending at restore", thread->handle());
+      }
+    }
+
     // Always retain when starting - the thread owns itself until exited.
     thread->RetainHandle();
 
@@ -1182,14 +1289,23 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state,
       // Set thread ID override. This is used by logging.
       xe::threading::set_current_thread_id(thread->handle());
 
-      // Set name immediately, if we have one.
-      thread->thread_->set_name(thread->name());
+      // Set name immediately, if we have one (XThread::set_name truncates to
+      // what pthread_setname_np accepts; the raw call silently fails).
+      thread->set_name(thread->thread_name_);
 
       // Profiler needs to know about the thread.
       xe::Profiler::ThreadEnter(thread->name().c_str());
 
       current_xthread_tls_ = thread;
       current_thread_ = thread;
+
+      // Scheduling state as it was saved: host priority and CPU affinity.
+      if (!cvars::ignore_thread_priorities) {
+        thread->thread_->set_priority(GuestPriorityToHost(thread->priority_));
+      }
+      if (thread->pcr_address_ && state.active_cpu < 6) {
+        thread->SetActiveCpu(state.active_cpu);
+      }
 
       // Acquire any mutants
       for (auto mutant : thread->pending_mutant_acquires_) {
@@ -1218,6 +1334,54 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state,
     // Notify processor we were recreated.
     thread->emulator()->processor()->OnThreadCreated(
         thread->handle(), thread->thread_state(), thread);
+  } else if (life == 1) {
+    // Created suspended by the guest, never started. Recreate it the way
+    // Create() does, suspended; the guest's NtResumeThread starts it (its
+    // suspend count lives in the restored X_KTHREAD). RestoreFromFile does
+    // not resume it: running_ stays false until it runs.
+    thread->RetainHandle();
+
+    xe::threading::Thread::CreationParameters params;
+    params.create_suspended = true;
+    params.stack_size = 16_MiB;
+    thread->thread_ = xe::threading::Thread::Create(params, [thread, state]() {
+      xe::threading::set_current_thread_id(thread->handle());
+      thread->set_name(thread->thread_name_);
+      xe::Profiler::ThreadEnter(thread->name().c_str());
+
+      current_xthread_tls_ = thread;
+      current_thread_ = thread;
+      cpu::ThreadState::Bind(thread->thread_state());
+      if (!cvars::ignore_thread_priorities) {
+        thread->thread_->set_priority(GuestPriorityToHost(thread->priority_));
+      }
+      if (thread->pcr_address_ && state.active_cpu < 6) {
+        thread->SetActiveCpu(state.active_cpu);
+      }
+
+      thread->running_ = true;
+      thread->Execute();
+      thread->running_ = false;
+      current_thread_ = nullptr;
+      current_xthread_tls_ = nullptr;
+
+      xe::Profiler::ThreadExit();
+      thread->ReleaseHandle();
+    });
+    assert_not_null(thread->thread_);
+    thread->emulator()->processor()->OnThreadCreated(
+        thread->handle(), thread->thread_state(), thread);
+    XELOGI(
+        "XThread {:08X} restored suspended and never started (entry {:08X}, "
+        "guest suspend count {}); the guest's resume starts it",
+        thread->handle(), thread->creation_params_.start_address,
+        thread->guest_object<X_KTHREAD>()->suspend_count);
+  } else if (!state.is_running &&
+             kernel_state->emulator()->save_state_version() < 5) {
+    XELOGW(
+        "XThread {:08X} was not running at the save; a format-{} file cannot "
+        "say whether it had started, so it stays dead",
+        thread->handle(), kernel_state->emulator()->save_state_version());
   }
 
   return object_ref<XThread>(thread);

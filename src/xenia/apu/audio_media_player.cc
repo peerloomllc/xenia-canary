@@ -432,6 +432,139 @@ std::span<uint8_t> AudioMediaPlayer::LoadSongToMemory() {
   return buffer;
 }
 
+namespace {
+void WriteU16String(ByteStream* stream, const std::u16string& value) {
+  stream->Write<uint32_t>(uint32_t(value.size()));
+  if (!value.empty()) {
+    stream->Write(value.data(), value.size() * sizeof(char16_t));
+  }
+}
+std::u16string ReadU16String(ByteStream* stream) {
+  uint32_t length = stream->Read<uint32_t>();
+  std::u16string value(length, u'\0');
+  if (length) {
+    stream->Read(value.data(), size_t(length) * sizeof(char16_t));
+  }
+  return value;
+}
+}  // namespace
+
+bool AudioMediaPlayer::Save(ByteStream* stream) {
+  auto global_lock = global_critical_region_.Acquire();
+  stream->Write<uint32_t>(uint32_t(state_));
+  stream->Write<uint32_t>(xmp_override_ ? 1 : 0);
+  stream->Write<uint32_t>(uint32_t(playback_mode_));
+  stream->Write<uint32_t>(uint32_t(repeat_mode_));
+  stream->Write<uint32_t>(uint32_t(playback_flags_));
+  stream->Write<uint32_t>(uint32_t(playback_controller_));
+  stream->Write<uint32_t>(uint32_t(xmp_client_));
+  stream->Write<float>(volume_.load());
+  stream->Write<uint32_t>(dash_init_state);
+  stream->Write<uint32_t>(callback_);
+  stream->Write<uint32_t>(callback_context_);
+  stream->Write<uint32_t>(sample_buffer_ptr_);
+  stream->Write<uint32_t>(is_title_rendering_enabled_ ? 1 : 0);
+  stream->Write<uint32_t>(active_playlist_ ? active_playlist_->handle : 0);
+  stream->Write<uint32_t>(active_song_ ? active_song_->handle : 0);
+  stream->Write<uint32_t>(uint32_t(playlists_.size()));
+  for (const auto& [handle, playlist] : playlists_) {
+    stream->Write<uint32_t>(handle);
+    stream->Write<uint32_t>(playlist->handle);
+    WriteU16String(stream, playlist->name);
+    stream->Write<uint32_t>(playlist->flags);
+    stream->Write<uint32_t>(uint32_t(playlist->songs.size()));
+    for (const auto& song : playlist->songs) {
+      stream->Write<uint32_t>(song->handle);
+      WriteU16String(stream, song->file_path);
+      WriteU16String(stream, song->name);
+      WriteU16String(stream, song->artist);
+      WriteU16String(stream, song->album);
+      WriteU16String(stream, song->album_artist);
+      WriteU16String(stream, song->genre);
+      stream->Write<uint32_t>(song->track_number);
+      stream->Write<uint32_t>(song->duration_ms);
+      stream->Write<uint32_t>(uint32_t(song->format));
+    }
+  }
+  return true;
+}
+
+bool AudioMediaPlayer::Restore(ByteStream* stream) {
+  // Whatever is playing now belongs to the pre-restore game.
+  Stop(false, true);
+  auto global_lock = global_critical_region_.Acquire();
+  auto saved_state = XmpApp::State(stream->Read<uint32_t>());
+  xmp_override_ = stream->Read<uint32_t>() != 0;
+  playback_mode_ = XmpApp::PlaybackMode(stream->Read<uint32_t>());
+  repeat_mode_ = XmpApp::RepeatMode(stream->Read<uint32_t>());
+  playback_flags_ = XmpApp::PlaybackFlags(stream->Read<uint32_t>());
+  playback_controller_ = PlaybackController(stream->Read<uint32_t>());
+  xmp_client_ = XMP_CLIENT(stream->Read<uint32_t>());
+  volume_ = stream->Read<float>();
+  dash_init_state = stream->Read<uint32_t>();
+  callback_ = stream->Read<uint32_t>();
+  callback_context_ = stream->Read<uint32_t>();
+  sample_buffer_ptr_ = stream->Read<uint32_t>();
+  is_title_rendering_enabled_ = stream->Read<uint32_t>() != 0;
+  uint32_t active_playlist_handle = stream->Read<uint32_t>();
+  uint32_t active_song_handle = stream->Read<uint32_t>();
+  playlists_.clear();
+  active_playlist_ = nullptr;
+  active_song_ = nullptr;
+  uint32_t playlist_count = stream->Read<uint32_t>();
+  for (uint32_t i = 0; i < playlist_count; ++i) {
+    uint32_t map_handle = stream->Read<uint32_t>();
+    auto playlist = std::make_unique<XmpApp::Playlist>();
+    playlist->handle = stream->Read<uint32_t>();
+    playlist->name = ReadU16String(stream);
+    playlist->flags = stream->Read<uint32_t>();
+    uint32_t song_count = stream->Read<uint32_t>();
+    for (uint32_t j = 0; j < song_count; ++j) {
+      auto song = std::make_unique<XmpApp::Song>();
+      song->handle = stream->Read<uint32_t>();
+      song->file_path = ReadU16String(stream);
+      song->name = ReadU16String(stream);
+      song->artist = ReadU16String(stream);
+      song->album = ReadU16String(stream);
+      song->album_artist = ReadU16String(stream);
+      song->genre = ReadU16String(stream);
+      song->track_number = stream->Read<uint32_t>();
+      song->duration_ms = stream->Read<uint32_t>();
+      song->format = XmpApp::SongFormat(stream->Read<uint32_t>());
+      playlist->songs.push_back(std::move(song));
+    }
+    // Straight into the map: AddPlaylist would reshuffle a shuffled list.
+    playlists_.insert({map_handle, std::move(playlist)});
+  }
+  state_ = XmpApp::State::kIdle;
+  XELOGI("Media player: {} playlist(s) restored", playlists_.size());
+  if (saved_state != XmpApp::State::kIdle) {
+    // Start the saved song again (from its beginning: the position within
+    // it is not part of the state) and pause it if it was paused.
+    global_lock.unlock();
+    if (!playlists_.count(active_playlist_handle) ||
+        Play(active_playlist_handle, active_song_handle, true) !=
+            X_STATUS_SUCCESS) {
+      XELOGW(
+          "Media player: saved {} playlist {:08X} song {:08X}, which cannot "
+          "be started again; restored idle",
+          saved_state == XmpApp::State::kPlaying ? "playing" : "paused",
+          active_playlist_handle, active_song_handle);
+      return true;
+    }
+    if (saved_state == XmpApp::State::kPaused) {
+      for (int i = 0; i < 100 && !IsPlaying(); ++i) {
+        xe::threading::Sleep(std::chrono::milliseconds(10));
+      }
+      Pause();
+    }
+    XELOGI("Media player: playlist {:08X} song {:08X} started again ({})",
+           active_playlist_handle, active_song_handle,
+           saved_state == XmpApp::State::kPaused ? "paused" : "playing");
+  }
+  return true;
+}
+
 void AudioMediaPlayer::AddPlaylist(uint32_t handle,
                                    std::unique_ptr<XmpApp::Playlist> playlist) {
   if (playlists_.count(handle) != 0) {

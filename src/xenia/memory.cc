@@ -757,6 +757,12 @@ bool Memory::Save(ByteStream* stream) {
   heaps_.v80000000.Save(stream);
   heaps_.v90000000.Save(stream);
   heaps_.physical.Save(stream);
+  // The three views of physical memory keep their own page tables (the
+  // guest's allocations and protections in each view); their contents are
+  // the physical heap's.
+  heaps_.vA0000000.SavePageTable(stream);
+  heaps_.vC0000000.SavePageTable(stream);
+  heaps_.vE0000000.SavePageTable(stream);
 
   return true;
 }
@@ -768,6 +774,15 @@ bool Memory::Restore(ByteStream* stream) {
   heaps_.v80000000.Restore(stream);
   heaps_.v90000000.Restore(stream);
   heaps_.physical.Restore(stream);
+  // Views of physical memory: forget the GPU's write watches first (their
+  // page protections are about to be rewritten from the page tables), then
+  // the page tables. The GPU side invalidates all of its caches after a
+  // restore, and re-arms watches as it re-requests ranges.
+  for (PhysicalHeap* heap :
+       {&heaps_.vA0000000, &heaps_.vC0000000, &heaps_.vE0000000}) {
+    heap->ResetAccessCallbacks();
+    heap->RestorePageTable(stream);
+  }
 
   return true;
 }
@@ -894,20 +909,63 @@ bool BaseHeap::Save(ByteStream* stream) {
       continue;
     }
 
-    // TODO(DrChat): write compressed with snappy.
     if (page.state & kMemoryAllocationCommit) {
       void* addr = TranslateRelative(i * page_size_);
-
-      memory::PageAccess old_access;
-      memory::Protect(addr, page_size_, memory::PageAccess::kReadWrite,
-                      &old_access);
-
-      stream->Write(addr, page_size_);
-
-      memory::Protect(addr, page_size_, old_access, nullptr);
+      if (page.current_protect & kMemoryProtectRead) {
+        // Readable on the host as well: write watches only take write
+        // access away.
+        stream->Write(addr, page_size_);
+      } else {
+        // Open a no-access page for the copy. Protect(..., &old_access)
+        // parses /proc/self/maps on Linux, which for tens of thousands of
+        // pages was most of the save's paused time; the page table already
+        // says what to put back.
+        memory::Protect(addr, page_size_, memory::PageAccess::kReadOnly,
+                        nullptr);
+        stream->Write(addr, page_size_);
+        memory::Protect(addr, page_size_, memory::PageAccess::kNoAccess,
+                        nullptr);
+      }
     }
   }
 
+  return true;
+}
+
+bool BaseHeap::SavePageTable(ByteStream* stream) {
+  stream->Write<uint32_t>(uint32_t(page_table_.size()));
+  for (auto& page : page_table_) {
+    stream->Write(page.qword);
+  }
+  return true;
+}
+
+bool BaseHeap::RestorePageTable(ByteStream* stream) {
+  uint32_t count = stream->Read<uint32_t>();
+  if (count != page_table_.size()) {
+    XELOGE("RestorePageTable: heap {:08X} has {} pages, stream has {}",
+           heap_base_, page_table_.size(), count);
+    return false;
+  }
+  for (size_t i = 0; i < page_table_.size(); i++) {
+    auto& page = page_table_[i];
+    page.qword = stream->Read<uint64_t>();
+    if (!page.state) {
+      continue;
+    }
+    memory::PageAccess page_access = memory::PageAccess::kNoAccess;
+    if ((page.current_protect & kMemoryProtectRead) &&
+        (page.current_protect & kMemoryProtectWrite)) {
+      page_access = memory::PageAccess::kReadWrite;
+    } else if (page.current_protect & kMemoryProtectRead) {
+      page_access = memory::PageAccess::kReadOnly;
+    }
+    if (page.state & kMemoryAllocationCommit) {
+      xe::memory::Protect(TranslateRelative(i * page_size_), page_size_,
+                          page_access, nullptr);
+    }
+  }
+  RebuildFreeBlocks();
   return true;
 }
 
@@ -2152,6 +2210,14 @@ XE_NOINLINE void PhysicalHeap::EnableAccessCallbacksInner(
         protect_access);
   }
 }
+void PhysicalHeap::ResetAccessCallbacks() {
+  auto global_lock = global_critical_region_.Acquire();
+  for (auto& block : system_page_flags_) {
+    block.notify_on_invalidation = 0;
+    block.notify_on_read = 0;
+  }
+}
+
 bool PhysicalHeap::TriggerCallbacks(
     global_unique_lock_type global_lock_locked_once, uint32_t virtual_address,
     uint32_t length, bool is_write, bool unwatch_exact_range, bool unprotect,

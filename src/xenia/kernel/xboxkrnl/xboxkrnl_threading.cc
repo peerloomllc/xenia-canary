@@ -474,7 +474,7 @@ dword_result_t NtSuspendThread_entry(dword_t handle,
 
         if (is_self_suspend) {
           XELOGD("Thread {:X} self-suspending", thread->handle());
-          suspend_count = thread->SelfSuspend();
+          suspend_count = thread->SelfSuspend(thread->TakeRestoredSelfSuspend());
           result = X_STATUS_SUCCESS;
           XELOGD("Thread {:X} resumed", thread->handle());
         } else {
@@ -1508,6 +1508,10 @@ uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock,
     xe::threading::MaybeYield();
   }
 
+  // Holding a guest spinlock: a Thread::Suspend must wait for the release,
+  // or every other thread that needs the lock spins for as long as the
+  // emulator is paused (and a save state would record it as taken).
+  xe::threading::BeginSuspendDeferral();
   return old_irql;
 }
 
@@ -1523,6 +1527,7 @@ void xeKeKfReleaseSpinLock(PPCContext* ctx, X_KSPINLOCK* lock,
   assert_true(lock->prcb_of_owner == static_cast<uint32_t>(ctx->r[13]));
   // Unlock with release semantics to ensure all prior writes are visible.
   xe::atomic_store_release(0u, &lock->prcb_of_owner.value);
+  xe::threading::EndSuspendDeferral();
 
   if (change_irql) {
     // Unlock.
@@ -1561,6 +1566,7 @@ dword_result_t KeTryToAcquireSpinLockAtRaisedIrql_entry(
           lock_ptr.guest_address())) {
     return 0;
   }
+  xe::threading::BeginSuspendDeferral();
   return 1;
 }
 DECLARE_XBOXKRNL_EXPORT4(KeTryToAcquireSpinLockAtRaisedIrql, kThreading,

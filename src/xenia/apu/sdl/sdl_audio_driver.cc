@@ -303,6 +303,10 @@ void SDLAudioDriver::SDLCallback(void* userdata, Uint8* stream, int len) {
   if (driver->ring_.empty()) {
     available = 0;
   }
+  callback_count_.fetch_add(1, std::memory_order_relaxed);
+  if (!available) {
+    starved_callback_count_.fetch_add(1, std::memory_order_relaxed);
+  }
   if (available) {
     size_t first = std::min(available, driver->ring_.size() - driver->ring_read_);
     std::memcpy(out, driver->ring_.data() + driver->ring_read_,

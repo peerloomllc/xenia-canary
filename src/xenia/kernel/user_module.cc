@@ -396,10 +396,20 @@ object_ref<UserModule> UserModule::Restore(KernelState* kernel_state,
 
   auto result = module->LoadFromFile(path);
   if (XFAILED(result)) {
-    XELOGD("UserModule::Restore LoadFromFile({}) FAILED - code {:08X}", path,
+    XELOGE("UserModule::Restore LoadFromFile({}) FAILED - code {:08X}", path,
            result);
     return nullptr;
   }
+  // LoadFromFile stops before the import table so a patch can be applied;
+  // LoadContinue declares the import stubs the restored threads return to.
+  result = module->LoadContinue();
+  if (XFAILED(result)) {
+    XELOGE("UserModule::Restore LoadContinue({}) FAILED - code {:08X}", path,
+           result);
+    return nullptr;
+  }
+  XELOGI("UserModule::Restore loaded {} (handle {:08X}, executable={})", path,
+         module->handle(), module->is_executable());
 
   if (!kernel_state->RegisterUserModule(retain_object(module))) {
     // Already loaded?

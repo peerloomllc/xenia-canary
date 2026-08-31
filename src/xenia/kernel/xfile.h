@@ -168,6 +168,9 @@ class XFile : public XObject {
   X_STATUS Rename(const std::filesystem::path file_path);
 
   void RegisterIOCompletionPort(uint32_t key, object_ref<XIOCompletion> port);
+  // After every object is restored: turn the saved (key, port handle) pairs
+  // back into port references.
+  void RelinkIOCompletionPorts();
   void RemoveIOCompletionPort(uint32_t key);
 
   bool Save(ByteStream* stream) override;
@@ -196,6 +199,12 @@ class XFile : public XObject {
   mutable std::mutex file_lock_;
   std::mutex completion_port_lock_;
   std::vector<std::pair<uint32_t, object_ref<XIOCompletion>>> completion_ports_;
+  std::vector<std::pair<uint32_t, uint32_t>> pending_completion_ports_;
+  // A file the restore could not reopen: what the save said, so the next
+  // save can carry it and nothing dereferences file_.
+  std::string unresolved_path_;
+  uint32_t unresolved_access_ = 0;
+  bool unresolved_is_directory_ = false;
 
   // TODO(benvanik): create flags, open state, etc.
 

@@ -35,6 +35,8 @@ class BitMap {
   size_t AcquireFromBack();
   // (threadsafe) Releases an entry by an index.
   void Release(size_t index);
+  // (threadsafe) Acquires a specific entry. Returns false if it was taken.
+  bool AcquireAt(size_t index);
 
   // Resize the bitmap. Size is the number of entries, must be a multiple of 64.
   void Resize(size_t new_size_bits);

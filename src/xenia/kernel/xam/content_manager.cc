@@ -472,6 +472,75 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name,
   return X_ERROR_SUCCESS;
 }
 
+bool ContentManager::Save(ByteStream* stream) {
+  auto global_lock = global_critical_region_.Acquire();
+  stream->Write<uint32_t>(uint32_t('XCNT'));
+  stream->Write<uint32_t>(content_device_id_);
+  stream->Write<uint32_t>(uint32_t(mounted_packages_.size()));
+  for (auto& [device_path, package] : mounted_packages_) {
+    stream->Write(std::string_view(device_path));
+    stream->Write(std::string_view(package->GetPackageHostPath().string()));
+    auto root = package->GetRootName();
+    stream->Write(std::string_view(root ? std::string(root->view()) : std::string()));
+    XELOGI("ContentManager::Save: {} <- {} ({})", device_path,
+           package->GetPackageHostPath().string(),
+           root ? std::string(root->view()) : std::string("no root name"));
+  }
+  return true;
+}
+
+bool ContentManager::Restore(ByteStream* stream) {
+  if (stream->Read<uint32_t>() != uint32_t('XCNT')) {
+    XELOGE("ContentManager::Restore: bad magic");
+    return false;
+  }
+  uint32_t saved_device_id = stream->Read<uint32_t>();
+  uint32_t count = stream->Read<uint32_t>();
+  for (uint32_t i = 0; i < count; ++i) {
+    std::string device_path = stream->Read<std::string>();
+    std::string host_path = stream->Read<std::string>();
+    std::string root_name = stream->Read<std::string>();
+    auto global_lock = global_critical_region_.Acquire();
+    if (mounted_packages_.count(device_path)) {
+      continue;  // still mounted
+    }
+    // GeneratePackageDevicePath hands out \Device\Content\{++id}\; set the
+    // counter so the package gets its saved device path back.
+    uint32_t id = 0;
+    const std::string prefix = "\\Device\\Content\\";
+    if (device_path.rfind(prefix, 0) == 0) {
+      id = uint32_t(std::strtoul(device_path.c_str() + prefix.size(), nullptr, 10));
+    }
+    if (id) {
+      content_device_id_ = id - 1;
+    }
+    std::error_code ec;
+    if (!std::filesystem::exists(host_path, ec)) {
+      XELOGE("ContentManager::Restore: {} for {} is missing on the host",
+             host_path, device_path);
+      continue;
+    }
+    auto package = OpenPackage(std::filesystem::path(host_path));
+    if (!package) {
+      XELOGE("ContentManager::Restore: could not open {}", host_path);
+      continue;
+    }
+    if (package->GetDevicePath() != device_path) {
+      XELOGW("ContentManager::Restore: {} mounted as {} instead of {}",
+             host_path, package->GetDevicePath(), device_path);
+    }
+    if (!MountPackage(root_name, std::move(package))) {
+      XELOGE("ContentManager::Restore: could not mount {} as {}", host_path,
+             device_path);
+      continue;
+    }
+    XELOGI("ContentManager::Restore: {} <- {} ({})", device_path, host_path,
+           root_name.empty() ? "no root name" : root_name);
+  }
+  content_device_id_ = std::max(content_device_id_, saved_device_id);
+  return true;
+}
+
 X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
   auto global_lock = global_critical_region_.Acquire();
 

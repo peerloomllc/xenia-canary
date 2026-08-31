@@ -9,6 +9,8 @@
 
 #include "xenia/cpu/thread_state.h"
 
+#include "xenia/base/exception_handler.h"
+
 #include <cstdlib>
 #include <cstring>
 
@@ -125,6 +127,10 @@ ThreadState::~ThreadState() {
 }
 
 void ThreadState::Bind(ThreadState* thread_state) {
+  ExceptionHandler::SetThreadExceptionPcSlot(
+      thread_state ? &thread_state->current_exception_pc_ : nullptr);
+  threading::SetThreadBlockingWaitSlot(
+      thread_state ? &thread_state->in_blocking_wait_ : nullptr);
   thread_state_ = thread_state;
 }
 

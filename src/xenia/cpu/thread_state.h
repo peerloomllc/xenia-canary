@@ -19,6 +19,8 @@
 namespace xe {
 namespace cpu {
 
+class Export;
+
 class Processor;
 
 class ThreadState {
@@ -37,6 +39,60 @@ class ThreadState {
   static ThreadState* Get();
   static uint32_t GetThreadID();
 
+  // The kernel export this thread is currently executing (set by the shim
+  // trampoline for the duration of the call), and the host return address
+  // into the JIT import stub that called it. Save states use this to find
+  // the guest thunk of a blocking wait without unwinding JIT frames, which
+  // has no unwind info on POSIX.
+  const Export* current_export() const { return current_export_; }
+  void* current_export_return_address() const {
+    return current_export_return_address_;
+  }
+  void set_current_export(const Export* export_entry, void* return_address) {
+    current_export_ = export_entry;
+    current_export_return_address_ = return_address;
+  }
+  // Host PC of the guest instruction whose access is being emulated by the
+  // MMIO handler, while that handler runs on this thread.
+  uint64_t current_exception_pc() const { return current_exception_pc_; }
+  // True while the thread is blocked inside a threading wait or sleep (see
+  // threading::SetThreadBlockingWaitSlot).
+  bool in_blocking_wait() const { return in_blocking_wait_; }
+  struct ExceptionScope {
+    ExceptionScope(ThreadState* ts, uint64_t pc)
+        : ts_(ts), previous_(ts ? ts->current_exception_pc_ : 0) {
+      if (ts_) {
+        ts_->current_exception_pc_ = pc;
+      }
+    }
+    ~ExceptionScope() {
+      if (ts_) {
+        ts_->current_exception_pc_ = previous_;
+      }
+    }
+    ThreadState* ts_;
+    uint64_t previous_;
+  };
+  struct ExportScope {
+    ExportScope(ThreadState* ts, const Export* export_entry,
+                void* return_address)
+        : ts_(ts),
+          previous_(ts ? ts->current_export_ : nullptr),
+          previous_return_(ts ? ts->current_export_return_address_ : nullptr) {
+      if (ts_) {
+        ts_->set_current_export(export_entry, return_address);
+      }
+    }
+    ~ExportScope() {
+      if (ts_) {
+        ts_->set_current_export(previous_, previous_return_);
+      }
+    }
+    ThreadState* ts_;
+    const Export* previous_;
+    void* previous_return_;
+  };
+
  private:
   Processor* processor_;
   Memory* memory_;
@@ -44,6 +100,11 @@ class ThreadState {
 
   uint32_t pcr_address_ = 0;
   uint32_t thread_id_ = 0;
+
+  const Export* current_export_ = nullptr;
+  void* current_export_return_address_ = nullptr;
+  uint64_t current_exception_pc_ = 0;
+  bool in_blocking_wait_ = false;
 
   // NOTE: must be 64b aligned for SSE ops.
   ppc::PPCContext* context_;

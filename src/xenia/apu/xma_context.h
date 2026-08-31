@@ -15,6 +15,7 @@
 #include <mutex>
 #include <queue>
 
+#include "xenia/base/byte_stream.h"
 #include "xenia/base/threading.h"
 #include "xenia/memory.h"
 #include "xenia/xbox.h"
@@ -172,6 +173,8 @@ static_assert_size(Xma2ExtraData, 34);
 
 class XmaContext {
  public:
+  // Packets handed to the codec; --stats_log_seconds.
+  inline static std::atomic<uint64_t> decoded_packet_count_{0};
   static constexpr uint32_t kBytesPerPacket = 2048;
   static constexpr uint32_t kBytesPerPacketHeader = 4;
   static constexpr uint32_t kBytesPerPacketData =
@@ -216,6 +219,15 @@ class XmaContext {
   virtual void Clear() {};
   virtual void Disable() {};
   virtual void Release() {};
+
+  // Decoder-side state that is not in the guest context (pending decoded
+  // subframes, loop counters, the last frame fed to the codec). Called with
+  // the worker parked between passes (XmaDecoder::Pause). The default
+  // writes nothing; readers skip a section they do not understand.
+  virtual void SaveState(ByteStream* stream) {}
+  virtual bool RestoreState(ByteStream* stream, uint32_t size) {
+    return size == 0;
+  }
 
   Memory* memory() const { return memory_; }
 

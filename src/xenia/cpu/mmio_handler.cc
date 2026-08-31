@@ -9,6 +9,8 @@
 
 #include "xenia/cpu/mmio_handler.h"
 
+#include "xenia/cpu/thread_state.h"
+
 #include <cstring>
 
 #include "xenia/base/assert.h"

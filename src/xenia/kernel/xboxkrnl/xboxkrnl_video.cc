@@ -325,6 +325,8 @@ DECLARE_XBOXKRNL_EXPORT1(VdEnableDisableClockGating, kVideo, kStub);
 
 void VdSetGraphicsInterruptCallback_entry(function_t callback,
                                           lpvoid_t user_data) {
+  XELOGI("VdSetGraphicsInterruptCallback: callback {:08X} user_data {:08X}",
+         uint32_t(callback.value()), user_data.guest_address());
   // callback takes 2 params
   // r3 = bool 0/1 - 0 is normal interrupt, 1 is some acquire/lock mumble
   // r4 = user_data (r4 of VdSetGraphicsInterruptCallback)

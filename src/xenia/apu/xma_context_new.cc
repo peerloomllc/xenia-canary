@@ -282,6 +282,107 @@ void XmaContextNew::Release() {
   std::memset(context_ptr, 0, sizeof(XMA_CONTEXT_DATA));  // Zero it.
 }
 
+// Section layout (version 1): u32 version, i32 codec sample rate (0 =
+// codec never opened), i32 channels, u8 remaining subframes, u8 loop output
+// limit, u8 loop start skip pending, raw_frame_, u32 last packet size and
+// its bytes. The last packet is re-sent to a fresh codec on restore so its
+// overlap buffer matches what it held at the save.
+void XmaContextNew::SaveState(ByteStream* stream) {
+  stream->Write<uint32_t>(1);
+  stream->Write<int32_t>(av_context_ ? av_context_->sample_rate : 0);
+  stream->Write<int32_t>(av_context_ ? av_context_->ch_layout.nb_channels
+                                     : 0);
+  stream->Write<uint8_t>(current_frame_remaining_subframes_);
+  stream->Write<uint8_t>(loop_frame_output_limit_);
+  stream->Write<uint8_t>(loop_start_skip_pending_ ? 1 : 0);
+  stream->Write(raw_frame_.data(), raw_frame_.size());
+  uint32_t packet_size = 0;
+  if (av_context_ && av_context_->sample_rate && av_packet_ &&
+      av_packet_->data == xma_frame_.data() && av_packet_->size > 0 &&
+      size_t(av_packet_->size) <= xma_frame_.size()) {
+    packet_size = uint32_t(av_packet_->size);
+  }
+  stream->Write<uint32_t>(packet_size);
+  if (packet_size) {
+    stream->Write(xma_frame_.data(), packet_size);
+  }
+}
+
+bool XmaContextNew::RestoreState(ByteStream* stream, uint32_t size) {
+  std::lock_guard<xe_mutex> lock(lock_);
+  if (size == 0) {
+    // A file without decoder state: start the codec over so the previous
+    // stream's overlap does not bleed into the restored one.
+    current_frame_remaining_subframes_ = 0;
+    loop_frame_output_limit_ = 0;
+    loop_start_skip_pending_ = false;
+    return ResetCodec(0, 0);
+  }
+  size_t end = stream->offset() + size;
+  uint32_t version = stream->Read<uint32_t>();
+  if (version != 1) {
+    XELOGE("XmaContext {}: unknown state version {}", id(), version);
+    stream->set_offset(end);
+    return false;
+  }
+  int32_t sample_rate = stream->Read<int32_t>();
+  int32_t channels = stream->Read<int32_t>();
+  current_frame_remaining_subframes_ = stream->Read<uint8_t>();
+  loop_frame_output_limit_ = stream->Read<uint8_t>();
+  loop_start_skip_pending_ = stream->Read<uint8_t>() != 0;
+  stream->Read(raw_frame_.data(), raw_frame_.size());
+  uint32_t packet_size = stream->Read<uint32_t>();
+  if (packet_size > xma_frame_.size() || stream->offset() + packet_size > end) {
+    XELOGE("XmaContext {}: bad packet size {} in state", id(), packet_size);
+    stream->set_offset(end);
+    return false;
+  }
+  xma_frame_.fill(0);
+  if (packet_size) {
+    stream->Read(xma_frame_.data(), packet_size);
+  }
+  stream->set_offset(end);
+
+  if (!ResetCodec(sample_rate, channels)) {
+    return false;
+  }
+  if (sample_rate && packet_size) {
+    // Prime the fresh codec with the frame decoded before the save; its
+    // output was already consumed, only the decoder's carry-over matters.
+    av_packet_->data = xma_frame_.data();
+    av_packet_->size = int(packet_size);
+    DecodePacket(av_context_, av_packet_, av_frame_);
+  }
+  XELOGI(
+      "XmaContext {}: state restored (rate {}, ch {}, {} subframes pending, "
+      "primed with {} bytes)",
+      id(), sample_rate, channels, current_frame_remaining_subframes_,
+      packet_size);
+  return true;
+}
+
+bool XmaContextNew::ResetCodec(int sample_rate, int channels) {
+  avcodec_free_context(&av_context_);
+  av_context_ = avcodec_alloc_context3(av_codec_);
+  if (!av_context_) {
+    XELOGE("XmaContext {}: Couldn't allocate context", id());
+    return false;
+  }
+  if (!sample_rate) {
+    av_context_->ch_layout = AVChannelLayout{};
+    av_context_->sample_rate = 0;
+    return true;
+  }
+  av_context_->sample_rate = sample_rate;
+  av_channel_layout_default(&av_context_->ch_layout, channels);
+  av_context_->flags2 |= AV_CODEC_FLAG2_SKIP_MANUAL;
+  if (avcodec_open2(av_context_, av_codec_, NULL) < 0) {
+    XELOGE("XmaContext {}: Failed to reopen FFmpeg context", id());
+    return false;
+  }
+  return true;
+}
+
 int XmaContextNew::GetSampleRate(int id) {
   return kIdToSampleRate[std::min(id, 3)];
 }
@@ -947,6 +1048,7 @@ void XmaContextNew::PreparePacket(const uint32_t frame_size,
 
 bool XmaContextNew::DecodePacket(AVCodecContext* av_context,
                                  const AVPacket* av_packet, AVFrame* av_frame) {
+  decoded_packet_count_.fetch_add(1, std::memory_order_relaxed);
   auto ret = avcodec_send_packet(av_context, av_packet);
   if (ret < 0) {
     char errbuf[AV_ERROR_MAX_STRING_SIZE];

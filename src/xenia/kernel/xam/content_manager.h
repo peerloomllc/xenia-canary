@@ -17,6 +17,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "xenia/base/byte_stream.h"
 #include "xenia/base/memory.h"
 #include "xenia/base/mutex.h"
 #include "xenia/base/string_key.h"
@@ -102,7 +103,18 @@ class ContentManager {
   bool IsContentOpen(const XCONTENT_DATA_INTERNAL& data) const;
   bool IsContentOpen(const std::string_view root_name) const;
 
+  // Save state: the mounted packages (device path, host path, root name),
+  // re-mounted on restore with the same device paths so restored file
+  // handles into \Device\Content\N\ resolve again.
+  bool Save(ByteStream* stream);
+  bool Restore(ByteStream* stream);
+
   void CloseOpenedFilesFromContent(const std::string_view root_name);
+
+  const std::filesystem::path& root_path() const { return root_path_; }
+  void set_root_path(const std::filesystem::path& root_path) {
+    root_path_ = root_path;
+  }
 
   uint64_t GetContentTotalSpace() const;
   uint64_t GetContentFreeSpace() const;

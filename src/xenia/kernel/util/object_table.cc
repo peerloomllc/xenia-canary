@@ -358,24 +358,23 @@ XObject* ObjectTable::LookupObject(X_HANDLE handle, bool already_locked) {
 
 void ObjectTable::GetObjectsByType(XObject::Type type,
                                    std::vector<object_ref<XObject>>* results) {
+  // One entry per object, as in GetAllObjects: an object with more than one
+  // handle (the main thread has one in each table) would otherwise be listed
+  // twice, and a save state then serialised and restored it twice.
   auto global_lock = global_critical_region_.Acquire();
-  for (uint32_t slot = 0; slot < host_table_capacity_; ++slot) {
-    auto& entry = host_table_[slot];
-    if (entry.object) {
-      if (entry.object->type() == type) {
-        entry.object->Retain();
-        results->push_back(object_ref<XObject>(entry.object));
-      }
+  auto add = [&](XObject* object) {
+    if (object && object->type() == type &&
+        std::find(results->begin(), results->end(), object) ==
+            results->end()) {
+      object->Retain();
+      results->push_back(object_ref<XObject>(object));
     }
+  };
+  for (uint32_t slot = 0; slot < host_table_capacity_; ++slot) {
+    add(host_table_[slot].object);
   }
   for (uint32_t slot = 0; slot < table_capacity_; ++slot) {
-    auto& entry = table_[slot];
-    if (entry.object) {
-      if (entry.object->type() == type) {
-        entry.object->Retain();
-        results->push_back(object_ref<XObject>(entry.object));
-      }
-    }
+    add(table_[slot].object);
   }
 }
 

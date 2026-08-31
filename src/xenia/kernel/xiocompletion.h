@@ -12,6 +12,7 @@
 
 #include <queue>
 
+#include "xenia/base/byte_stream.h"
 #include "xenia/base/threading.h"
 #include "xenia/kernel/xobject.h"
 #include "xenia/xbox.h"
@@ -38,7 +39,12 @@ class XIOCompletion : public XObject {
   // Returns true if the wait ended because a notification was received.
   bool WaitForNotification(uint64_t wait_ticks, IONotification* notify);
 
+  bool Save(ByteStream* stream) override;
+  static object_ref<XIOCompletion> Restore(KernelState* kernel_state,
+                                           ByteStream* stream);
+
  private:
+  XIOCompletion();
   static constexpr uint32_t kMaxNotifications = 1024;
 
   std::mutex notification_lock_;

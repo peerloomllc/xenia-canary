@@ -8,6 +8,7 @@
  */
 
 #include "xenia/kernel/xam/xam_state.h"
+#include "xenia/base/logging.h"
 #include "xenia/emulator.h"
 
 namespace xe {
@@ -155,6 +156,34 @@ void XamState::LoadSpaInfo(const SpaInfo* info) {
   spa_info_ = std::make_unique<SpaInfo>(*info);
   spa_info_->Load();
   user_tracker_->UpdateSpaInfo(spa_info_.get());
+}
+
+bool XamState::Save(ByteStream* stream) {
+  stream->Write<uint32_t>(content_register_callback);
+  stream->Write(&dash_app_info_, sizeof(dash_app_info_));
+  stream->Write<uint32_t>(dash_backstack_nodes_count_);
+  stream->Write(dash_backstack_data_, sizeof(dash_backstack_data_));
+  auto* profile = profile_manager_->GetProfile(static_cast<uint8_t>(0));
+  stream->Write<uint64_t>(profile ? profile->xuid() : 0);
+  return true;
+}
+
+bool XamState::Restore(ByteStream* stream) {
+  content_register_callback = stream->Read<uint32_t>();
+  stream->Read(&dash_app_info_, sizeof(dash_app_info_));
+  dash_backstack_nodes_count_ = stream->Read<uint32_t>();
+  stream->Read(dash_backstack_data_, sizeof(dash_backstack_data_));
+  uint64_t saved_xuid = stream->Read<uint64_t>();
+  auto* profile = profile_manager_->GetProfile(static_cast<uint8_t>(0));
+  uint64_t current_xuid = profile ? profile->xuid() : 0;
+  if (saved_xuid != current_xuid) {
+    XELOGW("Restore: saved with profile {:016X} in slot 0, now {:016X}",
+           saved_xuid, current_xuid);
+    kernel_state_->emulator()->AddRestoreWarning(fmt::format(
+        "saved with profile {:016X}, {:016X} is signed in", saved_xuid,
+        current_xuid));
+  }
+  return true;
 }
 
 void XamState::SetContentRegisterCallback(uint32_t callback) {

@@ -9,6 +9,10 @@
 
 #include "xenia/apu/xma_decoder.h"
 
+#include <chrono>
+
+#include "xenia/base/byte_stream.h"
+
 #include "xenia/apu/xma_context.h"
 #include "xenia/apu/xma_context_fake.h"
 #include "xenia/apu/xma_context_master.h"
@@ -205,8 +209,10 @@ void XmaDecoder::WorkerThreadMain() {
     }
 
     if (paused_) {
+      XELOGI("XMA: worker pausing");
       pause_fence_.Signal();
       resume_fence_.Wait();
+      XELOGI("XMA: worker resumed");
     }
 
     if (did_work) {
@@ -261,6 +267,7 @@ uint32_t XmaDecoder::AllocateContext() {
   XmaContext& context = *contexts_[index];
   assert_false(context.is_allocated());
   context.set_is_allocated(true);
+  XELOGI("XMA: allocate context {} ({:08X})", index, context.guest_ptr());
   return context.guest_ptr();
 }
 
@@ -270,6 +277,7 @@ void XmaDecoder::ReleaseContext(uint32_t guest_ptr) {
 
   XmaContext& context = *contexts_[context_id];
   assert_true(context.is_allocated());
+  XELOGI("XMA: release context {}", context_id);
   context.Release();
   context_bitmap_.Release(context_id);
 }
@@ -337,9 +345,16 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
     // The context ID is a bit in the range of the entire context array.
     const uint32_t base_context_id = (r - XmaRegister::Context0Kick) * 32;
     const uint32_t kicked_value = value;
+    static uint32_t kicks_per_context[kContextCount] = {};
+    auto kick_started = std::chrono::steady_clock::now();
     while (value) {
       const uint32_t context_id = base_context_id + std::countr_zero(value);
       auto& context = *contexts_[context_id];
+      uint32_t k = ++kicks_per_context[context_id];
+      if (k <= 2 || k == 10 || k == 100 || (k % 1000) == 0) {
+        XELOGI("XMA: kick context {} (#{}) allocated={} enabled={}",
+               context_id, k, context.is_allocated(), context.is_enabled());
+      }
       context.Enable();
       if (!cvars::use_dedicated_xma_thread) {
         context.Work();
@@ -354,8 +369,22 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
       while (remaining) {
         const uint32_t context_id =
             base_context_id + std::countr_zero(remaining);
-        contexts_[context_id]->WaitForWorkDone();
+        // The worker only touches allocated contexts, so waiting for one
+        // that is not would block the guest here (inside the MMIO fault
+        // handler) forever.
+        if (contexts_[context_id]->is_allocated()) {
+          contexts_[context_id]->WaitForWorkDone();
+        } else {
+          XELOGW("XMA: kick of unallocated context {} ignored", context_id);
+        }
         remaining &= remaining - 1;
+      }
+      auto kick_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - kick_started)
+                         .count();
+      if (kick_ms > 200) {
+        XELOGW("XMA: kick {:08X} (base {}) took {} ms waiting for the worker",
+               kicked_value, base_context_id, kick_ms);
       }
     }
   } else if (r >= XmaRegister::Context0Lock && r <= XmaRegister::Context9Lock) {
@@ -366,6 +395,7 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
     while (value) {
       const uint32_t context_id = base_context_id + std::countr_zero(value);
       auto& context = *contexts_[context_id];
+      XELOGD("XMA: lock (disable) context {}", context_id);
       context.Disable();
       // Ensure the worker isn't mid-processing this context.
       context.Block(false);
@@ -379,6 +409,7 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
     while (value) {
       const uint32_t context_id = base_context_id + std::countr_zero(value);
       auto& context = *contexts_[context_id];
+      XELOGI("XMA: clear context {}", context_id);
       context.Clear();
       value &= value - 1;
     }
@@ -403,12 +434,100 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
   }
 }
 
+// 'XMAD': allocated/enabled flags only. 'XMAE': the flags, then for every
+// allocated context a u32 size and that many bytes of decoder state
+// (XmaContext::SaveState; zero bytes from a decoder that keeps none).
+bool XmaDecoder::Save(ByteStream* stream) {
+  stream->Write<uint32_t>(uint32_t('XMAE'));
+  stream->Write<uint32_t>(kContextCount);
+  uint32_t allocated = 0, enabled = 0;
+  for (uint32_t i = 0; i < kContextCount; ++i) {
+    bool is_allocated = contexts_[i]->is_allocated();
+    bool is_enabled = contexts_[i]->is_enabled();
+    stream->Write<uint8_t>(is_allocated ? 1 : 0);
+    stream->Write<uint8_t>(is_enabled ? 1 : 0);
+    allocated += is_allocated;
+    enabled += is_enabled;
+  }
+  for (uint32_t i = 0; i < kContextCount; ++i) {
+    if (!contexts_[i]->is_allocated()) {
+      continue;
+    }
+    size_t size_offset = stream->offset();
+    stream->Write<uint32_t>(0);
+    contexts_[i]->SaveState(stream);
+    size_t end = stream->offset();
+    stream->set_offset(size_offset);
+    stream->Write<uint32_t>(uint32_t(end - size_offset - sizeof(uint32_t)));
+    stream->set_offset(end);
+  }
+  XELOGI("XmaDecoder::Save: {} contexts allocated, {} enabled", allocated,
+         enabled);
+  return true;
+}
+
+bool XmaDecoder::Restore(ByteStream* stream) {
+  uint32_t magic = stream->Read<uint32_t>();
+  if (magic != uint32_t('XMAD') && magic != uint32_t('XMAE')) {
+    XELOGE("XmaDecoder::Restore - invalid magic");
+    return false;
+  }
+  const bool has_context_state = magic == uint32_t('XMAE');
+  uint32_t count = stream->Read<uint32_t>();
+  if (count != kContextCount) {
+    XELOGE("XmaDecoder::Restore - context count mismatch ({})", count);
+    return false;
+  }
+  uint32_t allocated = 0, enabled = 0, changed = 0;
+  for (uint32_t i = 0; i < kContextCount; ++i) {
+    bool want_allocated = stream->Read<uint8_t>() != 0;
+    bool want_enabled = stream->Read<uint8_t>() != 0;
+    XmaContext& context = *contexts_[i];
+    if (want_allocated != context.is_allocated()) {
+      ++changed;
+      if (want_allocated) {
+        context_bitmap_.AcquireAt(i);
+        context.set_is_allocated(true);
+      } else {
+        // Release() also zeroes the guest context data; the memory image is
+        // restored after this, so that is harmless.
+        context.Release();
+        context_bitmap_.Release(i);
+      }
+    }
+    context.set_is_enabled(want_enabled);
+    allocated += want_allocated;
+    enabled += want_enabled;
+  }
+  // Decoder-side state: whatever the file has for allocated contexts, and a
+  // reset for everything else, so no context carries the pre-restore stream.
+  bool ok = true;
+  for (uint32_t i = 0; i < kContextCount; ++i) {
+    XmaContext& context = *contexts_[i];
+    if (context.is_allocated() && has_context_state) {
+      uint32_t size = stream->Read<uint32_t>();
+      ok = context.RestoreState(stream, size) && ok;
+    } else {
+      context.RestoreState(stream, 0);
+    }
+  }
+  XELOGI("XmaDecoder::Restore: {} contexts allocated, {} enabled, {} "
+         "allocation(s) changed, decoder state {}",
+         allocated, enabled, changed,
+         has_context_state ? (ok ? "restored" : "PARTLY restored")
+                           : "not in file, reset");
+  return true;
+}
+
 void XmaDecoder::Pause() {
   if (paused_) {
     return;
   }
   paused_ = true;
 
+  // The worker sleeps on work_event_ when no context needs decoding and only
+  // checks paused_ after waking, so wake it or this fence never signals.
+  work_event_->Set();
   pause_fence_.Wait();
 }
 

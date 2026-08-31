@@ -36,6 +36,9 @@ class SDLAudioSystem : public AudioSystem {
 
  protected:
   void Initialize() override;
+
+ private:
+  bool sdl_audio_held_ = false;
 };
 
 }  // namespace sdl

@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -57,6 +58,29 @@ class Window;
 namespace xe {
 
 constexpr fourcc_t kEmulatorSaveSignature = make_fourcc("XSAV");
+// Save-state file container (format 2): header + LZ4 chunks around the
+// serialised stream that starts with kEmulatorSaveSignature. A format 1 file
+// is that stream alone, uncompressed.
+constexpr fourcc_t kSaveStateContainerSignature = make_fourcc("XSSC");
+// 3 adds the disc (number, count, media id) to the header. 4 adds I/O
+// completion ports, timers and the file -> port links (kernel section).
+// 5 adds each thread's life state and creation parameters, so a thread
+// created suspended and not yet started is restored that way. 6 adds the
+// guest clock (tick count, system time) to the header. 7 adds the mounted
+// content packages (DLC, saves opened through XAM) to the kernel section, so
+// their files can be reopened.
+constexpr uint32_t kSaveStateFormatVersion = 9;
+
+// What the container header of a save-state file says, without loading it.
+struct SaveStateFileInfo {
+  uint32_t version = 0;  // 1 = legacy raw stream, 2+ = container
+  uint32_t title_id = 0;
+  uint32_t media_id = 0;     // format 3+, else 0
+  uint8_t disc_number = 0;   // format 3+, else 0
+  uint8_t disc_count = 0;    // format 3+, else 0
+  uint64_t raw_size = 0;     // format 2+, else 0
+  bool has_disc_info() const { return version >= 3; }
+};
 static constexpr std::string_view kDefaultGameSymbolicLink = "GAME:";
 static constexpr std::string_view kDefaultPartitionSymbolicLink = "D:";
 static constexpr std::string_view kDefaultUpdateSymbolicLink = "UPDATE:";
@@ -110,6 +134,10 @@ class Emulator {
 
   // Folder guest content is stored in.
   const std::filesystem::path& content_root() const { return content_root_; }
+  // Points the emulator and the kernel's content manager at another folder
+  // (Content > Content Folder). Only meant for when no title is running:
+  // packages mounted from the old folder stay where they are.
+  void set_content_root(const std::filesystem::path& content_root);
 
   // Folder files safe to remove without significant side effects are stored in.
   const std::filesystem::path& cache_root() const { return cache_root_; }
@@ -127,6 +155,12 @@ class Emulator {
 
   // Are we currently running a title?
   bool is_title_open() const { return title_id_.has_value(); }
+
+  // Disc of a multi-disc title, from the XEX execution info (0 if unknown).
+  uint8_t disc_number() const { return disc_number_; }
+  uint8_t disc_count() const { return disc_count_; }
+  uint32_t media_id() const { return media_id_; }
+  bool is_multi_disc() const { return disc_count_ > 1; }
 
   // Window used for displaying graphical output. Can be null.
   ui::Window* display_window() const { return display_window_; }
@@ -300,11 +334,42 @@ class Emulator {
     bool hasError{false};
   };
 
-  void Pause();
+  // capture_edram: read the EDRAM contents back for a save state.
+  void Pause(bool capture_edram = false);
   void Resume();
+
+  // Why the last SaveToFile refused before pausing ("" when it did not).
+  const std::string& last_save_error() const { return last_save_error_; }
+  // A (guest address, delta) to add to an int32 in the saved memory image
+  // only; recorded by the threads during a save, cleared after it.
+  void AddSaveMemoryFixup(uint32_t address, int32_t delta) {
+    save_memory_fixups_.emplace_back(address, delta);
+  }
+  // Notes a restore left for the user (a different profile is signed in,
+  // ...); cleared at the start of every RestoreFromFile.
+  const std::vector<std::string>& restore_warnings() const {
+    return restore_warnings_;
+  }
+  void AddRestoreWarning(std::string text) {
+    restore_warnings_.push_back(std::move(text));
+  }
   bool is_paused() const { return paused_; }
-  bool SaveToFile(const std::filesystem::path& path);
+  // Pauses, serialises the state into memory, resumes (calling on_resumed),
+  // then compresses and writes the file. The game is stopped only for the
+  // serialisation.
+  bool SaveToFile(const std::filesystem::path& path,
+                  std::function<void()> on_resumed = nullptr);
+  // Pause, step every running guest thread to a safe point, Resume. No file.
+  bool StepAllGuestThreads();
   bool RestoreFromFile(const std::filesystem::path& path);
+  // Reads a save-state file's header. False if it is not a save state.
+  static bool ReadSaveStateInfo(const std::filesystem::path& path,
+                                SaveStateFileInfo* out_info);
+  // Why a file cannot be loaded into the running title, or "" if it can
+  // (title and disc checks only; the content is not validated).
+  std::string SaveStateMismatch(const SaveStateFileInfo& info) const;
+  // Format version of the file being restored (1 = uncompressed legacy).
+  uint32_t save_state_version() const { return save_state_version_; }
 
   // The game can request another title to be loaded.
   const std::filesystem::path GetNewDiscPath(std::string window_message = "");
@@ -343,6 +408,9 @@ class Emulator {
 
   std::string title_name_;
   std::string title_version_;
+  uint8_t disc_number_ = 0;
+  uint8_t disc_count_ = 0;
+  uint32_t media_id_ = 0;
 
   ui::Window* display_window_ = nullptr;
   ui::ImGuiDrawer* imgui_drawer_ = nullptr;
@@ -381,6 +449,17 @@ class Emulator {
   std::vector<kernel::object_ref<kernel::XThread>> paused_threads_;
   bool restoring_;
   threading::Fence restore_fence_;  // Fired on restore finish.
+
+  // Staging buffer for save/restore: a large anonymous reservation, kept for
+  // the life of the emulator so later saves take no page faults while paused.
+  uint8_t* AcquireStateBuffer();
+  uint8_t* state_buffer_ = nullptr;
+  size_t state_buffer_size_ = 0;
+  std::mutex state_buffer_mutex_;
+  uint32_t save_state_version_ = kSaveStateFormatVersion;
+  std::string last_save_error_;
+  std::vector<std::pair<uint32_t, int32_t>> save_memory_fixups_;
+  std::vector<std::string> restore_warnings_;
 };
 
 }  // namespace xe

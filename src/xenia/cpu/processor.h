@@ -12,9 +12,11 @@
 
 #include <atomic>
 #include <map>
+#include <functional>
 #include <memory>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "xenia/base/cvar.h"
@@ -70,6 +72,9 @@ class Processor {
 
   Memory* memory() const { return memory_; }
   StackWalker* stack_walker() const { return stack_walker_.get(); }
+  // " (owner tid N 'comm', state S, wchan W)" for the global critical region,
+  // empty where the mutex has no owner field. For log lines about a stall.
+  static std::string DescribeGlobalLockOwner();
   ppc::PPCFrontend* frontend() const { return frontend_.get(); }
   backend::Backend* backend() const { return backend_.get(); }
   ExportResolver* export_resolver() const { return export_resolver_; }
@@ -172,7 +177,13 @@ class Processor {
 
   // Steps the given thread until the guest address is hit.
   // Returns false if the step could not be completed (invalid target address).
-  bool StepToGuestAddress(uint32_t thread_id, uint32_t pc);
+  // give_up, polled while waiting: true ends the wait early as a failure
+  // (a thread that parked itself will never reach pc).
+  bool StepToGuestAddress(uint32_t thread_id, uint32_t pc,
+                          const std::function<bool()>& give_up = nullptr);
+  // The guest import stub (a GuestFunction with export_data) that calls the
+  // given kernel export, or nullptr. Cached after the first lookup.
+  GuestFunction* FindImportStub(const Export* export_entry);
 
   // Steps the given thread to the target of the branch at the specified guest
   // address. The address must specify a branch instruction.
@@ -184,7 +195,18 @@ class Processor {
   // Pass true for ignore_host if you've stopped the thread yourself
   // in host code you want to ignore.
   // Returns the new PC guest address.
-  uint32_t StepToGuestSafePoint(uint32_t thread_id, bool ignore_host = false);
+  // guest_suspend_count / out_parked_in_self_suspend: a thread parked in its
+  // own NtSuspendThread (count > 0) is saved at the call, to be re-issued on
+  // restore, and reported through the out parameter.
+  uint32_t StepToGuestSafePoint(uint32_t thread_id, bool ignore_host = false,
+                                uint32_t guest_suspend_count = 0,
+                                bool* out_parked_in_self_suspend = nullptr,
+                                const std::function<bool()>& give_up = nullptr,
+                                std::pair<uint32_t, int32_t>* out_memory_fixup = nullptr);
+  // out_memory_fixup: (guest address, delta) to add to an int32 in the saved
+  // memory image only. A thread saved inside RtlEnterCriticalSection's wait
+  // has counted itself in the section's lock_count; the call is re-issued on
+  // restore and counts it again, so the image gets one less.
 
   uint32_t GuestAtomicIncrement32(ppc::PPCContext* context,
                                   uint32_t guest_address);
@@ -289,6 +311,8 @@ class Processor {
 
   // TODO(benvanik): cleanup/change structures.
   std::vector<Breakpoint*> breakpoints_;
+  int nudge_attempts_remaining_ = 0;  // StepToGuestSafePoint retry budget.
+  bool in_step_to_safe_point_ = false;  // Set for the recursive calls.
 
   Irql irql_;
 };

@@ -151,6 +151,9 @@ class VulkanCommandProcessor final : public CommandProcessor {
       std::function<void()> completion_callback = nullptr) override;
 
   void RestoreEdramSnapshot(const void* snapshot) override;
+  bool CaptureEdramSnapshot(std::vector<uint8_t>& out) override;
+  bool RestoreEdramSnapshotSized(const void* data, size_t size,
+                                 uint32_t scale_x, uint32_t scale_y) override;
 
   void PollCompletedSubmission() override;
 
