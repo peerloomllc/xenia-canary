@@ -66,9 +66,10 @@ is the changelog.
 ## Building
 
 Each [release](https://github.com/peerloomllc/xenia-canary/releases)
-carries an **AppImage** built on Ubuntu 24.04 (needs glibc 2.39 or newer
-and a Vulkan driver; `chmod +x` and run) and a **tarball** built on
-Fedora 44 against its system libraries. To build from source on Fedora
+carries an **AppImage** built on Ubuntu 24.04: download, `chmod +x`, run.
+It needs glibc 2.39 or newer and a Vulkan driver, nothing else (the
+runtime is static; no FUSE package required). A **tarball** built on
+Fedora 44 against its system libraries is there too. To build from source on Fedora
 (44):
 
 ```sh
