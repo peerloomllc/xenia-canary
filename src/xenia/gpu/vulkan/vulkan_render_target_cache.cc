@@ -4985,39 +4985,49 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                       pair.end_tiles - pair.start_tiles >= 250)
                    : pair.was_eligible;
       };
-      static uint32_t probe_rotation = 0;
+      // Only one probe is in flight at a time, so without skipping it would
+      // always sample the first copy after a frame ends. Skip one more each
+      // time, walking the copies of a frame across frames.
+      static uint32_t probe_skip_remaining = 0;
+      static uint32_t probe_skip_next = 0;
       uint32_t wanted_count = 0;
       for (const DirtyBoxPair& pair : dirty_box_pairs) {
         wanted_count += uint32_t(probe_wanted(pair));
       }
       if (wanted_count) {
-        uint32_t probe_target = probe_rotation++ % wanted_count;
-        uint32_t wanted_seen = 0;
         for (const DirtyBoxPair& pair : dirty_box_pairs) {
-          if (probe_wanted(pair) && wanted_seen++ == probe_target) {
-            // The host extent of the destination, to read the box against:
-            // the boxes are in host viewport pixels, and the range copied is
-            // only part of the target's rows.
-            RenderTargetKey probe_dest_key = pair.dest->key();
-            uint32_t probe_dest_width = probe_dest_key.GetWidth() *
-                                        GetKeyScaleX(probe_dest_key);
-            uint32_t probe_dest_height =
-                GetRenderTargetHeight(probe_dest_key.pitch_tiles_at_32bpp,
-                                      probe_dest_key.msaa_samples) *
-                GetKeyScaleY(probe_dest_key);
-            uint32_t probe_range_rows =
-                probe_dest_key.pitch_tiles_at_32bpp
-                    ? (pair.end_tiles - pair.start_tiles) /
-                          probe_dest_key.pitch_tiles_at_32bpp
-                    : 0;
-            command_processor_.CaptureDirtyBboxPairProbe(
-                pair.source->dirty_bbox_slot(), pair.dest->dirty_bbox_slot(),
-                pair.was_eligible ? "eligible" : pair.gate, pair.start_tiles,
-                pair.end_tiles, probe_dest_width, probe_dest_height,
-                probe_range_rows * xenos::kEdramTileHeightSamples *
-                    GetKeyScaleY(probe_dest_key));
-            break;
+          if (!probe_wanted(pair)) {
+            continue;
           }
+          if (probe_skip_remaining) {
+            --probe_skip_remaining;
+            continue;
+          }
+          // The host extent of the destination, to read the box against: the
+          // boxes are in host viewport pixels, and the range copied is only
+          // part of the target's rows.
+          RenderTargetKey probe_dest_key = pair.dest->key();
+          uint32_t probe_dest_width =
+              probe_dest_key.GetWidth() * GetKeyScaleX(probe_dest_key);
+          uint32_t probe_dest_height =
+              GetRenderTargetHeight(probe_dest_key.pitch_tiles_at_32bpp,
+                                    probe_dest_key.msaa_samples) *
+              GetKeyScaleY(probe_dest_key);
+          uint32_t probe_range_rows =
+              probe_dest_key.pitch_tiles_at_32bpp
+                  ? (pair.end_tiles - pair.start_tiles) /
+                        probe_dest_key.pitch_tiles_at_32bpp
+                  : 0;
+          if (command_processor_.CaptureDirtyBboxPairProbe(
+                  pair.source->dirty_bbox_slot(), pair.dest->dirty_bbox_slot(),
+                  pair.was_eligible ? "eligible" : pair.gate, pair.start_tiles,
+                  pair.end_tiles, probe_dest_width, probe_dest_height,
+                  probe_range_rows * xenos::kEdramTileHeightSamples *
+                      GetKeyScaleY(probe_dest_key))) {
+            probe_skip_next = (probe_skip_next + 1) % 64;
+            probe_skip_remaining = probe_skip_next;
+          }
+          break;
         }
       }
     }
@@ -5067,6 +5077,8 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       snapshot_command_buffer.CmdVkFillBuffer(
           dirty_bbox_buffer,
           VkDeviceSize(pair.source->dirty_bbox_slot()) * kBoxSize, kBoxSize, 0);
+      command_processor_.ClearDirtyBboxDrawLog(pair.dest->dirty_bbox_slot());
+      command_processor_.ClearDirtyBboxDrawLog(pair.source->dirty_bbox_slot());
     }
     command_processor_.PushBufferMemoryBarrier(
         dirty_bbox_buffer, 0, VK_WHOLE_SIZE,

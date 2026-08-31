@@ -626,15 +626,40 @@ class VulkanCommandProcessor final : public CommandProcessor {
   uint32_t dirty_bbox_pair_probe_dest_extent_[2] = {};
   uint32_t dirty_bbox_pair_probe_range_height_ = 0;
   float dirty_bbox_pair_probe_viewport_[2] = {};
+  // --log_dirty_bbox_draws: what dirtied a box since it was last zeroed, so a
+  // non-empty box at a transfer can be attributed to the draws that wrote it.
+  struct DirtyBboxDrawRecord {
+    uint64_t vertex_shader_hash;
+    uint64_t pixel_shader_hash;
+    uint32_t primitive_type;
+    uint32_t vertex_count;
+    uint32_t viewport[2];
+    int32_t scissor_offset[2];
+    uint32_t scissor_extent[2];
+    bool depth_write;
+    bool stencil_write;
+  };
+  std::unordered_map<uint32_t, std::vector<DirtyBboxDrawRecord>>
+      dirty_bbox_draw_log_;
+  std::vector<DirtyBboxDrawRecord> dirty_bbox_pair_probe_draws_;
   // Public entry for the render target cache.
  public:
-  void CaptureDirtyBboxPairProbe(uint32_t source_slot, uint32_t dest_slot,
+  // True when the probe was taken (only one is in flight at a time), so the
+  // caller can walk which copy of a frame it samples.
+  bool CaptureDirtyBboxPairProbe(uint32_t source_slot, uint32_t dest_slot,
                                  const char* gate = "eligible",
                                  uint32_t start_tiles = 0,
                                  uint32_t end_tiles = 0,
                                  uint32_t dest_width = 0,
                                  uint32_t dest_height = 0,
                                  uint32_t range_height = 0);
+  // The boxes for these slots are about to be zeroed: the draws recorded
+  // against them no longer describe what a box holds.
+  void ClearDirtyBboxDrawLog(uint32_t slot) {
+    if (!dirty_bbox_draw_log_.empty()) {
+      dirty_bbox_draw_log_.erase(slot);
+    }
+  }
 
  private:
 

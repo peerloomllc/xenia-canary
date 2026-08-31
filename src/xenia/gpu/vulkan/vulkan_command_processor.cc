@@ -46,6 +46,12 @@ DEFINE_bool(log_dirty_bbox, false,
             "bounding boxes back and log them for validation.",
             "GPU");
 
+DEFINE_bool(log_dirty_bbox_draws, false,
+            "With dirty_region_tracking and log_rt_transfer_map: record what "
+            "dirtied each bounding box since it was last zeroed, and list "
+            "those draws with the pair probe, to attribute a non-empty box.",
+            "GPU");
+
 DEFINE_bool(gpu_time_stats, false,
             "Measure GPU time with device timestamps: whole submissions, "
             "render target ownership transfer regions and resolve regions. "
@@ -4347,13 +4353,13 @@ void VulkanCommandProcessor::CheckSubmissionCompletionAndDeviceLoss(
   }
 }
 
-void VulkanCommandProcessor::CaptureDirtyBboxPairProbe(
+bool VulkanCommandProcessor::CaptureDirtyBboxPairProbe(
     uint32_t source_slot, uint32_t dest_slot, const char* gate,
     uint32_t start_tiles, uint32_t end_tiles, uint32_t dest_width,
     uint32_t dest_height, uint32_t range_height) {
   if (!dirty_bbox_enabled_ || dirty_bbox_pair_probe_pending_ ||
       dirty_bbox_readback_buffer_ == VK_NULL_HANDLE) {
-    return;
+    return false;
   }
   // Two boxes into the tail of the readback buffer (the frame-end diagnostic
   // copy only writes the slot area it reads, addressed from 0).
@@ -4385,6 +4391,14 @@ void VulkanCommandProcessor::CaptureDirtyBboxPairProbe(
       system_constants_.dirty_bbox_px_scale[0] * 2.0f;
   dirty_bbox_pair_probe_viewport_[1] =
       system_constants_.dirty_bbox_px_scale[1] * 2.0f;
+  dirty_bbox_pair_probe_draws_.clear();
+  if (cvars::log_dirty_bbox_draws) {
+    auto it_source_draws = dirty_bbox_draw_log_.find(source_slot);
+    if (it_source_draws != dirty_bbox_draw_log_.end()) {
+      dirty_bbox_pair_probe_draws_ = it_source_draws->second;
+    }
+  }
+  return true;
 }
 
 void VulkanCommandProcessor::StartGpuTimeSubmission() {
@@ -4673,6 +4687,22 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
           dirty_bbox_pair_probe_dest_extent_[1],
           dirty_bbox_pair_probe_viewport_[0],
           dirty_bbox_pair_probe_viewport_[1]);
+      for (size_t probe_draw_index = 0;
+           probe_draw_index < dirty_bbox_pair_probe_draws_.size();
+           ++probe_draw_index) {
+        const DirtyBboxDrawRecord& record =
+            dirty_bbox_pair_probe_draws_[probe_draw_index];
+        XELOGI(
+            "  source box draw {}: vs {:016X} ps {:016X} prim {} verts {} "
+            "viewport {}x{} scissor [{}, {}] {}x{}{}{}",
+            probe_draw_index, record.vertex_shader_hash,
+            record.pixel_shader_hash, record.primitive_type,
+            record.vertex_count, record.viewport[0], record.viewport[1],
+            record.scissor_offset[0], record.scissor_offset[1],
+            record.scissor_extent[0], record.scissor_extent[1],
+            record.depth_write ? " depth_write" : "",
+            record.stencil_write ? " stencil_write" : "");
+      }
     }
     if (dirty_bbox_readback_pending_ &&
         completed_submission >= dirty_bbox_readback_submission_) {
@@ -5785,6 +5815,35 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     if (depth_written) {
       dirty_bbox_slot =
           render_target_cache_->last_update_used_depth_dirty_bbox_slot();
+    }
+    if (cvars::log_dirty_bbox_draws && dirty_bbox_slot != UINT32_MAX) {
+      std::vector<DirtyBboxDrawRecord>& slot_draws =
+          dirty_bbox_draw_log_[dirty_bbox_slot];
+      // Only the first few matter for attribution, and the list is cleared
+      // whenever the box is.
+      if (slot_draws.size() < 32) {
+        draw_util::Scissor draw_scissor;
+        draw_util::GetScissor(regs, draw_scissor);
+        DirtyBboxDrawRecord record;
+        record.vertex_shader_hash = active_vertex_shader()
+                                        ? active_vertex_shader()->ucode_data_hash()
+                                        : 0;
+        record.pixel_shader_hash = active_pixel_shader()
+                                       ? active_pixel_shader()->ucode_data_hash()
+                                       : 0;
+        record.primitive_type =
+            uint32_t(primitive_processing_result.host_primitive_type);
+        record.vertex_count = primitive_processing_result.host_draw_vertex_count;
+        record.viewport[0] = viewport_info.xy_extent[0];
+        record.viewport[1] = viewport_info.xy_extent[1];
+        record.scissor_offset[0] = draw_scissor.offset[0];
+        record.scissor_offset[1] = draw_scissor.offset[1];
+        record.scissor_extent[0] = draw_scissor.extent[0];
+        record.scissor_extent[1] = draw_scissor.extent[1];
+        record.depth_write = normalized_depth_control.z_write_enable != 0;
+        record.stencil_write = normalized_depth_control.stencil_enable != 0;
+        slot_draws.push_back(record);
+      }
     }
   }
   dirty |= system_constants_.dirty_bbox_slot != dirty_bbox_slot;
