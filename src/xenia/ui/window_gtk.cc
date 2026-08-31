@@ -521,6 +521,24 @@ VirtualKey GTKWindow::TranslateVirtualKey(guint keyval) {
     case GDK_KEY_Pause:
     case GDK_KEY_Break:
       return VirtualKey::kPause;
+    case GDK_KEY_Delete:
+    case GDK_KEY_KP_Delete:
+      return VirtualKey::kDelete;
+    case GDK_KEY_Insert:
+    case GDK_KEY_KP_Insert:
+      return VirtualKey::kInsert;
+    case GDK_KEY_Home:
+    case GDK_KEY_KP_Home:
+      return VirtualKey::kHome;
+    case GDK_KEY_End:
+    case GDK_KEY_KP_End:
+      return VirtualKey::kEnd;
+    case GDK_KEY_Page_Up:
+    case GDK_KEY_KP_Page_Up:
+      return VirtualKey::kPrior;
+    case GDK_KEY_Page_Down:
+    case GDK_KEY_KP_Page_Down:
+      return VirtualKey::kNext;
     default:
       XELOGW("Unhandled key code: {}", keyval);
       return VirtualKey(keyval);

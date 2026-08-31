@@ -11,6 +11,7 @@
 #define XENIA_APP_EMULATOR_WINDOW_H_
 
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "xenia/app/profile_dialogs.h"
@@ -40,6 +41,9 @@ struct RecentTitleEntry {
 
 class EmulatorWindow {
  public:
+  // Keyboard actions the user can rebind (HID > Keyboard hotkeys).
+  enum class HotkeyAction : int { kPauseResume = 0, kMute, kCount };
+
   using steady_clock = std::chrono::steady_clock;  // stdlib steady clock
 
   enum : size_t {
@@ -154,6 +158,7 @@ class EmulatorWindow {
     void OnFileDrop(ui::FileDropEvent& e) override;
 
     void OnKeyDown(ui::KeyEvent& e) override;
+    void OnKeyChar(ui::KeyEvent& e) override;
 
     void OnMouseDown(ui::MouseEvent& e) override;
     void OnMouseUp(ui::MouseEvent& e) override;
@@ -219,6 +224,46 @@ class EmulatorWindow {
     EmulatorWindow& emulator_window_;
   };
 
+  // Full-window dimming overlay with "PAUSED" while Emulator::is_paused().
+  class PausedOverlayDialog final : public ui::ImGuiDialog {
+   public:
+    PausedOverlayDialog(ui::ImGuiDrawer* imgui_drawer,
+                        EmulatorWindow& emulator_window)
+        : ui::ImGuiDialog(imgui_drawer), emulator_window_(emulator_window) {}
+
+   protected:
+    void OnDraw(ImGuiIO& io) override;
+
+   private:
+    EmulatorWindow& emulator_window_;
+  };
+
+  // Top-left status lines: "FAST-FORWARD 2.00x" / "SLOW-MOTION 0.50x" while
+  // the guest time scalar is not 1, "MUTED" while audio is muted.
+  class StatusOverlayDialog final : public ui::ImGuiDialog {
+   public:
+    explicit StatusOverlayDialog(ui::ImGuiDrawer* imgui_drawer)
+        : ui::ImGuiDialog(imgui_drawer) {}
+
+   protected:
+    void OnDraw(ImGuiIO& io) override;
+  };
+
+
+
+  class KeyboardHotkeysDialog final : public ui::ImGuiDialog {
+   public:
+    KeyboardHotkeysDialog(ui::ImGuiDrawer* imgui_drawer,
+                          EmulatorWindow& emulator_window)
+        : ui::ImGuiDialog(imgui_drawer), emulator_window_(emulator_window) {}
+
+   protected:
+    void OnDraw(ImGuiIO& io) override;
+
+   private:
+    EmulatorWindow& emulator_window_;
+  };
+
   class XMPConfigDialog final : public ui::ImGuiDialog {
    public:
     XMPConfigDialog(ui::ImGuiDrawer* imgui_drawer,
@@ -262,6 +307,10 @@ class EmulatorWindow {
   void ApplyDisplayConfigForCvars();
 
   void OnKeyDown(ui::KeyEvent& e);
+  // Printable keys (letters, digits, space) arrive here on GTK, not in
+  // OnKeyDown; the pause hotkey and key capture have to see both.
+  void OnKeyChar(ui::KeyEvent& e);
+  bool HandleAssignableHotkeys(ui::VirtualKey key, ui::KeyEvent& e);
   void OnMouseDown(const ui::MouseEvent& e);
   void ToggleFullscreenOnDoubleClick();
   void FileDrop(const std::filesystem::path& filename);
@@ -277,9 +326,26 @@ class EmulatorWindow {
   void CpuTimeScalarSetDouble();
   void CpuBreakIntoDebugger();
   void CpuBreakIntoHostDebugger();
+  void TogglePauseEmulation();
   void GpuTraceFrame();
   void GpuClearCaches();
   void ToggleDisplayConfigDialog();
+  void ToggleKeyboardHotkeysDialog();
+  void SetPausedOverlay(bool shown);
+  // Shows or hides the status overlay to match the time scalar and mute
+  // state; posts a "Speed" or "Audio" notification when asked.
+  void UpdateStatusOverlay(const char* notify_title);
+  void ToggleMute();
+  // Assigns an action's key at runtime and persists it to the config.
+  // Returns false (and leaves things unchanged) if the key is taken by a
+  // fixed hotkey or another action, or cannot be represented.
+  bool SetActionHotkey(HotkeyAction action, ui::VirtualKey key);
+  void ClearActionHotkey(HotkeyAction action);
+  std::optional<ui::VirtualKey> action_key(HotkeyAction action) const {
+    return action_keys_[int(action)];
+  }
+  int capturing_action_ = -1;  // HotkeyAction being captured, or -1.
+  std::string hotkey_status_;
   void ToggleControllerVibration();
   void ShowCompatibility();
   void ShowFAQ();
@@ -315,12 +381,16 @@ class EmulatorWindow {
   std::unique_ptr<ui::ImmediateDrawer> immediate_drawer_;
 
   bool emulator_initialized_ = false;
+  std::optional<ui::VirtualKey> action_keys_[int(HotkeyAction::kCount)];
   std::atomic<bool> disable_hotkeys_ = false;
 
   std::string base_title_;
   bool initializing_shader_storage_ = false;
 
   std::unique_ptr<DisplayConfigDialog> display_config_dialog_;
+  std::unique_ptr<KeyboardHotkeysDialog> keyboard_hotkeys_dialog_;
+  std::unique_ptr<PausedOverlayDialog> paused_overlay_;
+  std::unique_ptr<StatusOverlayDialog> status_overlay_;
   std::unique_ptr<ConsoleSettingsDialog> console_settings_dialog_;
   std::unique_ptr<ContentListDialog> content_list_dialog_;
   // Storing pointers and toggling dialog state is useful for broadcasting

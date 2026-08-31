@@ -21,6 +21,7 @@
 #include "xenia/base/delegate.h"
 #include "xenia/base/exception_handler.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/xthread.h"
 #include "xenia/kernel/util/game_info_database.h"
 #include "xenia/kernel/util/xlast.h"
 #include "xenia/memory.h"
@@ -316,6 +317,9 @@ class Emulator {
   xe::Delegate<> on_patch_apply;
   xe::Delegate<> on_terminate;
   xe::Delegate<> on_exit;
+  // Fired at the end of Pause() (true) and Resume() (false), on the thread
+  // that called them.
+  xe::Delegate<bool> on_pause_state_changed;
 
  private:
   enum : uint64_t { EmulatorFlagDisclaimerAcknowledged = 1ULL << 0 };
@@ -373,6 +377,8 @@ class Emulator {
   std::unique_ptr<kernel::util::GameInfoDatabase> game_info_database_;
 
   bool paused_;
+  // Guest threads Pause() suspended, so Resume() undoes exactly that.
+  std::vector<kernel::object_ref<kernel::XThread>> paused_threads_;
   bool restoring_;
   threading::Fence restore_fence_;  // Fired on restore finish.
 };

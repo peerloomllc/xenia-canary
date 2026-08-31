@@ -9,6 +9,16 @@
 
 #include "xenia/app/emulator_window.h"
 
+#include "xenia/apu/apu_flags.h"
+#include "xenia/config.h"
+
+#include <thread>
+
+#include <cctype>
+#include <cmath>
+#include <algorithm>
+#include <chrono>
+
 #include "third_party/imgui/imgui.h"
 #include "third_party/stb/stb_image_write.h"
 #if defined(__clang__)
@@ -69,6 +79,31 @@ DEFINE_bool(fullscreen, false, "Whether to launch the emulator in fullscreen.",
 
 DEFINE_bool(controller_hotkeys, false, "Hotkeys for Xbox and PS controllers.",
             "General");
+DEFINE_string(ui_experiment_dialog, "",
+              "Experiment: open a dialog from a timer on the UI thread: "
+              "hotkeys, display, console, xmp. For reproducing UI crashes "
+              "without a keyboard.",
+              "General");
+DEFINE_int32(ui_experiment_seconds, 30,
+             "Experiment: delay before --ui_experiment_dialog opens.",
+             "General");
+DEFINE_string(pause_hotkey, "F7",
+              "Key that pauses/resumes emulation (Emulator::Pause/Resume): "
+              "F1-F24, A-Z, 0-9, Space, Delete, Insert, Home, End, PageUp, "
+              "PageDown, Tab, or empty to disable.",
+              "General");
+DEFINE_string(mute_hotkey, "Delete",
+              "Key that toggles audio mute. Same key names as pause_hotkey; "
+              "empty to disable.",
+              "General");
+
+namespace xe {
+namespace app {
+namespace {
+std::optional<ui::VirtualKey> ParseHotkeyName(const std::string& name);
+}  // namespace
+}  // namespace app
+}  // namespace xe
 
 DEFINE_string(
     postprocess_antialiasing, "",
@@ -293,6 +328,10 @@ void EmulatorWindow::EmulatorWindowListener::OnClosing(ui::UIEvent& e) {
 
 void EmulatorWindow::EmulatorWindowListener::OnFileDrop(ui::FileDropEvent& e) {
   emulator_window_.FileDrop(e.filename());
+}
+
+void EmulatorWindow::EmulatorWindowListener::OnKeyChar(ui::KeyEvent& e) {
+  emulator_window_.OnKeyChar(e);
 }
 
 void EmulatorWindow::EmulatorWindowListener::OnKeyDown(ui::KeyEvent& e) {
@@ -747,6 +786,10 @@ void EmulatorWindow::XMPConfigDialog::OnDraw(ImGuiIO& io) {
 
 bool EmulatorWindow::Initialize() {
   window_->AddListener(&window_listener_);
+  UpdateStatusOverlay(nullptr);
+  emulator_->on_pause_state_changed.AddListener([this](bool paused) {
+    app_context().CallInUIThread([this, paused]() { SetPausedOverlay(paused); });
+  });
   window_->AddInputListener(&window_listener_, kZOrderEmulatorWindowInput);
 
   // Main menu.
@@ -844,6 +887,17 @@ bool EmulatorWindow::Initialize() {
         "Ctrl+Pause/Break",
         std::bind(&EmulatorWindow::CpuBreakIntoHostDebugger, this)));
   }
+  cpu_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
+  {
+    action_keys_[int(HotkeyAction::kPauseResume)] =
+        ParseHotkeyName(cvars::pause_hotkey);
+    action_keys_[int(HotkeyAction::kMute)] = ParseHotkeyName(cvars::mute_hotkey);
+    cpu_menu->AddChild(MenuItem::Create(
+        MenuItem::Type::kString, "Pause/Resume &Emulation",
+        action_key(HotkeyAction::kPauseResume).has_value() ? cvars::pause_hotkey
+                                                          : "",
+        std::bind(&EmulatorWindow::TogglePauseEmulation, this)));
+  }
   main_menu->AddChild(std::move(cpu_menu));
 
   // GPU menu.
@@ -888,6 +942,9 @@ bool EmulatorWindow::Initialize() {
     hid_menu->AddChild(MenuItem::Create(
         MenuItem::Type::kString, "&Display controller hotkeys", "",
         std::bind(&EmulatorWindow::DisplayHotKeysConfig, this)));
+    hid_menu->AddChild(MenuItem::Create(
+        MenuItem::Type::kString, "&Keyboard hotkeys", "",
+        std::bind(&EmulatorWindow::ToggleKeyboardHotkeysDialog, this)));
   }
   main_menu->AddChild(std::move(hid_menu));
 
@@ -897,6 +954,10 @@ bool EmulatorWindow::Initialize() {
     xmp_menu->AddChild(MenuItem::Create(
         MenuItem::Type::kString, "&Show XMP Menu", "",
         std::bind(&EmulatorWindow::ToggleXMPConfigDialog, this)));
+    xmp_menu->AddChild(MenuItem::Create(
+        MenuItem::Type::kString, "Toggle &Mute",
+        action_key(HotkeyAction::kMute).has_value() ? cvars::mute_hotkey : "",
+        std::bind(&EmulatorWindow::ToggleMute, this)));
   }
   main_menu->AddChild(std::move(xmp_menu));
 
@@ -937,6 +998,33 @@ bool EmulatorWindow::Initialize() {
   main_menu->AddChild(std::move(help_menu));
 
   window_->SetMainMenu(std::move(main_menu));
+
+  if (!cvars::ui_experiment_dialog.empty()) {
+    std::thread([this]() {
+      xe::threading::set_name("UI Experiment");
+      std::this_thread::sleep_for(
+          std::chrono::seconds(cvars::ui_experiment_seconds));
+      app_context().CallInUIThread([this]() {
+        const std::string& which = cvars::ui_experiment_dialog;
+        XELOGI("UI EXPERIMENT: opening '{}'", which);
+        if (which == "hotkeys") {
+          DisplayHotKeysConfig();
+        } else if (which == "display") {
+          ToggleDisplayConfigDialog();
+        } else if (which == "console") {
+          ToggleConsoleSettingsDialog();
+        } else if (which == "xmp") {
+          ToggleXMPConfigDialog();
+        } else if (which == "keyboard") {
+          ToggleKeyboardHotkeysDialog();
+        } else if (which == "keyboard_capture") {
+          ToggleKeyboardHotkeysDialog();
+          capturing_action_ = int(HotkeyAction::kPauseResume);
+        }
+        XELOGI("UI EXPERIMENT: '{}' opened", which);
+      });
+    }).detach();
+  }
 
   window_->SetMainMenuEnabled(false);
 
@@ -1039,8 +1127,476 @@ void EmulatorWindow::ApplyDisplayConfigForCvars() {
   }
 }
 
+namespace {
+std::optional<ui::VirtualKey> ParseHotkeyName(const std::string& name) {
+  if (name.empty()) {
+    return std::nullopt;
+  }
+  std::string n = name;
+  for (auto& c : n) {
+    c = char(std::toupper(static_cast<unsigned char>(c)));
+  }
+  if (n.size() >= 2 && n[0] == 'F') {
+    int f = std::atoi(n.c_str() + 1);
+    if (f >= 1 && f <= 24) {
+      return ui::VirtualKey(uint16_t(ui::VirtualKey::kF1) + (f - 1));
+    }
+  }
+  if (n.size() == 1 && n[0] >= 'A' && n[0] <= 'Z') {
+    return ui::VirtualKey(uint16_t(ui::VirtualKey::kA) + (n[0] - 'A'));
+  }
+  if (n.size() == 1 && n[0] >= '0' && n[0] <= '9') {
+    return ui::VirtualKey(0x30 + (n[0] - '0'));
+  }
+  static const std::pair<const char*, ui::VirtualKey> kNamed[] = {
+      {"PAUSE", ui::VirtualKey::kPause},   {"SPACE", ui::VirtualKey::kSpace},
+      {"DELETE", ui::VirtualKey::kDelete}, {"INSERT", ui::VirtualKey::kInsert},
+      {"HOME", ui::VirtualKey::kHome},     {"END", ui::VirtualKey::kEnd},
+      {"PAGEUP", ui::VirtualKey::kPrior},  {"PAGEDOWN", ui::VirtualKey::kNext},
+      {"TAB", ui::VirtualKey::kTab},
+  };
+  for (const auto& [key_name, key] : kNamed) {
+    if (n == key_name) {
+      return key;
+    }
+  }
+  XELOGW("Unrecognised hotkey name '{}', hotkey disabled", name);
+  return std::nullopt;
+}
+}  // namespace
+
+namespace {
+// Keyboard shortcuts handled in EmulatorWindow::OnKeyDown, for the dialog
+// and for conflict checks. Keep in step with OnKeyDown.
+struct FixedHotkey {
+  ui::VirtualKey key;
+  const char* name;
+  const char* action;
+};
+const FixedHotkey kFixedHotkeys[] = {
+    {ui::VirtualKey::kO, "Ctrl+O", "Open..."},
+    {ui::VirtualKey::kF1, "F1", "Show FAQ"},
+    {ui::VirtualKey::kF2, "F2", "Show build commit"},
+    {ui::VirtualKey::kF3, "F3", "Toggle profiler display"},
+    {ui::VirtualKey::kF4, "F4", "GPU: trace frame"},
+    {ui::VirtualKey::kF5, "F5", "GPU: clear runtime caches"},
+    {ui::VirtualKey::kF6, "F6", "Post-processing settings"},
+    {ui::VirtualKey::kF9, "F9", "Run previously played title"},
+    {ui::VirtualKey::kF11, "F11", "Toggle fullscreen"},
+    {ui::VirtualKey::kF12, "F12", "Take screenshot"},
+    {ui::VirtualKey::kEscape, "Escape", "Leave fullscreen"},
+    {ui::VirtualKey::kPause, "Pause/Break", "Break into guest debugger"},
+    {ui::VirtualKey::kCancel, "Ctrl+Pause/Break", "Break into host debugger"},
+    {ui::VirtualKey::kMultiply, "Numpad *", "Reset time scalar"},
+    {ui::VirtualKey::kSubtract, "Numpad -", "Time scalar /= 2"},
+    {ui::VirtualKey::kAdd, "Numpad +", "Time scalar *= 2"},
+};
+
+// Inverse of ParseHotkeyName for the keys it accepts; empty otherwise.
+std::string HotkeyName(ui::VirtualKey key) {
+  uint16_t v = uint16_t(key);
+  if (v >= uint16_t(ui::VirtualKey::kF1) &&
+      v <= uint16_t(ui::VirtualKey::kF24)) {
+    return "F" + std::to_string(v - uint16_t(ui::VirtualKey::kF1) + 1);
+  }
+  if (v >= uint16_t(ui::VirtualKey::kA) && v <= uint16_t(ui::VirtualKey::kZ)) {
+    return std::string(1, char('A' + (v - uint16_t(ui::VirtualKey::kA))));
+  }
+  if (v >= uint16_t(ui::VirtualKey::k0) && v <= uint16_t(ui::VirtualKey::k9)) {
+    return std::string(1, char('0' + (v - uint16_t(ui::VirtualKey::k0))));
+  }
+  switch (key) {
+    case ui::VirtualKey::kSpace:
+      return "Space";
+    case ui::VirtualKey::kDelete:
+      return "Delete";
+    case ui::VirtualKey::kInsert:
+      return "Insert";
+    case ui::VirtualKey::kHome:
+      return "Home";
+    case ui::VirtualKey::kEnd:
+      return "End";
+    case ui::VirtualKey::kPrior:
+      return "PageUp";
+    case ui::VirtualKey::kNext:
+      return "PageDown";
+    case ui::VirtualKey::kTab:
+      return "Tab";
+    default:
+      return "";
+  }
+}
+
+const FixedHotkey* FindFixedHotkey(ui::VirtualKey key) {
+  for (const auto& h : kFixedHotkeys) {
+    if (h.key == key) {
+      return &h;
+    }
+  }
+  return nullptr;
+}
+
+// Keys offered in the dialog's dropdown: everything ParseHotkeyName accepts
+// except the fixed hotkeys.
+std::vector<std::string> AssignableHotkeyChoices() {
+  std::vector<std::string> out;
+  auto add = [&](ui::VirtualKey k) {
+    if (!FindFixedHotkey(k)) {
+      out.push_back(HotkeyName(k));
+    }
+  };
+  for (int i = 0; i < 24; ++i) {
+    add(ui::VirtualKey(uint16_t(ui::VirtualKey::kF1) + i));
+  }
+  for (int i = 0; i < 26; ++i) {
+    add(ui::VirtualKey(uint16_t(ui::VirtualKey::kA) + i));
+  }
+  for (int i = 0; i < 10; ++i) {
+    add(ui::VirtualKey(uint16_t(ui::VirtualKey::k0) + i));
+  }
+  for (ui::VirtualKey k :
+       {ui::VirtualKey::kSpace, ui::VirtualKey::kDelete, ui::VirtualKey::kInsert,
+        ui::VirtualKey::kHome, ui::VirtualKey::kEnd, ui::VirtualKey::kPrior,
+        ui::VirtualKey::kNext, ui::VirtualKey::kTab}) {
+    add(k);
+  }
+  return out;
+}
+
+const char* HotkeyActionLabel(EmulatorWindow::HotkeyAction action) {
+  switch (action) {
+    case EmulatorWindow::HotkeyAction::kPauseResume:
+      return "Pause/Resume emulation";
+    case EmulatorWindow::HotkeyAction::kMute:
+      return "Mute/unmute audio";
+    default:
+      return "?";
+  }
+}
+}  // namespace
+
+bool EmulatorWindow::SetActionHotkey(HotkeyAction action,
+                                     ui::VirtualKey key) {
+  std::string name = HotkeyName(key);
+  if (name.empty()) {
+    hotkey_status_ =
+        "That key cannot be used; pick F1-F24, A-Z, 0-9, Space, Delete, "
+        "Insert, Home, End, PageUp, PageDown or Tab.";
+    return false;
+  }
+  if (const FixedHotkey* fixed = FindFixedHotkey(key)) {
+    hotkey_status_ = fmt::format("{} is already used for \"{}\".",
+                                 fixed->name, fixed->action);
+    return false;
+  }
+  for (int i = 0; i < int(HotkeyAction::kCount); ++i) {
+    if (i != int(action) && action_keys_[i].has_value() &&
+        *action_keys_[i] == key) {
+      hotkey_status_ = fmt::format("{} is already used for \"{}\".", name,
+                                   HotkeyActionLabel(HotkeyAction(i)));
+      return false;
+    }
+  }
+  action_keys_[int(action)] = key;
+  switch (action) {
+    case HotkeyAction::kPauseResume:
+      OVERRIDE_string(pause_hotkey, name);
+      break;
+    case HotkeyAction::kMute:
+      OVERRIDE_string(mute_hotkey, name);
+      break;
+    default:
+      break;
+  }
+  config::SaveConfig();
+  hotkey_status_ =
+      fmt::format("{} is now {}.", HotkeyActionLabel(action), name);
+  XELOGI("Hotkey: {} set to {}", HotkeyActionLabel(action), name);
+  return true;
+}
+
+void EmulatorWindow::ClearActionHotkey(HotkeyAction action) {
+  action_keys_[int(action)].reset();
+  switch (action) {
+    case HotkeyAction::kPauseResume:
+      OVERRIDE_string(pause_hotkey, "");
+      break;
+    case HotkeyAction::kMute:
+      OVERRIDE_string(mute_hotkey, "");
+      break;
+    default:
+      break;
+  }
+  config::SaveConfig();
+  hotkey_status_ =
+      fmt::format("{} hotkey disabled.", HotkeyActionLabel(action));
+  XELOGI("Hotkey: {} disabled", HotkeyActionLabel(action));
+}
+
+void EmulatorWindow::ToggleKeyboardHotkeysDialog() {
+  if (!keyboard_hotkeys_dialog_) {
+    hotkey_status_.clear();
+    keyboard_hotkeys_dialog_ =
+        std::make_unique<KeyboardHotkeysDialog>(imgui_drawer_.get(), *this);
+  } else {
+    capturing_action_ = -1;
+    if (keyboard_hotkeys_dialog_->IsClosing()) {
+      keyboard_hotkeys_dialog_.release();
+    } else {
+      keyboard_hotkeys_dialog_.reset();
+    }
+  }
+}
+
+void EmulatorWindow::KeyboardHotkeysDialog::OnDraw(ImGuiIO& io) {
+  ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(20, 20), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowBgAlpha(0.85f);
+  bool dialog_open = true;
+  if (!ImGui::Begin(
+          "Keyboard hotkeys", &dialog_open,
+          ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
+    ImGui::End();
+    Close();
+    return;
+  }
+
+  EmulatorWindow& w = emulator_window_;
+  static std::vector<std::string> choices = AssignableHotkeyChoices();
+
+  ImGui::TextUnformatted("Assignable hotkeys");
+  ImGui::Separator();
+  for (int a = 0; a < int(HotkeyAction::kCount); ++a) {
+    HotkeyAction action = HotkeyAction(a);
+    ImGui::PushID(a);
+    std::string current = w.action_keys_[a].has_value()
+                              ? HotkeyName(*w.action_keys_[a])
+                              : "Disabled";
+    ImGui::Text("%s", HotkeyActionLabel(action));
+    ImGui::SetNextItemWidth(140.0f);
+    if (ImGui::BeginCombo("##key", current.c_str())) {
+      for (const auto& choice : choices) {
+        bool selected = choice == current;
+        if (ImGui::Selectable(choice.c_str(), selected)) {
+          w.capturing_action_ = -1;
+          w.SetActionHotkey(action, *ParseHotkeyName(choice));
+        }
+        if (selected) {
+          ImGui::SetItemDefaultFocus();
+        }
+      }
+      ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    if (w.capturing_action_ == a) {
+      if (ImGui::Button("Cancel")) {
+        w.capturing_action_ = -1;
+        w.hotkey_status_.clear();
+      }
+      ImGui::SameLine();
+      ImGui::TextUnformatted("Press the new key now...");
+    } else {
+      if (ImGui::Button("Press a key...")) {
+        w.capturing_action_ = a;
+        w.hotkey_status_.clear();
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Disable")) {
+        w.ClearActionHotkey(action);
+      }
+    }
+    ImGui::PopID();
+  }
+  if (!w.hotkey_status_.empty()) {
+    ImGui::TextUnformatted(w.hotkey_status_.c_str());
+  }
+  ImGui::TextUnformatted(
+      "Changes take effect immediately and are saved to the config file\n"
+      "(pause_hotkey, mute_hotkey). Menu labels update on the next launch.");
+
+  ImGui::Spacing();
+  ImGui::TextUnformatted("Fixed hotkeys");
+  ImGui::Separator();
+  if (ImGui::BeginTable("fixed_hotkeys", 2, ImGuiTableFlags_SizingFixedFit)) {
+    for (const auto& h : kFixedHotkeys) {
+      ImGui::TableNextRow();
+      ImGui::TableSetColumnIndex(0);
+      ImGui::TextUnformatted(h.name);
+      ImGui::TableSetColumnIndex(1);
+      ImGui::TextUnformatted(h.action);
+    }
+    ImGui::EndTable();
+  }
+
+  ImGui::End();
+  if (!dialog_open) {
+    w.capturing_action_ = -1;
+    Close();
+  }
+}
+
+void EmulatorWindow::SetPausedOverlay(bool shown) {
+  if (shown) {
+    if (!paused_overlay_) {
+      paused_overlay_ =
+          std::make_unique<PausedOverlayDialog>(imgui_drawer_.get(), *this);
+    }
+  } else {
+    paused_overlay_.reset();
+  }
+}
+
+void EmulatorWindow::PausedOverlayDialog::OnDraw(ImGuiIO& io) {
+  ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
+  ImGui::SetNextWindowSize(io.DisplaySize);
+  ImGui::SetNextWindowBgAlpha(0.0f);
+  if (!ImGui::Begin("##paused_overlay", nullptr,
+                    ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                        ImGuiWindowFlags_NoSavedSettings |
+                        ImGuiWindowFlags_NoFocusOnAppearing |
+                        ImGuiWindowFlags_NoBringToFrontOnFocus |
+                        ImGuiWindowFlags_NoNav)) {
+    ImGui::End();
+    return;
+  }
+  ImDrawList* draw_list = ImGui::GetWindowDrawList();
+  draw_list->AddRectFilled(ImVec2(0.0f, 0.0f), io.DisplaySize,
+                           IM_COL32(0, 0, 0, 120));
+
+  const char* title = "PAUSED";
+  std::string hint;
+  auto pause_key =
+      emulator_window_.action_key(EmulatorWindow::HotkeyAction::kPauseResume);
+  if (pause_key.has_value()) {
+    hint = "Press " + HotkeyName(*pause_key) +
+           " or use CPU > Pause/Resume Emulation to resume";
+  } else {
+    hint = "Use CPU > Pause/Resume Emulation to resume";
+  }
+
+  const float title_scale = 3.0f;
+  ImGui::SetWindowFontScale(title_scale);
+  ImVec2 title_size = ImGui::CalcTextSize(title);
+  ImGui::SetWindowFontScale(1.0f);
+  ImVec2 hint_size = ImGui::CalcTextSize(hint.c_str());
+  float total_height = title_size.y + 8.0f + hint_size.y;
+  float y = (io.DisplaySize.y - total_height) * 0.5f;
+
+  ImFont* font = ImGui::GetFont();
+  float base_size = ImGui::GetFontSize();
+  ImVec2 title_pos((io.DisplaySize.x - title_size.x) * 0.5f, y);
+  draw_list->AddText(font, base_size * title_scale,
+                     ImVec2(title_pos.x + 2.0f, title_pos.y + 2.0f),
+                     IM_COL32(0, 0, 0, 200), title);
+  draw_list->AddText(font, base_size * title_scale, title_pos,
+                     IM_COL32(255, 255, 255, 255), title);
+  ImVec2 hint_pos((io.DisplaySize.x - hint_size.x) * 0.5f,
+                  y + title_size.y + 8.0f);
+  draw_list->AddText(font, base_size,
+                     ImVec2(hint_pos.x + 1.0f, hint_pos.y + 1.0f),
+                     IM_COL32(0, 0, 0, 200), hint.c_str());
+  draw_list->AddText(font, base_size, hint_pos, IM_COL32(220, 220, 220, 255),
+                     hint.c_str());
+  ImGui::End();
+}
+
+void EmulatorWindow::TogglePauseEmulation() {
+  auto* emu = emulator();
+  if (!emu->is_title_open()) {
+    return;
+  }
+  // Pause() waits for the GPU and audio workers to park and suspends every
+  // guest thread; do it off the UI thread so the window keeps painting.
+  bool pause = !emu->is_paused();
+  std::thread([emu, pause]() {
+    xe::threading::set_name("Pause Toggle");
+    if (pause) {
+      emu->Pause();
+    } else {
+      emu->Resume();
+    }
+  }).detach();
+}
+
+bool EmulatorWindow::HandleAssignableHotkeys(ui::VirtualKey key,
+                                             ui::KeyEvent& e) {
+  if (capturing_action_ >= 0) {
+    if (key != ui::VirtualKey::kEscape) {
+      SetActionHotkey(HotkeyAction(capturing_action_), key);
+    } else {
+      hotkey_status_ = "Cancelled.";
+    }
+    capturing_action_ = -1;
+    e.set_handled(true);
+    return true;
+  }
+  if (e.is_ctrl_pressed() || e.is_alt_pressed()) {
+    return false;
+  }
+  for (int a = 0; a < int(HotkeyAction::kCount); ++a) {
+    if (action_keys_[a].has_value() && *action_keys_[a] == key) {
+      switch (HotkeyAction(a)) {
+        case HotkeyAction::kPauseResume:
+          TogglePauseEmulation();
+          break;
+        case HotkeyAction::kMute:
+          ToggleMute();
+          break;
+        default:
+          break;
+      }
+      e.set_handled(true);
+      return true;
+    }
+  }
+  return false;
+}
+
+void EmulatorWindow::ToggleMute() {
+  xe::apu::SetMuteOverride(!cvars::mute);
+  config::SaveConfig();
+  XELOGI("Audio {}", cvars::mute ? "muted" : "unmuted");
+  UpdateStatusOverlay("Audio");
+}
+
+void EmulatorWindow::OnKeyChar(ui::KeyEvent& e) {
+  if (!emulator_initialized_ || disable_hotkeys_) {
+    return;
+  }
+  // On GTK the virtual key of a char event is the Unicode code point.
+  uint32_t c = uint32_t(e.virtual_key());
+  ui::VirtualKey key;
+  if (c >= 'a' && c <= 'z') {
+    key = ui::VirtualKey(uint16_t(ui::VirtualKey::kA) + (c - 'a'));
+  } else if (c >= 'A' && c <= 'Z') {
+    key = ui::VirtualKey(uint16_t(ui::VirtualKey::kA) + (c - 'A'));
+  } else if (c >= '0' && c <= '9') {
+    key = ui::VirtualKey(uint16_t(ui::VirtualKey::k0) + (c - '0'));
+  } else if (c == ' ') {
+    key = ui::VirtualKey::kSpace;
+  } else if (c == '+' || c == '-' || c == '*') {
+    // Numpad + - * are printable, so they never reach OnKeyDown on GTK.
+    if (c == '+') {
+      CpuTimeScalarSetDouble();
+    } else if (c == '-') {
+      CpuTimeScalarSetHalf();
+    } else {
+      CpuTimeScalarReset();
+    }
+    e.set_handled(true);
+    return;
+  } else {
+    return;
+  }
+  HandleAssignableHotkeys(key, e);
+}
+
 void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
   if (!emulator_initialized_) {
+    return;
+  }
+
+  if (HandleAssignableHotkeys(e.virtual_key(), e)) {
     return;
   }
 
@@ -1590,16 +2146,76 @@ void EmulatorWindow::ShowContentDirectory() {
 void EmulatorWindow::CpuTimeScalarReset() {
   Clock::set_guest_time_scalar(1.0);
   UpdateTitle();
+  UpdateStatusOverlay("Speed");
 }
 
 void EmulatorWindow::CpuTimeScalarSetHalf() {
-  Clock::set_guest_time_scalar(Clock::guest_time_scalar() / 2.0);
+  Clock::set_guest_time_scalar(
+      std::max(1.0 / 16.0, Clock::guest_time_scalar() / 2.0));
   UpdateTitle();
+  UpdateStatusOverlay("Speed");
 }
 
 void EmulatorWindow::CpuTimeScalarSetDouble() {
-  Clock::set_guest_time_scalar(Clock::guest_time_scalar() * 2.0);
+  Clock::set_guest_time_scalar(
+      std::min(16.0, Clock::guest_time_scalar() * 2.0));
   UpdateTitle();
+  UpdateStatusOverlay("Speed");
+}
+
+void EmulatorWindow::UpdateStatusOverlay(const char* notify_title) {
+  double scalar = Clock::guest_time_scalar();
+  bool normal_speed = std::abs(scalar - 1.0) < 1e-9;
+  bool any = !normal_speed || cvars::mute;
+  if (!any) {
+    status_overlay_.reset();
+  } else if (!status_overlay_) {
+    status_overlay_ =
+        std::make_unique<StatusOverlayDialog>(imgui_drawer_.get());
+  }
+  if (notify_title) {
+    std::string text;
+    if (std::string(notify_title) == "Audio") {
+      text = cvars::mute ? "Muted" : "Unmuted";
+    } else {
+      text = normal_speed ? "Normal speed (1.00x)"
+             : scalar > 1.0 ? fmt::format("Fast-forward {:.2f}x", scalar)
+                            : fmt::format("Slow-motion {:.2f}x", scalar);
+    }
+    new xe::ui::HostNotificationWindow(imgui_drawer(), notify_title, text, 0);
+  }
+}
+
+void EmulatorWindow::StatusOverlayDialog::OnDraw(ImGuiIO& io) {
+  double scalar = Clock::guest_time_scalar();
+  bool normal_speed = std::abs(scalar - 1.0) < 1e-9;
+  if (normal_speed && !cvars::mute) {
+    return;
+  }
+  ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f), ImGuiCond_Always);
+  ImGui::SetNextWindowBgAlpha(0.55f);
+  if (ImGui::Begin("##status_overlay", nullptr,
+                   ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                       ImGuiWindowFlags_NoSavedSettings |
+                       ImGuiWindowFlags_AlwaysAutoResize |
+                       ImGuiWindowFlags_NoFocusOnAppearing |
+                       ImGuiWindowFlags_NoBringToFrontOnFocus |
+                       ImGuiWindowFlags_NoNav)) {
+    ImGui::SetWindowFontScale(1.5f);
+    if (!normal_speed) {
+      std::string text =
+          scalar > 1.0 ? fmt::format(">> FAST-FORWARD {:.2f}x", scalar)
+                       : fmt::format("<< SLOW-MOTION {:.2f}x", scalar);
+      ImGui::TextColored(scalar > 1.0 ? ImVec4(1.0f, 0.85f, 0.2f, 1.0f)
+                                      : ImVec4(0.5f, 0.8f, 1.0f, 1.0f),
+                         "%s", text.c_str());
+    }
+    if (cvars::mute) {
+      ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", "MUTED");
+    }
+    ImGui::SetWindowFontScale(1.0f);
+  }
+  ImGui::End();
 }
 
 void EmulatorWindow::CpuBreakIntoDebugger() {

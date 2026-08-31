@@ -7,7 +7,9 @@
  ******************************************************************************
  */
 
+#include <chrono>
 #include <ranges>
+#include <thread>
 
 #include "xenia/emulator.h"
 
@@ -68,6 +70,25 @@
 #include "xenia/cpu/backend/a64/a64_backend.h"
 #endif  // XE_ARCH
 
+DEFINE_int32(
+    savestate_experiment_save_seconds, 0,
+    "Experiment: N seconds after launch, call Emulator::SaveToFile on the "
+    "path in --savestate_experiment_path from a host thread.",
+    "General");
+DEFINE_int32(
+    savestate_experiment_restore_seconds, 0,
+    "Experiment: N seconds after launch, call Emulator::RestoreFromFile on "
+    "the same path. Must be later than the save.",
+    "General");
+DEFINE_string(savestate_experiment_path, "xenia_experiment.sav",
+              "Experiment: save state path.", "General");
+DEFINE_int32(pause_experiment_pause_seconds, 0,
+             "Experiment: N seconds after launch, call Emulator::Pause() "
+             "from a host thread (what the pause hotkey does).",
+             "General");
+DEFINE_int32(pause_experiment_resume_seconds, 0,
+             "Experiment: N seconds after launch, call Emulator::Resume().",
+             "General");
 DEFINE_double(time_scalar, 1.0,
               "Scalar used to speed or slow time (1x, 2x, 1/2x, etc).",
               "General");
@@ -1191,10 +1212,13 @@ void Emulator::Pause() {
 
     if (thread->is_running()) {
       thread->thread()->Suspend(nullptr);
+      paused_threads_.push_back(thread);
     }
   }
 
-  XELOGD("! EMULATOR PAUSED !");
+  XELOGI("! EMULATOR PAUSED ! ({} guest threads suspended)",
+         paused_threads_.size());
+  on_pause_state_changed(true);
 }
 
 void Emulator::Resume() {
@@ -1202,24 +1226,20 @@ void Emulator::Resume() {
     return;
   }
   paused_ = false;
-  XELOGD("! EMULATOR RESUMED !");
 
   graphics_system_->Resume();
   audio_system_->Resume();
 
-  auto threads =
-      kernel_state()->object_table()->GetObjectsByType<kernel::XThread>(
-          kernel::XObject::Type::Thread);
-  for (auto thread : threads) {
-    if (!thread->can_debugger_suspend()) {
-      // Don't pause host threads.
-      continue;
-    }
-
-    if (!thread->is_running()) {
-      thread->thread()->Resume(nullptr);
-    }
+  // Resume exactly the threads Pause() suspended. The previous version
+  // resumed every thread that was *not* running (exited ones) and left the
+  // suspended ones suspended, so the title never came back.
+  for (auto& thread : paused_threads_) {
+    thread->thread()->Resume(nullptr);
   }
+  XELOGI("! EMULATOR RESUMED ! ({} guest threads resumed)",
+         paused_threads_.size());
+  paused_threads_.clear();
+  on_pause_state_changed(false);
 }
 
 bool Emulator::SaveToFile(const std::filesystem::path& path) {
@@ -1827,6 +1847,65 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
   // If the debugger has requested a suspend this will just decrement the
   // suspend count without resuming it until the debugger wants.
   main_thread_->Resume();
+
+  if (cvars::pause_experiment_pause_seconds > 0) {
+    std::thread([this]() {
+      xe::threading::set_name("Pause Experiment");
+      std::this_thread::sleep_for(
+          std::chrono::seconds(cvars::pause_experiment_pause_seconds));
+      auto t0 = std::chrono::steady_clock::now();
+      Pause();
+      XELOGI("PAUSE EXPERIMENT: paused in {} ms",
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - t0)
+                 .count());
+      if (cvars::pause_experiment_resume_seconds >
+          cvars::pause_experiment_pause_seconds) {
+        std::this_thread::sleep_for(
+            std::chrono::seconds(cvars::pause_experiment_resume_seconds -
+                                 cvars::pause_experiment_pause_seconds));
+        t0 = std::chrono::steady_clock::now();
+        Resume();
+        XELOGI("PAUSE EXPERIMENT: resumed in {} ms",
+               std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - t0)
+                   .count());
+      }
+    }).detach();
+  }
+
+  if (cvars::savestate_experiment_save_seconds > 0) {
+    std::thread([this]() {
+      xe::threading::set_name("Savestate Experiment");
+      std::filesystem::path path = cvars::savestate_experiment_path;
+      std::this_thread::sleep_for(
+          std::chrono::seconds(cvars::savestate_experiment_save_seconds));
+      XELOGI("SAVESTATE EXPERIMENT: saving to {}", path.string());
+      auto t0 = std::chrono::steady_clock::now();
+      bool ok = SaveToFile(path);
+      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count();
+      XELOGI("SAVESTATE EXPERIMENT: save {} in {} ms, {} bytes",
+             ok ? "ok" : "FAILED", ms,
+             std::filesystem::exists(path) ? std::filesystem::file_size(path)
+                                           : 0);
+      if (ok && cvars::savestate_experiment_restore_seconds >
+                    cvars::savestate_experiment_save_seconds) {
+        std::this_thread::sleep_for(std::chrono::seconds(
+            cvars::savestate_experiment_restore_seconds -
+            cvars::savestate_experiment_save_seconds));
+        XELOGI("SAVESTATE EXPERIMENT: restoring from {}", path.string());
+        t0 = std::chrono::steady_clock::now();
+        ok = RestoreFromFile(path);
+        ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - t0)
+                 .count();
+        XELOGI("SAVESTATE EXPERIMENT: restore {} in {} ms",
+               ok ? "ok" : "FAILED", ms);
+      }
+    }).detach();
+  }
 
   return X_STATUS_SUCCESS;
 }
