@@ -731,13 +731,29 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
 }
 
 void SDLInputDriver::QueueControllerUpdate() {
+  const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
   // To minimize consecutive event pumps do not queue before previous pump is
   // finished.
   bool is_queued = false;
-  sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);
-  if (!is_queued) {
+  if (!sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true)) {
+    // A pump is already queued. Normally it runs within a frame; if it has
+    // not run for over a second, the UI thread dropped it and the flag
+    // would block controller input for the rest of the process (observed
+    // live: a DualSense dead while the game rendered on, no hidraw reads).
+    // Reclaim the flag and queue a fresh pump; a rare double pump is
+    // harmless, a lost one is not.
+    if (now_ms - pump_queued_at_ms_.load(std::memory_order_relaxed) < 1000) {
+      return;
+    }
+    XELOGW("SDL input: queued event pump never ran; re-queueing");
+  }
+  pump_queued_at_ms_.store(now_ms, std::memory_order_relaxed);
+  {
     auto queued_at = std::chrono::steady_clock::now();
-    window()->app_context().CallInUIThread([this, queued_at]() {
+    bool call_queued = window()->app_context().CallInUIThread([this,
+                                                               queued_at]() {
       auto now = std::chrono::steady_clock::now();
       if (cvars::log_input_latency) {
         // The pump runs on the UI thread; a stall there is invisible input
@@ -765,6 +781,11 @@ void SDLInputDriver::QueueControllerUpdate() {
       SDL_PumpEvents();
       sdl_pumpevents_queued_ = false;
     });
+    if (!call_queued) {
+      // The UI thread refused the call (shutting down, or not pumping):
+      // give the flag back so the next poll can try again.
+      sdl_pumpevents_queued_ = false;
+    }
   }
 }
 

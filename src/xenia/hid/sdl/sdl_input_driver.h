@@ -13,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <mutex>
 #include <optional>
 
@@ -89,6 +90,9 @@ class SDLInputDriver final : public InputDriver {
   std::atomic<bool> sdl_pumpevents_queued_;
   // UI thread only: when the last event pump ran (--log_input_latency).
   std::chrono::steady_clock::time_point last_pump_time_{};
+  // When the pending pump was queued (steady clock, ms); lets a poll reclaim
+  // sdl_pumpevents_queued_ if the queued pump was lost by the UI thread.
+  std::atomic<int64_t> pump_queued_at_ms_{0};
   std::array<ControllerState, HID_SDL_USER_COUNT> controllers_;
   std::array<KeystrokeState, HID_SDL_USER_COUNT> keystroke_states_;
 };
