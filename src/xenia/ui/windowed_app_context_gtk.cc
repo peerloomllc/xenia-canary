@@ -31,8 +31,13 @@ void GTKWindowedAppContext::NotifyUILoopOfPendingFunctions() {
   std::lock_guard<std::mutex> pending_functions_idle_pending_lock(
       pending_functions_idle_pending_mutex_);
   if (!pending_functions_idle_pending_) {
-    pending_functions_idle_pending_ =
-        gdk_threads_add_idle(PendingFunctionsSourceFunc, this);
+    // At event priority, not idle: GTK redraws (G_PRIORITY_HIGH_IDLE + 20)
+    // outrank idle sources, so on a GPU-bound title the loop is never idle
+    // and idle-priority pending functions starve for seconds to forever.
+    // The SDL controller event pump is queued through here - at idle
+    // priority, input froze whenever the GPU was saturated.
+    pending_functions_idle_pending_ = gdk_threads_add_idle_full(
+        G_PRIORITY_DEFAULT, PendingFunctionsSourceFunc, this, nullptr);
   }
 }
 
