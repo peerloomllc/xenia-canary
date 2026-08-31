@@ -6178,6 +6178,9 @@ void EmulatorWindow::ToggleSettingsWindow() {
              cvars::render_target_path_vulkan, [](const std::string& v) {
                SetGpuOption<std::string>("render_target_path_vulkan", v);
              });
+    AddCheck(grid, row,
+             "Skip copying unchanged screen regions (experimental; relaunch)",
+             "dirty_region_tracking", cvars::dirty_region_tracking);
     AddCheck(grid, row, "Sparse shared memory (Vulkan; relaunch)",
              "vulkan_sparse_shared_memory", cvars::vulkan_sparse_shared_memory);
     AddSpin(grid, row, "Pipeline creation threads (-1 = automatic; relaunch)",
