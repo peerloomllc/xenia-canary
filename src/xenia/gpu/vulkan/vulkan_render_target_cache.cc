@@ -4791,17 +4791,23 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
               break;
             }
           }
+          // A host depth source that is the destination itself is harmless
+          // for bounding: the round trip is identity for untouched data by
+          // design, so an empty-union copy would reproduce the destination's
+          // current contents exactly.
+          bool transfer_foreign_host_depth =
+              transfer.host_depth_source != nullptr &&
+              transfer.host_depth_source != render_targets[i];
           if (pair) {
             pair->start_tiles = std::min(pair->start_tiles,
                                          transfer.start_tiles);
             pair->end_tiles = std::max(pair->end_tiles, transfer.end_tiles);
-            pair->host_depth_involved |= transfer.host_depth_source != nullptr;
+            pair->host_depth_involved |= transfer_foreign_host_depth;
           } else {
             dirty_box_pairs.push_back({render_targets[i], transfer.source,
                                        transfer.start_tiles,
                                        transfer.end_tiles,
-                                       transfer.host_depth_source != nullptr,
-                                       false});
+                                       transfer_foreign_host_depth, false});
           }
         }
       }
@@ -4809,17 +4815,36 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         if (pair.host_depth_involved) {
           continue;
         }
+        const char* pair_gate = "no_record";
         for (const RenderTarget::PairSync& pair_sync :
              pair.dest->pair_syncs) {
-          if (pair_sync.valid && pair_sync.peer == pair.source->key() &&
-              pair_sync.start_tiles <= pair.start_tiles &&
-              pair_sync.end_tiles >= pair.end_tiles &&
-              pair_sync.self_epoch == pair.dest->box_epoch() &&
-              pair_sync.peer_epoch == pair.source->box_epoch()) {
+          if (pair_sync.valid && pair_sync.peer == pair.source->key()) {
+            if (pair_sync.start_tiles > pair.start_tiles ||
+                pair_sync.end_tiles < pair.end_tiles) {
+              pair_gate = "range";
+              continue;
+            }
+            if (pair_sync.self_epoch != pair.dest->box_epoch() ||
+                pair_sync.peer_epoch != pair.source->box_epoch()) {
+              pair_gate = "stale_epoch";
+              continue;
+            }
             pair.was_eligible = true;
             stats_transfer_bounded_eligible_.fetch_add(
                 1, std::memory_order_relaxed);
             break;
+          }
+        }
+        if (!pair.was_eligible && cvars::log_rt_transfer_map) {
+          static std::atomic<uint32_t> ineligible_log_budget{40};
+          if (ineligible_log_budget.fetch_sub(1, std::memory_order_relaxed) >
+              0) {
+            XELOGI(
+                "Pair not eligible ({}): source slot {} epoch {} -> dest "
+                "slot {} epoch {} tiles [{}, {})",
+                pair_gate, pair.source->dirty_bbox_slot(),
+                pair.source->box_epoch(), pair.dest->dirty_bbox_slot(),
+                pair.dest->box_epoch(), pair.start_tiles, pair.end_tiles);
           }
         }
       }
@@ -5893,12 +5918,16 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         }
       }
     }
-    bool record_syncs = !resolve_clear_needed;
     for (const DirtyBoxPair& pair : dirty_box_pairs) {
+      // After the copy the pair is identical on the range except where later
+      // divergence lands in the boxes. A resolve clear in this same call
+      // rewrites part of the destination behind the boxes' backs, so the
+      // destination box is set to fully dirty instead of empty - the record
+      // stays valid and the next copy is simply unbounded.
       reset_command_buffer.CmdVkFillBuffer(
           dirty_bbox_buffer,
           VkDeviceSize(pair.dest->dirty_bbox_slot()) * (sizeof(uint32_t) * 4),
-          sizeof(uint32_t) * 4, 0);
+          sizeof(uint32_t) * 4, resolve_clear_needed ? 0xFFFFu : 0u);
       reset_command_buffer.CmdVkFillBuffer(
           dirty_bbox_buffer,
           VkDeviceSize(pair.source->dirty_bbox_slot()) *
@@ -5906,9 +5935,6 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
           sizeof(uint32_t) * 4, 0);
       pair.dest->set_box_epoch(NextDirtyBoxEpoch());
       pair.source->set_box_epoch(NextDirtyBoxEpoch());
-      if (!record_syncs) {
-        continue;
-      }
       auto put_sync = [&](RenderTarget& record_holder, RenderTarget& peer) {
         for (RenderTarget::PairSync& pair_sync : record_holder.pair_syncs) {
           if (pair_sync.valid && pair_sync.peer == peer.key() &&
