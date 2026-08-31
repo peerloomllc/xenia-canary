@@ -1795,7 +1795,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
             frontbuffer_height_scaled;
         render_pass_begin_info.clearValueCount = 0;
         render_pass_begin_info.pClearValues = nullptr;
-        deferred_command_buffer_.CmdVkBeginRenderPass(
+        stats_render_pass_count_.fetch_add(1, std::memory_order_relaxed);
+  deferred_command_buffer_.CmdVkBeginRenderPass(
             &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
         current_render_pass_ = swap_apply_gamma_render_pass_;
         current_framebuffer_ =
@@ -2092,6 +2093,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   render_pass_begin_info.renderArea.extent = framebuffer->host_extent;
   render_pass_begin_info.clearValueCount = 0;
   render_pass_begin_info.pClearValues = nullptr;
+  stats_render_pass_count_.fetch_add(1, std::memory_order_relaxed);
   deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
                                                 VK_SUBPASS_CONTENTS_INLINE);
 
@@ -2468,6 +2470,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
                                        uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
+  stats_draw_count_.fetch_add(1, std::memory_order_relaxed);
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES

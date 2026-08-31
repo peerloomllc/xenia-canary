@@ -1124,6 +1124,13 @@ bool VulkanRenderTargetCache::Resolve(
     return true;
   }
 
+  stats_resolve_count_.fetch_add(1, std::memory_order_relaxed);
+  stats_resolve_pixels_.fetch_add(
+      uint64_t(resolve_info.coordinate_info.width_div_8) * 8 *
+          resolve_info.height_div_8 * 8 * draw_resolution_scale_x() *
+          draw_resolution_scale_y(),
+      std::memory_order_relaxed);
+
   const ui::vulkan::VulkanDevice* const vulkan_device =
       command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -4642,6 +4649,17 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
     const uint64_t* render_target_resolve_clear_values,
     const Transfer::Rectangle* resolve_clear_rectangle) {
   assert_true(GetPath() == Path::kHostRenderTargets);
+
+  if (render_target_transfers) {
+    uint64_t transfer_total = 0;
+    for (uint32_t i = 0; i < render_target_count; ++i) {
+      transfer_total += render_target_transfers[i].size();
+    }
+    if (transfer_total) {
+      stats_transfer_count_.fetch_add(transfer_total,
+                                      std::memory_order_relaxed);
+    }
+  }
 
   const ui::vulkan::VulkanDevice* const vulkan_device =
       command_processor_.GetVulkanDevice();

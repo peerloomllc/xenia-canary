@@ -50,6 +50,7 @@
 #include "xenia/cpu/stack_walker.h"
 #include "xenia/cpu/thread_state.h"
 #include "xenia/gpu/command_processor.h"
+#include "xenia/gpu/render_target_cache.h"
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/hid/input_driver.h"
 #include "xenia/hid/input_system.h"
@@ -2540,6 +2541,8 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
       const int period = cvars::stats_log_seconds;
       uint64_t swaps = 0, audio = 0, silent = 0, xma = 0, cbs = 0,
                starved = 0;
+      uint64_t draws = 0, passes = 0, rtxfers = 0, resolves = 0,
+               resolve_px = 0;
       auto t0 = std::chrono::steady_clock::now();
       while (true) {
         std::this_thread::sleep_for(std::chrono::seconds(period));
@@ -2553,18 +2556,30 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
         uint64_t x = apu::XmaContext::decoded_packet_count_.load();
         uint64_t c = apu::AudioDriver::callback_count_.load();
         uint64_t st = apu::AudioDriver::starved_callback_count_.load();
+        uint64_t d = gpu::CommandProcessor::stats_draw_count_.load();
+        uint64_t rp = gpu::CommandProcessor::stats_render_pass_count_.load();
+        uint64_t tx = gpu::RenderTargetCache::stats_transfer_count_.load();
+        uint64_t rv = gpu::RenderTargetCache::stats_resolve_count_.load();
+        uint64_t rvp = gpu::RenderTargetCache::stats_resolve_pixels_.load();
         double t = std::chrono::duration<double>(
                        std::chrono::steady_clock::now() - t0)
                        .count();
         XELOGI(
             "STATS t={:.0f}s guest={:.1f}s swaps +{} ({:.1f}/s) audio_frames "
             "+{} ({:.1f}/s, {} silent) xma_packets +{} sdl_callbacks +{} "
-            "starved +{}{}",
+            "starved +{} draws +{} passes +{} rt_transfers +{} resolves +{} ({:.1f} MPix){}",
             t,
             double(Clock::QueryGuestTickCount()) / Clock::guest_tick_frequency(),
             s - swaps, double(s - swaps) / period, a - audio,
             double(a - audio) / period, q - silent, x - xma, c - cbs,
-            st - starved, is_title_open() ? "" : " (no title)");
+            st - starved, d - draws, rp - passes, tx - rtxfers,
+            rv - resolves, double(rvp - resolve_px) / 1e6,
+            is_title_open() ? "" : " (no title)");
+        draws = d;
+        passes = rp;
+        rtxfers = tx;
+        resolves = rv;
+        resolve_px = rvp;
         swaps = s;
         audio = a;
         silent = q;

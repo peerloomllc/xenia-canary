@@ -184,6 +184,11 @@ class CommandProcessor {
 
   // Frames presented (guest swaps) since start; --stats_log_seconds.
   uint64_t swap_count() const { return swap_count_.load(); }
+
+  // Draw packets executed and host render passes begun, cumulative, for
+  // --stats_log_seconds.
+  static std::atomic<uint64_t> stats_draw_count_;
+  static std::atomic<uint64_t> stats_render_pass_count_;
   bool is_paused() const { return paused_; }
   // capture_edram: read the EDRAM contents back on the worker thread before
   // it stops, for a save state (CommandProcessor::Save writes them).

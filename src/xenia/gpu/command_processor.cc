@@ -106,6 +106,9 @@ DEFINE_bool(
 namespace xe {
 namespace gpu {
 
+std::atomic<uint64_t> CommandProcessor::stats_draw_count_{0};
+std::atomic<uint64_t> CommandProcessor::stats_render_pass_count_{0};
+
 // This should be written completely differently with support for different
 // types.
 void SaveGPUSetting(GPUSetting setting, uint64_t value) {

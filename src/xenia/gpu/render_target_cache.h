@@ -10,6 +10,7 @@
 #ifndef XENIA_GPU_RENDER_TARGET_CACHE_H_
 #define XENIA_GPU_RENDER_TARGET_CACHE_H_
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -42,6 +43,13 @@ namespace gpu {
 
 class RenderTargetCache {
  public:
+  // GPU workload statistics for --stats_log_seconds, cumulative. Transfers
+  // are ownership moves between host render targets (the main copying cost
+  // of the host-render-target path); resolves are EDRAM-to-memory copies.
+  static std::atomic<uint64_t> stats_transfer_count_;
+  static std::atomic<uint64_t> stats_resolve_count_;
+  static std::atomic<uint64_t> stats_resolve_pixels_;
+
   // High-level emulation logic implementation path.
   enum class Path {
     // Approximate method using conventional host render targets and copying

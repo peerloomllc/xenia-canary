@@ -210,6 +210,10 @@ DEFINE_bool(
 namespace xe {
 namespace gpu {
 
+std::atomic<uint64_t> RenderTargetCache::stats_transfer_count_{0};
+std::atomic<uint64_t> RenderTargetCache::stats_resolve_count_{0};
+std::atomic<uint64_t> RenderTargetCache::stats_resolve_pixels_{0};
+
 void RenderTargetCache::GetPSIColorFormatInfo(
     xenos::ColorRenderTargetFormat format, uint32_t write_mask,
     float& clamp_rgb_low, float& clamp_alpha_low, float& clamp_rgb_high,
