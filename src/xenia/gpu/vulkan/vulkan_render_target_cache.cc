@@ -4995,10 +4995,27 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         uint32_t wanted_seen = 0;
         for (const DirtyBoxPair& pair : dirty_box_pairs) {
           if (probe_wanted(pair) && wanted_seen++ == probe_target) {
+            // The host extent of the destination, to read the box against:
+            // the boxes are in host viewport pixels, and the range copied is
+            // only part of the target's rows.
+            RenderTargetKey probe_dest_key = pair.dest->key();
+            uint32_t probe_dest_width = probe_dest_key.GetWidth() *
+                                        GetKeyScaleX(probe_dest_key);
+            uint32_t probe_dest_height =
+                GetRenderTargetHeight(probe_dest_key.pitch_tiles_at_32bpp,
+                                      probe_dest_key.msaa_samples) *
+                GetKeyScaleY(probe_dest_key);
+            uint32_t probe_range_rows =
+                probe_dest_key.pitch_tiles_at_32bpp
+                    ? (pair.end_tiles - pair.start_tiles) /
+                          probe_dest_key.pitch_tiles_at_32bpp
+                    : 0;
             command_processor_.CaptureDirtyBboxPairProbe(
                 pair.source->dirty_bbox_slot(), pair.dest->dirty_bbox_slot(),
                 pair.was_eligible ? "eligible" : pair.gate, pair.start_tiles,
-                pair.end_tiles);
+                pair.end_tiles, probe_dest_width, probe_dest_height,
+                probe_range_rows * xenos::kEdramTileHeightSamples *
+                    GetKeyScaleY(probe_dest_key));
             break;
           }
         }

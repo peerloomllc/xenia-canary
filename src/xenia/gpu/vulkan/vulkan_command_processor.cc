@@ -4347,11 +4347,10 @@ void VulkanCommandProcessor::CheckSubmissionCompletionAndDeviceLoss(
   }
 }
 
-void VulkanCommandProcessor::CaptureDirtyBboxPairProbe(uint32_t source_slot,
-                                                       uint32_t dest_slot,
-                                                       const char* gate,
-                                                       uint32_t start_tiles,
-                                                       uint32_t end_tiles) {
+void VulkanCommandProcessor::CaptureDirtyBboxPairProbe(
+    uint32_t source_slot, uint32_t dest_slot, const char* gate,
+    uint32_t start_tiles, uint32_t end_tiles, uint32_t dest_width,
+    uint32_t dest_height, uint32_t range_height) {
   if (!dirty_bbox_enabled_ || dirty_bbox_pair_probe_pending_ ||
       dirty_bbox_readback_buffer_ == VK_NULL_HANDLE) {
     return;
@@ -4377,6 +4376,15 @@ void VulkanCommandProcessor::CaptureDirtyBboxPairProbe(uint32_t source_slot,
   dirty_bbox_pair_probe_gate_ = gate;
   dirty_bbox_pair_probe_tiles_[0] = start_tiles;
   dirty_bbox_pair_probe_tiles_[1] = end_tiles;
+  dirty_bbox_pair_probe_dest_extent_[0] = dest_width;
+  dirty_bbox_pair_probe_dest_extent_[1] = dest_height;
+  dirty_bbox_pair_probe_range_height_ = range_height;
+  // The viewport the last box-writing draw used: the space the box is in,
+  // scale * 2 being the extent.
+  dirty_bbox_pair_probe_viewport_[0] =
+      system_constants_.dirty_bbox_px_scale[0] * 2.0f;
+  dirty_bbox_pair_probe_viewport_[1] =
+      system_constants_.dirty_bbox_px_scale[1] * 2.0f;
 }
 
 void VulkanCommandProcessor::StartGpuTimeSubmission() {
@@ -4634,17 +4642,37 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
         probe_empty[probe_i] = probe_min_x[probe_i] > probe_max_x[probe_i] ||
                                probe_min_y[probe_i] > probe_max_y[probe_i];
       }
+      // Union area as a fraction of what the copy has to cover: the
+      // destination's host width by the rows the tile range spans.
+      uint32_t union_min_x = std::min(probe_min_x[0], probe_min_x[1]);
+      uint32_t union_min_y = std::min(probe_min_y[0], probe_min_y[1]);
+      uint32_t union_max_x = std::max(probe_max_x[0], probe_max_x[1]);
+      uint32_t union_max_y = std::max(probe_max_y[0], probe_max_y[1]);
+      double copied_area = double(dirty_bbox_pair_probe_dest_extent_[0]) *
+                           double(dirty_bbox_pair_probe_range_height_);
+      double union_fraction = 0.0;
+      if (!(probe_empty[0] && probe_empty[1]) && copied_area > 0.0) {
+        union_fraction = double(union_max_x - union_min_x + 1) *
+                         double(union_max_y - union_min_y + 1) / copied_area;
+      }
       XELOGI(
           "Dirty bbox pair probe ({}) tiles [{}, {}): source slot {} px x "
           "[{}, {}] y [{}, {}]{} | dest slot {} px x [{}, {}] y [{}, {}]{} | "
-          "union {}",
+          "union {} = {:.1f}% of the copied {}x{} | dest host {}x{} | "
+          "viewport {:.0f}x{:.0f}",
           dirty_bbox_pair_probe_gate_, dirty_bbox_pair_probe_tiles_[0],
           dirty_bbox_pair_probe_tiles_[1], dirty_bbox_pair_probe_slots_[0],
           probe_min_x[0], probe_max_x[0], probe_min_y[0], probe_max_y[0],
           probe_empty[0] ? " EMPTY" : "", dirty_bbox_pair_probe_slots_[1],
           probe_min_x[1], probe_max_x[1], probe_min_y[1], probe_max_y[1],
           probe_empty[1] ? " EMPTY" : "",
-          (probe_empty[0] && probe_empty[1]) ? "EMPTY" : "non-empty");
+          (probe_empty[0] && probe_empty[1]) ? "EMPTY" : "non-empty",
+          union_fraction * 100.0, dirty_bbox_pair_probe_dest_extent_[0],
+          dirty_bbox_pair_probe_range_height_,
+          dirty_bbox_pair_probe_dest_extent_[0],
+          dirty_bbox_pair_probe_dest_extent_[1],
+          dirty_bbox_pair_probe_viewport_[0],
+          dirty_bbox_pair_probe_viewport_[1]);
     }
     if (dirty_bbox_readback_pending_ &&
         completed_submission >= dirty_bbox_readback_submission_) {
