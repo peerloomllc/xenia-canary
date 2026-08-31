@@ -1131,6 +1131,9 @@ bool VulkanRenderTargetCache::Resolve(
     return true;
   }
 
+  VulkanCommandProcessor::GpuTimeRegionScope gpu_time_region_scope(
+      command_processor_, VulkanCommandProcessor::GpuTimeCategory::kResolves);
+
   stats_resolve_count_.fetch_add(1, std::memory_order_relaxed);
   stats_resolve_pixels_.fetch_add(
       uint64_t(resolve_info.coordinate_info.width_div_8) * 8 *
@@ -4700,6 +4703,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       }
     }
   }
+
+  VulkanCommandProcessor::GpuTimeRegionScope gpu_time_region_scope(
+      command_processor_, VulkanCommandProcessor::GpuTimeCategory::kTransfers);
 
   const ui::vulkan::VulkanDevice* const vulkan_device =
       command_processor_.GetVulkanDevice();

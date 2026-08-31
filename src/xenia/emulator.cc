@@ -2543,6 +2543,8 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
                starved = 0;
       uint64_t draws = 0, passes = 0, rtxfers = 0, resolves = 0,
                resolve_px = 0;
+      uint64_t gpu_total_ns = 0, gpu_xfer_ns = 0, gpu_resolve_ns = 0;
+      uint64_t scissor_area = 0;
       auto t0 = std::chrono::steady_clock::now();
       while (true) {
         std::this_thread::sleep_for(std::chrono::seconds(period));
@@ -2561,20 +2563,31 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
         uint64_t tx = gpu::RenderTargetCache::stats_transfer_count_.load();
         uint64_t rv = gpu::RenderTargetCache::stats_resolve_count_.load();
         uint64_t rvp = gpu::RenderTargetCache::stats_resolve_pixels_.load();
+        uint64_t gt = gpu::CommandProcessor::stats_gpu_total_ns_.load();
+        uint64_t gx = gpu::CommandProcessor::stats_gpu_transfer_ns_.load();
+        uint64_t gr = gpu::CommandProcessor::stats_gpu_resolve_ns_.load();
+        uint64_t sca = gpu::CommandProcessor::stats_scissor_area_sum_.load();
         double t = std::chrono::duration<double>(
                        std::chrono::steady_clock::now() - t0)
                        .count();
         XELOGI(
             "STATS t={:.0f}s guest={:.1f}s swaps +{} ({:.1f}/s) audio_frames "
             "+{} ({:.1f}/s, {} silent) xma_packets +{} sdl_callbacks +{} "
-            "starved +{} draws +{} passes +{} rt_transfers +{} resolves +{} ({:.1f} MPix){}",
+            "starved +{} draws +{} passes +{} rt_transfers +{} resolves +{} ({:.1f} MPix) gpu_ms +{:.0f} (xfer {:.0f}, resolve {:.0f}) scissor_kpx/draw {:.0f}{}",
             t,
             double(Clock::QueryGuestTickCount()) / Clock::guest_tick_frequency(),
             s - swaps, double(s - swaps) / period, a - audio,
             double(a - audio) / period, q - silent, x - xma, c - cbs,
             st - starved, d - draws, rp - passes, tx - rtxfers,
             rv - resolves, double(rvp - resolve_px) / 1e6,
+            double(gt - gpu_total_ns) / 1e6, double(gx - gpu_xfer_ns) / 1e6,
+            double(gr - gpu_resolve_ns) / 1e6,
+            (d - draws) ? double(sca - scissor_area) / (d - draws) / 1e3 : 0.0,
             is_title_open() ? "" : " (no title)");
+        scissor_area = sca;
+        gpu_total_ns = gt;
+        gpu_xfer_ns = gx;
+        gpu_resolve_ns = gr;
         draws = d;
         passes = rp;
         rtxfers = tx;

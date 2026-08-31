@@ -60,6 +60,8 @@ class VulkanDevice {
     uint32_t maxImageDimensionCube = 4096;
     uint32_t maxImageArrayLayers = 256;
     uint32_t maxStorageBufferRange = uint32_t(1) << 27;
+    float timestampPeriod = 0.0f;
+    uint32_t timestampComputeAndGraphics = 0;
     uint32_t maxSamplerAllocationCount = 4000;
     uint32_t maxPerStageDescriptorSamplers = 16;
     uint32_t maxPerStageDescriptorStorageBuffers = 4;

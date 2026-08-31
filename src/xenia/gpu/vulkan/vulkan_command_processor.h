@@ -171,7 +171,27 @@ class VulkanCommandProcessor final : public CommandProcessor {
   }
 
   bool submission_open() const { return submission_open_; }
-  uint64_t GetCurrentSubmission() const {
+  // --gpu_time_stats: bracket a GPU-timed region in the current submission's
+  // command stream. Regions must not overlap categories; nested calls are
+  // counted only at the outermost level.
+  enum class GpuTimeCategory : uint8_t {
+    kTransfers = 0,
+    kResolves = 1,
+  };
+  void BeginGpuTimeRegion(GpuTimeCategory category);
+  void EndGpuTimeRegion();
+  struct GpuTimeRegionScope {
+    GpuTimeRegionScope(VulkanCommandProcessor& command_processor,
+                       GpuTimeCategory category)
+        : command_processor_(command_processor) {
+      command_processor_.BeginGpuTimeRegion(category);
+    }
+    ~GpuTimeRegionScope() { command_processor_.EndGpuTimeRegion(); }
+   private:
+    VulkanCommandProcessor& command_processor_;
+  };
+
+    uint64_t GetCurrentSubmission() const {
     return completion_timeline_.GetUpcomingSubmission();
   }
   uint64_t GetCompletedSubmission() const override {
@@ -570,6 +590,32 @@ class VulkanCommandProcessor final : public CommandProcessor {
   std::vector<CommandBuffer> command_buffers_writable_;
   std::deque<std::pair<uint64_t, CommandBuffer>> command_buffers_submitted_;
   DeferredCommandBuffer deferred_command_buffer_;
+
+  // --gpu_time_stats state. A fixed-size chunk of the timestamp query pool is
+  // used per submission: queries base+0 / base+1 bracket the submission,
+  // pairs from base+2 bracket regions. Records wait for submission
+  // completion, then are read back and accumulated into the statics.
+  static constexpr uint32_t kGpuTimePoolQueries = 16384;
+  static constexpr uint32_t kGpuTimeQueriesPerSubmission = 2048;
+  VkQueryPool gpu_time_query_pool_ = VK_NULL_HANDLE;
+  float gpu_time_timestamp_period_ = 0.0f;
+  struct GpuTimeRecord {
+    uint64_t submission;
+    uint32_t base;
+    uint32_t query_count;
+    std::vector<uint8_t> region_categories;
+  };
+  std::deque<GpuTimeRecord> gpu_time_records_;
+  uint32_t gpu_time_pool_cursor_ = 0;
+  bool gpu_time_active_ = false;
+  uint32_t gpu_time_base_ = 0;
+  uint32_t gpu_time_queries_used_ = 0;
+  std::vector<uint8_t> gpu_time_region_categories_;
+  uint32_t gpu_time_region_depth_ = 0;
+  bool gpu_time_region_open_ = false;
+  void StartGpuTimeSubmission();
+  void FinishGpuTimeSubmission();
+  void DrainGpuTimeRecords(uint64_t completed_submission);
 
   std::vector<VkSparseMemoryBind> sparse_memory_binds_;
   std::vector<SparseBufferBind> sparse_buffer_binds_;

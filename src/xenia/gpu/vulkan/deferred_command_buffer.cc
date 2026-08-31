@@ -138,6 +138,12 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                                 args.first_query, args.query_count);
       } break;
 
+      case Command::kVkWriteTimestamp: {
+        auto& args = *reinterpret_cast<const ArgsVkWriteTimestamp*>(stream);
+        dfn.vkCmdWriteTimestamp(command_buffer, args.pipeline_stage,
+                                args.query_pool, args.query);
+      } break;
+
       case Command::kVkClearAttachments: {
         auto& args = *reinterpret_cast<const ArgsVkClearAttachments*>(stream);
         size_t offset_bytes = xe::align(sizeof(ArgsVkClearAttachments),

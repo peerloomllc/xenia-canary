@@ -594,6 +594,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   XE_UI_VULKAN_LIMIT(maxImageDimensionCube)
   XE_UI_VULKAN_LIMIT(maxImageArrayLayers)
   XE_UI_VULKAN_LIMIT(maxStorageBufferRange)
+  XE_UI_VULKAN_LIMIT(timestampPeriod)
+  XE_UI_VULKAN_LIMIT(timestampComputeAndGraphics)
   XE_UI_VULKAN_LIMIT(maxSamplerAllocationCount)
   XE_UI_VULKAN_LIMIT(maxPerStageDescriptorSamplers)
   XE_UI_VULKAN_LIMIT(maxPerStageDescriptorStorageBuffers)

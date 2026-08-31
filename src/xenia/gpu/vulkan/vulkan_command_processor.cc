@@ -36,6 +36,12 @@
 #include "xenia/ui/vulkan/vulkan_presenter.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
 
+DEFINE_bool(gpu_time_stats, false,
+            "Measure GPU time with device timestamps: whole submissions, "
+            "render target ownership transfer regions and resolve regions. "
+            "Cumulative nanoseconds appear on the --stats_log_seconds line.",
+            "GPU");
+
 DECLARE_bool(log_wait_reg_mem);
 DECLARE_bool(clear_memory_page_state);
 DECLARE_bool(readback_resolve_half_pixel_offset);
@@ -239,6 +245,25 @@ bool VulkanCommandProcessor::SetupContext() {
   const VkDevice device = vulkan_device->device();
   const ui::vulkan::VulkanDevice::Properties& device_properties =
       vulkan_device->properties();
+
+  if (cvars::gpu_time_stats) {
+    if (device_properties.timestampComputeAndGraphics &&
+        device_properties.timestampPeriod > 0.0f) {
+      VkQueryPoolCreateInfo query_pool_create_info = {};
+      query_pool_create_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+      query_pool_create_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+      query_pool_create_info.queryCount = kGpuTimePoolQueries;
+      if (dfn.vkCreateQueryPool(device, &query_pool_create_info, nullptr,
+                                &gpu_time_query_pool_) == VK_SUCCESS) {
+        gpu_time_timestamp_period_ = device_properties.timestampPeriod;
+      } else {
+        XELOGW("--gpu_time_stats: failed to create the timestamp query pool");
+        gpu_time_query_pool_ = VK_NULL_HANDLE;
+      }
+    } else {
+      XELOGW("--gpu_time_stats: device timestamps not supported");
+    }
+  }
 
   // The unconditional inclusion of the vertex shader stage also covers the case
   // of manual index / factor buffer fetch (the system constants and the shared
@@ -1268,11 +1293,17 @@ void VulkanCommandProcessor::ShutdownContext() {
   ShutdownZPDQueryResources();
   zpd_host_query_pool_.reset();
 
+  gpu_time_records_.clear();
+  gpu_time_active_ = false;
+
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
   DestroyScratchBuffer();
+
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyQueryPool, device,
+                                         gpu_time_query_pool_);
 
   for (SwapFramebuffer& swap_framebuffer : swap_framebuffers_) {
     ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyFramebuffer, device,
@@ -2471,6 +2502,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
   stats_draw_count_.fetch_add(1, std::memory_order_relaxed);
+  {
+    draw_util::Scissor stats_scissor;
+    draw_util::GetScissor(*register_file_, stats_scissor);
+    stats_scissor_area_sum_.fetch_add(
+        uint64_t(stats_scissor.extent[0]) * stats_scissor.extent[1],
+        std::memory_order_relaxed);
+  }
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -4190,6 +4228,123 @@ void VulkanCommandProcessor::CheckSubmissionCompletionAndDeviceLoss(
   }
 }
 
+void VulkanCommandProcessor::StartGpuTimeSubmission() {
+  gpu_time_active_ = false;
+  if (gpu_time_query_pool_ == VK_NULL_HANDLE) {
+    return;
+  }
+  uint32_t base = gpu_time_pool_cursor_;
+  if (base + kGpuTimeQueriesPerSubmission > kGpuTimePoolQueries) {
+    base = 0;
+  }
+  // Never reuse a chunk a pending record still owns.
+  for (const GpuTimeRecord& record : gpu_time_records_) {
+    if (record.base < base + kGpuTimeQueriesPerSubmission &&
+        base < record.base + kGpuTimeQueriesPerSubmission) {
+      return;
+    }
+  }
+  gpu_time_pool_cursor_ = base + kGpuTimeQueriesPerSubmission;
+  gpu_time_active_ = true;
+  gpu_time_base_ = base;
+  gpu_time_queries_used_ = 2;
+  gpu_time_region_categories_.clear();
+  gpu_time_region_depth_ = 0;
+  gpu_time_region_open_ = false;
+  deferred_command_buffer_.CmdVkResetQueryPool(gpu_time_query_pool_, base,
+                                               kGpuTimeQueriesPerSubmission);
+  deferred_command_buffer_.CmdVkWriteTimestamp(
+      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_time_query_pool_, base);
+}
+
+void VulkanCommandProcessor::FinishGpuTimeSubmission() {
+  if (!gpu_time_active_) {
+    return;
+  }
+  gpu_time_active_ = false;
+  assert_true(gpu_time_region_depth_ == 0);
+  deferred_command_buffer_.CmdVkWriteTimestamp(
+      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_time_query_pool_,
+      gpu_time_base_ + 1);
+  GpuTimeRecord& record = gpu_time_records_.emplace_back();
+  record.submission = GetCurrentSubmission();
+  record.base = gpu_time_base_;
+  record.query_count = gpu_time_queries_used_;
+  record.region_categories = std::move(gpu_time_region_categories_);
+}
+
+void VulkanCommandProcessor::DrainGpuTimeRecords(
+    uint64_t completed_submission) {
+  if (gpu_time_records_.empty()) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  while (!gpu_time_records_.empty() &&
+         gpu_time_records_.front().submission <= completed_submission) {
+    const GpuTimeRecord& record = gpu_time_records_.front();
+    uint64_t results[kGpuTimeQueriesPerSubmission];
+    if (dfn.vkGetQueryPoolResults(
+            device, gpu_time_query_pool_, record.base, record.query_count,
+            sizeof(uint64_t) * record.query_count, results, sizeof(uint64_t),
+            VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+      double period = double(gpu_time_timestamp_period_);
+      auto region_ns = [&](uint32_t begin_index, uint32_t end_index) {
+        return uint64_t(
+            std::max(0.0, double(results[end_index] - results[begin_index]) *
+                              period));
+      };
+      stats_gpu_total_ns_.fetch_add(region_ns(0, 1),
+                                    std::memory_order_relaxed);
+      for (size_t i = 0; i < record.region_categories.size(); ++i) {
+        uint32_t begin_index = uint32_t(2 + 2 * i);
+        uint64_t ns = region_ns(begin_index, begin_index + 1);
+        (record.region_categories[i] == uint8_t(GpuTimeCategory::kTransfers)
+             ? stats_gpu_transfer_ns_
+             : stats_gpu_resolve_ns_)
+            .fetch_add(ns, std::memory_order_relaxed);
+      }
+    }
+    gpu_time_records_.pop_front();
+  }
+}
+
+void VulkanCommandProcessor::BeginGpuTimeRegion(GpuTimeCategory category) {
+  if (!gpu_time_active_) {
+    return;
+  }
+  if (gpu_time_region_depth_++ != 0) {
+    return;
+  }
+  if (gpu_time_queries_used_ + 2 > kGpuTimeQueriesPerSubmission) {
+    return;
+  }
+  gpu_time_region_open_ = true;
+  gpu_time_region_categories_.push_back(uint8_t(category));
+  deferred_command_buffer_.CmdVkWriteTimestamp(
+      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_time_query_pool_,
+      gpu_time_base_ + gpu_time_queries_used_);
+  ++gpu_time_queries_used_;
+}
+
+void VulkanCommandProcessor::EndGpuTimeRegion() {
+  if (!gpu_time_active_ || gpu_time_region_depth_ == 0) {
+    return;
+  }
+  if (--gpu_time_region_depth_ != 0) {
+    return;
+  }
+  if (!gpu_time_region_open_) {
+    return;
+  }
+  gpu_time_region_open_ = false;
+  deferred_command_buffer_.CmdVkWriteTimestamp(
+      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_time_query_pool_,
+      gpu_time_base_ + gpu_time_queries_used_);
+  ++gpu_time_queries_used_;
+}
+
 bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
@@ -4241,6 +4396,9 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     // the end of the submission (when async pipeline object creation requests
     // are fulfilled).
     deferred_command_buffer_.Reset();
+
+    DrainGpuTimeRecords(completed_submission);
+    StartGpuTimeSubmission();
 
     // Reset cached state of the command buffer.
     dynamic_viewport_update_needed_ = true;
@@ -4496,6 +4654,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       sparse_buffer_binds_.clear();
       sparse_memory_binds_.clear();
     }
+
+    FinishGpuTimeSubmission();
 
     // Can't cross command buffer boundaries. Close the active segment first.
     CloseQuerySegment();

@@ -189,6 +189,16 @@ class CommandProcessor {
   // --stats_log_seconds.
   static std::atomic<uint64_t> stats_draw_count_;
   static std::atomic<uint64_t> stats_render_pass_count_;
+
+  // GPU time attribution (--gpu_time_stats, Vulkan only), cumulative
+  // nanoseconds measured with device timestamps: whole submissions, render
+  // target ownership transfer regions and resolve regions within them.
+  static std::atomic<uint64_t> stats_gpu_total_ns_;
+  static std::atomic<uint64_t> stats_gpu_transfer_ns_;
+  static std::atomic<uint64_t> stats_gpu_resolve_ns_;
+  // Sum of per-draw guest scissor areas in pixels (with stats_draw_count_ as
+  // the divisor): how much of the surface draws could touch at most.
+  static std::atomic<uint64_t> stats_scissor_area_sum_;
   bool is_paused() const { return paused_; }
   // capture_edram: read the EDRAM contents back on the worker thread before
   // it stops, for a save state (CommandProcessor::Save writes them).

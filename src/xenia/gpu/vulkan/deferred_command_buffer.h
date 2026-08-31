@@ -171,6 +171,15 @@ class DeferredCommandBuffer {
     args.query_count = query_count;
   }
 
+  void CmdVkWriteTimestamp(VkPipelineStageFlagBits pipeline_stage,
+                           VkQueryPool query_pool, uint32_t query) {
+    auto& args = *reinterpret_cast<ArgsVkWriteTimestamp*>(WriteCommand(
+        Command::kVkWriteTimestamp, sizeof(ArgsVkWriteTimestamp)));
+    args.pipeline_stage = pipeline_stage;
+    args.query_pool = query_pool;
+    args.query = query;
+  }
+
   void CmdClearAttachmentsEmplace(uint32_t attachment_count,
                                   VkClearAttachment*& attachments_out,
                                   uint32_t rect_count,
@@ -447,6 +456,7 @@ class DeferredCommandBuffer {
     kVkEndQuery,
     kVkCopyQueryPoolResults,
     kVkResetQueryPool,
+    kVkWriteTimestamp,
     kVkClearAttachments,
     kVkClearColorImage,
     kVkCopyBuffer,
@@ -539,6 +549,12 @@ class DeferredCommandBuffer {
     VkQueryPool query_pool;
     uint32_t first_query;
     uint32_t query_count;
+  };
+
+  struct ArgsVkWriteTimestamp {
+    VkPipelineStageFlagBits pipeline_stage;
+    VkQueryPool query_pool;
+    uint32_t query;
   };
 
   struct ArgsVkClearAttachments {
