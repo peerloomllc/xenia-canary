@@ -46,6 +46,17 @@ class RenderTargetCache {
   // GPU workload statistics for --stats_log_seconds, cumulative. Transfers
   // are ownership moves between host render targets (the main copying cost
   // of the host-render-target path); resolves are EDRAM-to-memory copies.
+  // Dirty region tracking bounding box slot count (buffer is 4 uint32 each).
+  static constexpr uint32_t kDirtyBboxSlotCount = 4096;
+
+  // The dirty bounding box slot of the depth / stencil render target the last
+  // Update() bound, or UINT32_MAX.
+  uint32_t last_update_used_depth_dirty_bbox_slot() const {
+    return last_update_used_render_targets_[0]
+               ? last_update_used_render_targets_[0]->dirty_bbox_slot()
+               : UINT32_MAX;
+  }
+
   static std::atomic<uint64_t> stats_transfer_count_;
   static std::atomic<uint64_t> stats_resolve_count_;
   static std::atomic<uint64_t> stats_resolve_pixels_;
@@ -369,11 +380,17 @@ class RenderTargetCache {
     RenderTarget& operator=(RenderTarget&& render_target) = delete;
     RenderTargetKey key() const { return key_; }
 
+    // Dirty region tracking: index of this render target's bounding box in
+    // the dirty bbox buffer, assigned at creation.
+    uint32_t dirty_bbox_slot() const { return dirty_bbox_slot_; }
+    void set_dirty_bbox_slot(uint32_t slot) { dirty_bbox_slot_ = slot; }
+
    protected:
     RenderTarget(RenderTargetKey key) : key_(key) {}
 
    private:
     RenderTargetKey key_;
+    uint32_t dirty_bbox_slot_ = UINT32_MAX;
   };
 
   struct Transfer {
@@ -768,6 +785,8 @@ class RenderTargetCache {
   // Only valid for non-pixel-shader-interlock paths.
   RenderTarget*
       last_update_used_render_targets_[1 + xenos::kMaxColorRenderTargets];
+  // Next dirty bounding box slot to assign to a created render target.
+  uint32_t dirty_bbox_next_slot_ = 0;
   // Render targets used by the draw call with the last successful update or
   // previous updates, unless a different or a totally new one was bound (or
   // surface info was changed), to avoid unneeded render target switching (which

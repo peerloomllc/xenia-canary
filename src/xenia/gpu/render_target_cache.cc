@@ -1500,6 +1500,10 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(
     render_target = it_rt->second;
   } else {
     render_target = CreateRenderTarget(key);
+    if (render_target) {
+      render_target->set_dirty_bbox_slot(dirty_bbox_next_slot_);
+      dirty_bbox_next_slot_ = (dirty_bbox_next_slot_ + 1) % kDirtyBboxSlotCount;
+    }
     uint32_t width = key.GetWidth();
     uint32_t height =
         GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples);

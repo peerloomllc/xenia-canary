@@ -36,6 +36,16 @@
 #include "xenia/ui/vulkan/vulkan_presenter.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
 
+DEFINE_bool(dirty_region_tracking, false,
+            "Track the screen-space bounding box every draw's vertices touch "
+            "per render target, on the GPU (host-render-target path only). "
+            "Groundwork for bounded render target ownership transfers.",
+            "GPU");
+DEFINE_bool(log_dirty_bbox, false,
+            "With dirty_region_tracking: periodically read the accumulated "
+            "bounding boxes back and log them for validation.",
+            "GPU");
+
 DEFINE_bool(gpu_time_stats, false,
             "Measure GPU time with device timestamps: whole submissions, "
             "render target ownership transfer regions and resolve regions. "
@@ -501,7 +511,25 @@ bool VulkanCommandProcessor::SetupContext() {
         .pImmutableSamplers = nullptr;
     shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount = 3;
   } else {
-    shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount = 1;
+    dirty_bbox_enabled_ = cvars::dirty_region_tracking &&
+                          device_properties.vertexPipelineStoresAndAtomics;
+    if (dirty_bbox_enabled_) {
+      // Dirty bounding box buffer, written by guest vertex shaders.
+      shared_memory_and_edram_descriptor_set_layout_bindings[1].binding = 1;
+      shared_memory_and_edram_descriptor_set_layout_bindings[1]
+          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      shared_memory_and_edram_descriptor_set_layout_bindings[1]
+          .descriptorCount = 1;
+      shared_memory_and_edram_descriptor_set_layout_bindings[1].stageFlags =
+          guest_shader_vertex_stages_;
+      shared_memory_and_edram_descriptor_set_layout_bindings[1]
+          .pImmutableSamplers = nullptr;
+      shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount =
+          2;
+    } else {
+      shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount =
+          1;
+    }
   }
   if (dfn.vkCreateDescriptorSetLayout(
           device, &shared_memory_and_edram_descriptor_set_layout_create_info,
@@ -549,12 +577,41 @@ bool VulkanCommandProcessor::SetupContext() {
     }
   }
 
+  if (dirty_bbox_enabled_) {
+    const VkDeviceSize dirty_bbox_size =
+        sizeof(uint32_t) * 4 * RenderTargetCache::kDirtyBboxSlotCount;
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device, dirty_bbox_size,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            ui::vulkan::util::MemoryPurpose::kDeviceLocal, dirty_bbox_buffer_,
+            dirty_bbox_buffer_memory_)) {
+      XELOGE("Failed to create the dirty bounding box buffer");
+      return false;
+    }
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device, dirty_bbox_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            ui::vulkan::util::MemoryPurpose::kReadback,
+            dirty_bbox_readback_buffer_, dirty_bbox_readback_buffer_memory_)) {
+      XELOGE("Failed to create the dirty bounding box readback buffer");
+      return false;
+    }
+    if (dfn.vkMapMemory(device, dirty_bbox_readback_buffer_memory_, 0,
+                        VK_WHOLE_SIZE, 0,
+                        &dirty_bbox_readback_mapping_) != VK_SUCCESS) {
+      XELOGE("Failed to map the dirty bounding box readback buffer");
+      return false;
+    }
+  }
+
   // Shared memory, EDRAM, and ZPD FSI counter common bindings.
   VkDescriptorPoolSize descriptor_pool_sizes[1];
   descriptor_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   descriptor_pool_sizes[0].descriptorCount =
       shared_memory_binding_count +
-      2u * uint32_t(edram_fragment_shader_interlock);
+      2u * uint32_t(edram_fragment_shader_interlock) +
+      uint32_t(dirty_bbox_enabled_);
   VkDescriptorPoolCreateInfo descriptor_pool_create_info;
   descriptor_pool_create_info.sType =
       VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -660,9 +717,33 @@ bool VulkanCommandProcessor::SetupContext() {
         &zpd_fsi_counter_descriptor_buffer_info;
     write_descriptor_set_zpd_fsi_counter_init.pTexelBufferView = nullptr;
   }
-  dfn.vkUpdateDescriptorSets(device,
-                             1 + 2 * uint32_t(edram_fragment_shader_interlock),
-                             write_descriptor_sets, 0, nullptr);
+  VkDescriptorBufferInfo dirty_bbox_descriptor_buffer_info;
+  if (dirty_bbox_enabled_) {
+    dirty_bbox_descriptor_buffer_info.buffer = dirty_bbox_buffer_;
+    dirty_bbox_descriptor_buffer_info.offset = 0;
+    dirty_bbox_descriptor_buffer_info.range = VK_WHOLE_SIZE;
+    VkWriteDescriptorSet& write_descriptor_set_dirty_bbox =
+        write_descriptor_sets[1];
+    write_descriptor_set_dirty_bbox.sType =
+        VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write_descriptor_set_dirty_bbox.pNext = nullptr;
+    write_descriptor_set_dirty_bbox.dstSet =
+        shared_memory_and_edram_descriptor_set_;
+    write_descriptor_set_dirty_bbox.dstBinding = 1;
+    write_descriptor_set_dirty_bbox.dstArrayElement = 0;
+    write_descriptor_set_dirty_bbox.descriptorCount = 1;
+    write_descriptor_set_dirty_bbox.descriptorType =
+        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write_descriptor_set_dirty_bbox.pImageInfo = nullptr;
+    write_descriptor_set_dirty_bbox.pBufferInfo =
+        &dirty_bbox_descriptor_buffer_info;
+    write_descriptor_set_dirty_bbox.pTexelBufferView = nullptr;
+  }
+  dfn.vkUpdateDescriptorSets(
+      device,
+      1 + 2 * uint32_t(edram_fragment_shader_interlock) +
+          uint32_t(dirty_bbox_enabled_),
+      write_descriptor_sets, 0, nullptr);
   if (edram_fragment_shader_interlock) {
     zpd_fsi_counter_descriptor_buffer_ = zpd_fsi_counter_sink_buffer_;
     zpd_fsi_counter_descriptor_range_ = zpd_fsi_counter_sink_range;
@@ -1298,6 +1379,7 @@ bool VulkanCommandProcessor::SetupContext() {
   std::memset(&system_constants_, 0, sizeof(system_constants_));
   // ZPD FSI counter uses UINT32_MAX as its skip sentinel outside query draws.
   system_constants_.zpd_fsi_counter_index = UINT32_MAX;
+  system_constants_.dirty_bbox_slot = UINT32_MAX;
   zpd_fsi_counter_index_force_update_ = true;
 
   return true;
@@ -1320,6 +1402,21 @@ void VulkanCommandProcessor::ShutdownContext() {
 
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyQueryPool, device,
                                          gpu_time_query_pool_);
+  if (dirty_bbox_readback_mapping_) {
+    dfn.vkUnmapMemory(device, dirty_bbox_readback_buffer_memory_);
+    dirty_bbox_readback_mapping_ = nullptr;
+  }
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                         dirty_bbox_readback_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                         dirty_bbox_readback_buffer_memory_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                         dirty_bbox_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                         dirty_bbox_buffer_memory_);
+  dirty_bbox_enabled_ = false;
+  dirty_bbox_needs_init_ = true;
+  dirty_bbox_readback_pending_ = false;
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyQueryPool, device,
                                          gpu_stat_query_pool_);
 
@@ -4459,6 +4556,60 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     DrainGpuTimeRecords(completed_submission);
     StartGpuTimeSubmission();
 
+    if (dirty_bbox_enabled_ && dirty_bbox_needs_init_) {
+      const VkPipelineStageFlags dirty_bbox_stages =
+          VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+          ((guest_shader_vertex_stages_ &
+            VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT)
+               ? VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT
+               : 0);
+      dirty_bbox_needs_init_ = false;
+      deferred_command_buffer_.CmdVkFillBuffer(
+          dirty_bbox_buffer_, 0, VK_WHOLE_SIZE, 0);
+      PushBufferMemoryBarrier(
+          dirty_bbox_buffer_, 0, VK_WHOLE_SIZE,
+          VK_PIPELINE_STAGE_TRANSFER_BIT, dirty_bbox_stages,
+          VK_ACCESS_TRANSFER_WRITE_BIT,
+          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    }
+    if (dirty_bbox_readback_pending_ &&
+        completed_submission >= dirty_bbox_readback_submission_) {
+      dirty_bbox_readback_pending_ = false;
+      {
+        const ui::vulkan::VulkanDevice* const vulkan_device_inv =
+            GetVulkanDevice();
+        VkMappedMemoryRange readback_range = {};
+        readback_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        readback_range.memory = dirty_bbox_readback_buffer_memory_;
+        readback_range.offset = 0;
+        readback_range.size = VK_WHOLE_SIZE;
+        vulkan_device_inv->functions().vkInvalidateMappedMemoryRanges(
+            vulkan_device_inv->device(), 1, &readback_range);
+      }
+      const uint32_t* boxes =
+          static_cast<const uint32_t*>(dirty_bbox_readback_mapping_);
+      uint32_t logged = 0;
+      for (uint32_t slot = 0;
+           slot < RenderTargetCache::kDirtyBboxSlotCount && logged < 8;
+           ++slot) {
+        const uint32_t* box = boxes + size_t(slot) * 4;
+        if (!(box[0] | box[1] | box[2] | box[3])) {
+          continue;
+        }
+        float min_x = (65535 - std::min<uint32_t>(box[0], 65535)) / 655.35f;
+        float min_y = (65535 - std::min<uint32_t>(box[1], 65535)) / 655.35f;
+        float max_x = std::min<uint32_t>(box[2], 65535) / 655.35f;
+        float max_y = std::min<uint32_t>(box[3], 65535) / 655.35f;
+        ++logged;
+        XELOGI(
+            "Dirty bbox slot {}: x [{:.1f}%, {:.1f}%] y [{:.1f}%, {:.1f}%] "
+            "area {:.1f}%",
+            slot, min_x, min_y, max_x, max_y,
+            std::max(0.0f, (max_x - min_x)) * std::max(0.0f, (max_y - min_y)) /
+                100.0f);
+      }
+    }
+
     // Reset cached state of the command buffer.
     dynamic_viewport_update_needed_ = true;
     dynamic_scissor_update_needed_ = true;
@@ -4715,6 +4866,45 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     }
 
     FinishGpuTimeSubmission();
+
+    if (dirty_bbox_enabled_ && !dirty_bbox_needs_init_) {
+      const VkPipelineStageFlags dirty_bbox_stages =
+          VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+          ((guest_shader_vertex_stages_ &
+            VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT)
+               ? VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT
+               : 0);
+      EndRenderPass();
+      ++dirty_bbox_frame_counter_;
+      const VkDeviceSize dirty_bbox_size =
+          sizeof(uint32_t) * 4 * RenderTargetCache::kDirtyBboxSlotCount;
+      PushBufferMemoryBarrier(
+          dirty_bbox_buffer_, 0, VK_WHOLE_SIZE,
+          dirty_bbox_stages, VK_PIPELINE_STAGE_TRANSFER_BIT,
+          VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT |
+                                          VK_ACCESS_TRANSFER_READ_BIT);
+      SubmitBarriers(true);
+      if (cvars::log_dirty_bbox && !dirty_bbox_readback_pending_ &&
+          (dirty_bbox_frame_counter_ % 300) == 0) {
+        VkBufferCopy dirty_bbox_copy;
+        dirty_bbox_copy.srcOffset = 0;
+        dirty_bbox_copy.dstOffset = 0;
+        dirty_bbox_copy.size = dirty_bbox_size;
+        deferred_command_buffer_.CmdVkCopyBuffer(
+            dirty_bbox_buffer_, dirty_bbox_readback_buffer_, 1,
+            &dirty_bbox_copy);
+        dirty_bbox_readback_pending_ = true;
+        dirty_bbox_readback_submission_ = GetCurrentSubmission();
+      }
+      // Reset all boxes to empty for the next frame.
+      deferred_command_buffer_.CmdVkFillBuffer(dirty_bbox_buffer_, 0,
+                                               VK_WHOLE_SIZE, 0);
+      PushBufferMemoryBarrier(
+          dirty_bbox_buffer_, 0, VK_WHOLE_SIZE,
+          VK_PIPELINE_STAGE_TRANSFER_BIT, dirty_bbox_stages,
+          VK_ACCESS_TRANSFER_WRITE_BIT,
+          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    }
 
     // Can't cross command buffer boundaries. Close the active segment first.
     CloseQuerySegment();
@@ -5479,6 +5669,15 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
            system_constants_.zpd_fsi_counter_index != zpd_fsi_counter_index;
   system_constants_.zpd_fsi_counter_index = zpd_fsi_counter_index;
   zpd_fsi_counter_index_force_update_ = false;
+
+  // Dirty region tracking: the bounding box slot of the bound depth / stencil
+  // render target (depth only in the first stage).
+  uint32_t dirty_bbox_slot =
+      dirty_bbox_enabled_
+          ? render_target_cache_->last_update_used_depth_dirty_bbox_slot()
+          : UINT32_MAX;
+  dirty |= system_constants_.dirty_bbox_slot != dirty_bbox_slot;
+  system_constants_.dirty_bbox_slot = dirty_bbox_slot;
 
   uint32_t edram_tile_dwords_scaled =
       xenos::kEdramTileWidthSamples * xenos::kEdramTileHeightSamples *

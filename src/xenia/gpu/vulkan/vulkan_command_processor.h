@@ -597,6 +597,22 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // completion, then are read back and accumulated into the statics.
   static constexpr uint32_t kGpuTimePoolQueries = 16384;
   static constexpr uint32_t kGpuTimeQueriesPerSubmission = 2048;
+  // Dirty region tracking (--dirty_region_tracking): a device-local buffer of
+  // RenderTargetCache::kDirtyBboxSlotCount bounding boxes (4 uint32 each,
+  // inverted min x/y then max x/y, accumulated with atomic max by translated
+  // vertex shaders), zero-filled at the end of every frame. Validation
+  // readback for --log_dirty_bbox.
+  bool dirty_bbox_enabled_ = false;
+  bool dirty_bbox_needs_init_ = true;
+  VkBuffer dirty_bbox_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory dirty_bbox_buffer_memory_ = VK_NULL_HANDLE;
+  VkBuffer dirty_bbox_readback_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory dirty_bbox_readback_buffer_memory_ = VK_NULL_HANDLE;
+  void* dirty_bbox_readback_mapping_ = nullptr;
+  uint64_t dirty_bbox_readback_submission_ = 0;
+  bool dirty_bbox_readback_pending_ = false;
+  uint64_t dirty_bbox_frame_counter_ = 0;
+
   VkQueryPool gpu_time_query_pool_ = VK_NULL_HANDLE;
   static constexpr uint32_t kGpuStatPoolQueries = 64;
   VkQueryPool gpu_stat_query_pool_ = VK_NULL_HANDLE;

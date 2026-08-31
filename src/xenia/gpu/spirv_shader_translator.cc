@@ -307,6 +307,8 @@ void SpirvShaderTranslator::StartTranslation() {
       {"alpha_to_mask", offsetof(SystemConstants, alpha_to_mask), type_uint_},
       {"zpd_fsi_counter_index",
        offsetof(SystemConstants, zpd_fsi_counter_index), type_uint_},
+      {"dirty_bbox_slot", offsetof(SystemConstants, dirty_bbox_slot),
+       type_uint_},
       {"color_exp_bias", offsetof(SystemConstants, color_exp_bias),
        type_float4_},
       {"edram_poly_offset_front_scale",
@@ -1289,6 +1291,38 @@ void SpirvShaderTranslator::EnsureBuildPointAvailable() {
 }
 
 void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
+  if (features_.dirty_bbox_vertex_binding != UINT32_MAX &&
+      features_.vertex_pipeline_stores_and_atomics) {
+    // Dirty bounding box buffer uint[] (4 per slot: inverted min x, inverted
+    // min y, max x, max y - all accumulated with atomic max so a zero fill
+    // resets the whole buffer).
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(builder_->makeRuntimeArray(type_uint_));
+    builder_->addDecoration(id_vector_temp_.back(), spv::DecorationArrayStride,
+                            sizeof(uint32_t));
+    spv::Id type_dirty_bbox =
+        builder_->makeStructType(id_vector_temp_, "XeDirtyBbox");
+    builder_->addMemberName(type_dirty_bbox, 0, "bbox");
+    builder_->addMemberDecoration(type_dirty_bbox, 0, spv::DecorationCoherent);
+    builder_->addMemberDecoration(type_dirty_bbox, 0, spv::DecorationRestrict);
+    builder_->addMemberDecoration(type_dirty_bbox, 0, spv::DecorationOffset, 0);
+    builder_->addDecoration(type_dirty_bbox,
+                            features_.spirv_version >= spv::Spv_1_3
+                                ? spv::DecorationBlock
+                                : spv::DecorationBufferBlock);
+    buffer_dirty_bbox_ = builder_->createVariable(
+        spv::NoPrecision,
+        features_.spirv_version >= spv::Spv_1_3 ? spv::StorageClassStorageBuffer
+                                                : spv::StorageClassUniform,
+        type_dirty_bbox, "xe_dirty_bbox");
+    builder_->addDecoration(buffer_dirty_bbox_, spv::DecorationDescriptorSet,
+                            int(kDescriptorSetSharedMemoryAndEdram));
+    builder_->addDecoration(buffer_dirty_bbox_, spv::DecorationBinding,
+                            int(features_.dirty_bbox_vertex_binding));
+    if (features_.spirv_version >= spv::Spv_1_4) {
+      main_interface_.push_back(buffer_dirty_bbox_);
+    }
+  }
   // Create the inputs.
   if (IsSpirvTessEvalShader()) {
     // Per-control-point index input from the hull shader, mirroring the control
@@ -2306,6 +2340,97 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
     }
     builder_->createStore(position, position_ptr);
   }
+
+  if (buffer_dirty_bbox_ != spv::NoResult) {
+    CompleteVertexShaderDirtyBbox(position_ptr);
+  }
+}
+
+void SpirvShaderTranslator::CompleteVertexShaderDirtyBbox(
+    spv::Id position_ptr) {
+  // Nothing to do when the slot constant is UINT32_MAX (no tracked render
+  // target bound for this draw).
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(
+      builder_->makeIntConstant(kSystemConstantDirtyBboxSlot));
+  spv::Id slot = builder_->createLoad(
+      builder_->createAccessChain(spv::StorageClassUniform,
+                                  uniform_system_constants_, id_vector_temp_),
+      spv::NoPrecision);
+  SpirvBuilder::IfBuilder if_slot_valid(
+      builder_->createBinOp(spv::OpINotEqual, type_bool_, slot,
+                            builder_->makeUintConstant(UINT32_MAX)),
+      spv::SelectionControlDontFlattenMask, *builder_);
+
+  spv::Id position = builder_->createLoad(position_ptr, spv::NoPrecision);
+  spv::Id position_w =
+      builder_->createCompositeExtract(position, type_float_, 3);
+  // A vertex behind the eye (or with an untrustworthy W) marks the whole
+  // surface dirty - conservative, never incorrect.
+  spv::Id w_usable = builder_->createBinOp(
+      spv::OpFOrdGreaterThan, type_bool_, position_w,
+      builder_->makeFloatConstant(1e-8f));
+  spv::Id inv_w = builder_->createNoContractionBinOp(
+      spv::OpFDiv, type_float_, const_float_1_, position_w);
+  spv::Id const_uint_65535 = builder_->makeUintConstant(65535);
+  spv::Id quantized[2];
+  for (uint32_t axis = 0; axis < 2; ++axis) {
+    spv::Id ndc = builder_->createNoContractionBinOp(
+        spv::OpFMul, type_float_,
+        builder_->createCompositeExtract(position, type_float_, axis), inv_w);
+    // [-1, 1] -> [0, 1], clamped.
+    spv::Id unorm = builder_->createTriBuiltinCall(
+        type_float_, ext_inst_glsl_std_450_, GLSLstd450NClamp,
+        builder_->createNoContractionBinOp(
+            spv::OpFAdd, type_float_,
+            builder_->createNoContractionBinOp(
+                spv::OpFMul, type_float_, ndc,
+                builder_->makeFloatConstant(0.5f)),
+            builder_->makeFloatConstant(0.5f)),
+        const_float_0_, const_float_1_);
+    quantized[axis] = builder_->createUnaryOp(
+        spv::OpConvertFToU, type_uint_,
+        builder_->createNoContractionBinOp(
+            spv::OpFMul, type_float_, unorm,
+            builder_->makeFloatConstant(65535.0f)));
+  }
+  // Four atomic max values: inverted minimums first (so a zeroed buffer means
+  // an empty box), then maximums.
+  spv::Id values[4];
+  for (uint32_t axis = 0; axis < 2; ++axis) {
+    values[axis] = builder_->createTriOp(
+        spv::OpSelect, type_uint_, w_usable,
+        builder_->createBinOp(spv::OpISub, type_uint_, const_uint_65535,
+                              quantized[axis]),
+        const_uint_65535);
+    values[2 + axis] = builder_->createTriOp(spv::OpSelect, type_uint_,
+                                             w_usable, quantized[axis],
+                                             const_uint_65535);
+  }
+  spv::StorageClass storage_class = features_.spirv_version >= spv::Spv_1_3
+                                        ? spv::StorageClassStorageBuffer
+                                        : spv::StorageClassUniform;
+  spv::Id const_scope_device =
+      builder_->makeUintConstant(static_cast<unsigned int>(spv::ScopeDevice));
+  spv::Id const_semantics_relaxed = const_uint_0_;
+  spv::Id slot_base = builder_->createBinOp(
+      spv::OpIMul, type_uint_, slot, builder_->makeUintConstant(4));
+  for (uint32_t component = 0; component < 4; ++component) {
+    spv::Id element_index = builder_->createBinOp(
+        spv::OpIAdd, type_uint_, slot_base,
+        builder_->makeUintConstant(component));
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(const_int_0_);
+    id_vector_temp_.push_back(
+        builder_->createUnaryOp(spv::OpBitcast, type_int_, element_index));
+    spv::Id element_ptr = builder_->createAccessChain(
+        storage_class, buffer_dirty_bbox_, id_vector_temp_);
+    builder_->createQuadOp(spv::OpAtomicUMax, type_uint_, element_ptr,
+                           const_scope_device, const_semantics_relaxed,
+                           values[component]);
+  }
+
+  if_slot_valid.makeEndIf();
 }
 
 void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {

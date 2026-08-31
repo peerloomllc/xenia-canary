@@ -258,8 +258,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // UINT32_MAX when the draw is outside an active ZPD segment, which is used
     // as a skip writing sentinel to the FSI counter buffer.
     uint32_t zpd_fsi_counter_index;
+    // Slot in the dirty bounding box buffer written by vertex shaders when
+    // dirty region tracking is enabled; UINT32_MAX to not write.
+    uint32_t dirty_bbox_slot;
     // Align for std140.
-    uint32_t color_exp_bias_padding[2];
+    uint32_t color_exp_bias_padding;
 
     float color_exp_bias[4];
 
@@ -426,6 +429,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
     bool rounding_mode_rte_float32;
 
     bool fragment_shader_sample_interlock;
+
+    // kDescriptorSetSharedMemoryAndEdram binding index of the dirty bounding
+    // box buffer written by vertex shaders (dirty region tracking), or
+    // UINT32_MAX when not used.
+    uint32_t dirty_bbox_vertex_binding = UINT32_MAX;
 
     bool demote_to_helper_invocation;
   };
@@ -656,6 +664,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   void StartVertexOrTessEvalShaderBeforeMain();
   void StartVertexOrTessEvalShaderInMain();
   void CompleteVertexOrTessEvalShaderInMain();
+  // Dirty region tracking: accumulate the vertex position into the bound
+  // render target dirty bounding box slot.
+  void CompleteVertexShaderDirtyBbox(spv::Id position_ptr);
 
   void StartFragmentShaderBeforeMain();
   void StartFragmentShaderInMain();
@@ -997,6 +1008,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdramDepthBaseDwordsScaled,
     kSystemConstantAlphaToMask,
     kSystemConstantZpdFsiCounterIndex,
+    kSystemConstantDirtyBboxSlot,
     kSystemConstantColorExpBias,
     kSystemConstantEdramPolyOffsetFrontScale,
     kSystemConstantEdramPolyOffsetBackScale,
@@ -1023,6 +1035,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id buffers_shared_memory_;
   spv::Id buffer_edram_;
   spv::Id buffer_zpd_fsi_counter_;
+  spv::Id buffer_dirty_bbox_ = spv::NoResult;
 
   // Not using combined images and samplers because
   // maxPerStageDescriptorSamplers is often lower than

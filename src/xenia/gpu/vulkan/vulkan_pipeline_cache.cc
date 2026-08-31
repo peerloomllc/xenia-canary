@@ -62,6 +62,8 @@ DEFINE_int32(
 
 DECLARE_bool(spirv_disable_rounding_mode_rte);
 
+DECLARE_bool(dirty_region_tracking);
+
 namespace xe {
 namespace gpu {
 namespace vulkan {
@@ -87,7 +89,11 @@ bool VulkanPipelineCache::Initialize() {
       RenderTargetCache::Path::kPixelShaderInterlock;
 
   // Cache device float control features for geometry shader creation.
-  const SpirvShaderTranslator::Features features(vulkan_device);
+  SpirvShaderTranslator::Features features(vulkan_device);
+  if (!edram_fragment_shader_interlock && cvars::dirty_region_tracking &&
+      features.vertex_pipeline_stores_and_atomics) {
+    features.dirty_bbox_vertex_binding = 1;
+  }
   signed_zero_inf_nan_preserve_float32_ =
       features.signed_zero_inf_nan_preserve_float32;
   denorm_flush_to_zero_float32_ = features.denorm_flush_to_zero_float32;
@@ -1048,8 +1054,13 @@ void VulkanPipelineCache::TranslateShadersForStorage(
                              msaa_2x_attachments, msaa_2x_no_attachments,
                              edram_fsi_used, draw_res_x, draw_res_y]() {
     // Each thread needs its own translator.
+    SpirvShaderTranslator::Features thread_features(vulkan_device);
+    if (!edram_fsi_used && cvars::dirty_region_tracking &&
+        thread_features.vertex_pipeline_stores_and_atomics) {
+      thread_features.dirty_bbox_vertex_binding = 1;
+    }
     SpirvShaderTranslator translator(
-        SpirvShaderTranslator::Features(vulkan_device), msaa_2x_attachments,
+        thread_features, msaa_2x_attachments,
         msaa_2x_no_attachments, edram_fsi_used, draw_res_x, draw_res_y);
 
     while (true) {
