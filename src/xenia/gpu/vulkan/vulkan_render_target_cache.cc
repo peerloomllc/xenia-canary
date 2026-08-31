@@ -46,6 +46,14 @@ DEFINE_bool(
     "each transfer costs.",
     "GPU");
 
+DEFINE_bool(
+    dirty_region_partial_transfers, true,
+    "With dirty_region_tracking, clamp a render target ownership transfer to "
+    "the region dirtied since the two targets were last in sync, instead of "
+    "only skipping the copy when nothing was dirtied at all. Off falls back "
+    "to the whole-copy-or-nothing behaviour.",
+    "GPU");
+
 DEFINE_string(
     render_target_path_vulkan, "",
     "Render target emulation path to use on Vulkan.\n"
@@ -687,7 +695,7 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
         transfer_pipeline_layout_infos_runtime_[i].used_descriptor_sets |=
             kTransferUsedDescriptorSetDirtyBboxBit;
         transfer_pipeline_layout_infos_runtime_[i].used_push_constant_dwords |=
-            kTransferUsedPushConstantDwordBoundedSlotsBit;
+            kTransferUsedPushConstantDwordBoundedBits;
       }
     }
     if (dirty_bbox_transfers_enabled_) {
@@ -5317,7 +5325,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
   VkDescriptorSet last_descriptor_set_color_texture = VK_NULL_HANDLE;
   TransferAddressConstant last_host_depth_address_constant;
   TransferAddressConstant last_address_constant;
-  uint32_t last_bounded_slots_constant = UINT32_MAX;
+  TransferBoundedConstant last_bounded_constant;
   VkShaderStageFlags transfer_push_constant_stages =
       dirty_bbox_transfers_enabled_
           ? (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
@@ -5808,24 +5816,65 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             kTransferUsedPushConstantDwordAddressBit) {
           RenderTargetKey source_rt_key = source_vulkan_rt.key();
           if (dirty_bbox_transfers_enabled_) {
-            uint32_t bounded_slots_constant = UINT32_MAX;
+            TransferBoundedConstant bounded_constant;
             for (const DirtyBoxPair& bounded_pair : dirty_box_pairs) {
               if (bounded_pair.dest == dest_rt &&
                   bounded_pair.source == it->transfer.source) {
                 if (bounded_pair.was_eligible) {
-                  bounded_slots_constant =
+                  bounded_constant.slots =
                       (bounded_pair.snapshot_source_slot & 0xFFFFu) |
                       (bounded_pair.snapshot_dest_slot << 16);
+                  // The two boxes are in their own targets' host pixels. They
+                  // share a pixel grid only when the targets have the same
+                  // pitch and base, in which case the sample counts scale one
+                  // into the other; otherwise the copy re-addresses EDRAM and
+                  // no simple scale relates the two, so partial clamping is
+                  // off (scale 0) and only the empty collapse applies.
+                  RenderTargetKey bounded_source_key =
+                      bounded_pair.source->key();
+                  if (cvars::dirty_region_partial_transfers &&
+                      bounded_source_key.pitch_tiles_at_32bpp ==
+                          dest_rt_key.pitch_tiles_at_32bpp &&
+                      bounded_source_key.base_tiles == dest_rt_key.base_tiles) {
+                    uint32_t bounded_source_width =
+                        bounded_source_key.GetWidth() *
+                        GetKeyScaleX(bounded_source_key);
+                    uint32_t bounded_source_height =
+                        GetRenderTargetHeight(
+                            bounded_source_key.pitch_tiles_at_32bpp,
+                            bounded_source_key.msaa_samples) *
+                        GetKeyScaleY(bounded_source_key);
+                    uint32_t bounded_dest_width =
+                        dest_rt_key.GetWidth() * GetKeyScaleX(dest_rt_key);
+                    uint32_t bounded_dest_height =
+                        GetRenderTargetHeight(
+                            dest_rt_key.pitch_tiles_at_32bpp,
+                            dest_rt_key.msaa_samples) *
+                        GetKeyScaleY(dest_rt_key);
+                    if (bounded_source_width && bounded_source_height &&
+                        bounded_dest_width && bounded_dest_height) {
+                      bounded_constant.source_scale_x =
+                          float(bounded_dest_width) /
+                          float(bounded_source_width);
+                      bounded_constant.source_scale_y =
+                          float(bounded_dest_height) /
+                          float(bounded_source_height);
+                      bounded_constant.pixels_to_ndc_x =
+                          2.0f / transfer_viewport.width;
+                      bounded_constant.pixels_to_ndc_y =
+                          2.0f / transfer_viewport.height;
+                    }
+                  }
                   stats_transfer_bounded_pushed_.fetch_add(
                       1, std::memory_order_relaxed);
                 }
                 break;
               }
             }
-            if (last_bounded_slots_constant != bounded_slots_constant) {
-              last_bounded_slots_constant = bounded_slots_constant;
+            if (last_bounded_constant != bounded_constant) {
+              last_bounded_constant = bounded_constant;
               transfer_push_constants_set &=
-                  ~kTransferUsedPushConstantDwordBoundedSlotsBit;
+                  ~kTransferUsedPushConstantDwordBoundedBits;
             }
           }
           TransferAddressConstant address_constant;
@@ -5901,12 +5950,12 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             transfer_pipeline_layout_info.used_push_constant_dwords &
             ~transfer_push_constants_set;
         if (transfer_push_constants_unset &
-            kTransferUsedPushConstantDwordBoundedSlotsBit) {
+            kTransferUsedPushConstantDwordBoundedBits) {
           command_buffer.CmdVkPushConstants(
               transfer_pipeline_layout, transfer_push_constant_stages, 0,
-              sizeof(uint32_t), &last_bounded_slots_constant);
+              sizeof(TransferBoundedConstant), &last_bounded_constant);
           transfer_push_constants_set |=
-              kTransferUsedPushConstantDwordBoundedSlotsBit;
+              kTransferUsedPushConstantDwordBoundedBits;
         }
         if (transfer_push_constants_unset &
             kTransferUsedPushConstantDwordHostDepthAddressBit) {
@@ -6142,11 +6191,20 @@ VkShaderModule VulkanRenderTargetCache::BuildBoundedTransferVertexShader() {
                         static_cast<int>(spv::BuiltIn::Position));
   main_interface.push_back(out_position);
 
-  // Push constant: dword 0 = bounded slots.
-  spv::Id type_push = builder.makeStructType({type_uint},
-                                             "XeTransferBoundedPush");
+  // Push constant: dword 0 = bounded slots, 1 - 2 = the source box's scale
+  // into destination pixels, 3 - 4 = destination pixels to NDC.
+  spv::Id type_push = builder.makeStructType(
+      {type_uint, type_float, type_float, type_float, type_float},
+      "XeTransferBoundedPush");
   builder.addMemberName(type_push, 0, "bounded_slots");
-  builder.addMemberDecoration(type_push, 0, spv::DecorationOffset, 0);
+  builder.addMemberName(type_push, 1, "source_scale_x");
+  builder.addMemberName(type_push, 2, "source_scale_y");
+  builder.addMemberName(type_push, 3, "pixels_to_ndc_x");
+  builder.addMemberName(type_push, 4, "pixels_to_ndc_y");
+  for (int push_member = 0; push_member < 5; ++push_member) {
+    builder.addMemberDecoration(type_push, push_member, spv::DecorationOffset,
+                                push_member * int(sizeof(uint32_t)));
+  }
   builder.addDecoration(type_push, spv::DecorationBlock);
   spv::Id push_constants = builder.createVariable(
       spv::NoPrecision, spv::StorageClassPushConstant, type_push,
@@ -6189,7 +6247,13 @@ VkShaderModule VulkanRenderTargetCache::BuildBoundedTransferVertexShader() {
   // (an untouched slot is all zeros: minimum 65535, maximum 0). Minimums are
   // stored inverted (65535 - minimum), so empty on an axis is
   // (65535 - inverted_min) > max.
-  auto box_empty = [&](spv::Id slot) {
+  // Reads one slot's box. Minimums are stored inverted (65535 - minimum), and
+  // an untouched slot is all zeros, so its minimum reads back as 65535 and its
+  // maximum as 0: empty on an axis is minimum > maximum.
+  struct SpirvBox {
+    spv::Id min_x, min_y, max_x, max_y, empty;
+  };
+  auto read_box = [&](spv::Id slot) {
     spv::Id base = builder.createBinOp(spv::OpIMul, type_uint, slot,
                                        builder.makeUintConstant(4));
     spv::Id words[4];
@@ -6203,36 +6267,135 @@ VkShaderModule VulkanRenderTargetCache::BuildBoundedTransferVertexShader() {
                builder.createUnaryOp(spv::OpBitcast, type_int, index)}),
           spv::NoPrecision);
     }
-    spv::Id min_x = builder.createBinOp(spv::OpISub, type_uint,
-                                        const_uint_65535, words[0]);
-    spv::Id min_y = builder.createBinOp(spv::OpISub, type_uint,
-                                        const_uint_65535, words[1]);
-    spv::Id empty_x =
-        builder.createBinOp(spv::OpUGreaterThan, type_bool, min_x, words[2]);
-    spv::Id empty_y =
-        builder.createBinOp(spv::OpUGreaterThan, type_bool, min_y, words[3]);
-    return builder.createBinOp(spv::OpLogicalOr, type_bool, empty_x, empty_y);
+    SpirvBox box;
+    box.min_x = builder.createBinOp(spv::OpISub, type_uint, const_uint_65535,
+                                    words[0]);
+    box.min_y = builder.createBinOp(spv::OpISub, type_uint, const_uint_65535,
+                                    words[1]);
+    box.max_x = words[2];
+    box.max_y = words[3];
+    spv::Id empty_x = builder.createBinOp(spv::OpUGreaterThan, type_bool,
+                                          box.min_x, box.max_x);
+    spv::Id empty_y = builder.createBinOp(spv::OpUGreaterThan, type_bool,
+                                          box.min_y, box.max_y);
+    box.empty =
+        builder.createBinOp(spv::OpLogicalOr, type_bool, empty_x, empty_y);
+    return box;
   };
 
   spv::Id unbounded = builder.createBinOp(spv::OpIEqual, type_bool, slots,
                                           const_uint_max);
+  spv::Id bounded =
+      builder.createUnaryOp(spv::OpLogicalNot, type_bool, unbounded);
   spv::Id source_slot = builder.createBinOp(
       spv::OpBitwiseAnd, type_uint, slots, builder.makeUintConstant(0xFFFF));
   spv::Id dest_slot = builder.createBinOp(spv::OpShiftRightLogical, type_uint,
                                           slots,
                                           builder.makeUintConstant(16));
+  SpirvBox source_box = read_box(source_slot);
+  SpirvBox dest_box = read_box(dest_slot);
   spv::Id union_empty = builder.createBinOp(
-      spv::OpLogicalAnd, type_bool, box_empty(source_slot),
-      box_empty(dest_slot));
-  spv::Id collapse = builder.createBinOp(
-      spv::OpLogicalAnd, type_bool,
-      builder.createUnaryOp(spv::OpLogicalNot, type_bool, unbounded),
-      union_empty);
+      spv::OpLogicalAnd, type_bool, source_box.empty, dest_box.empty);
+  spv::Id collapse =
+      builder.createBinOp(spv::OpLogicalAnd, type_bool, bounded, union_empty);
 
   spv::Id const_float_0 = builder.makeFloatConstant(0.0f);
   spv::Id const_float_1 = builder.makeFloatConstant(1.0f);
+
+  auto push_float = [&](int member) {
+    return builder.createLoad(
+        builder.createAccessChain(spv::StorageClassPushConstant,
+                                  push_constants,
+                                  {builder.makeIntConstant(member)}),
+        spv::NoPrecision);
+  };
+  spv::Id source_scale_x = push_float(1);
+  spv::Id source_scale_y = push_float(2);
+  spv::Id pixels_to_ndc_x = push_float(3);
+  spv::Id pixels_to_ndc_y = push_float(4);
+
+  // The union of the two boxes in destination pixels, the source box scaled
+  // by the ratio of the two targets' host extents. An empty box contributes
+  // nothing; both empty is the collapse above, which wins over this.
+  auto to_float = [&](spv::Id value) {
+    return builder.createUnaryOp(spv::OpConvertUToF, type_float, value);
+  };
+  auto union_axis = [&](spv::Id source_min, spv::Id source_max,
+                        spv::Id dest_min, spv::Id dest_max, spv::Id scale,
+                        spv::Id* out_min, spv::Id* out_max) {
+    // Maximums are inclusive pixel indices, so the box's far edge is max + 1.
+    spv::Id source_low = builder.createNoContractionBinOp(
+        spv::OpFMul, type_float, to_float(source_min), scale);
+    spv::Id source_high = builder.createNoContractionBinOp(
+        spv::OpFMul, type_float,
+        to_float(builder.createBinOp(spv::OpIAdd, type_uint, source_max,
+                                     builder.makeUintConstant(1))),
+        scale);
+    spv::Id dest_low = to_float(dest_min);
+    spv::Id dest_high = to_float(builder.createBinOp(
+        spv::OpIAdd, type_uint, dest_max, builder.makeUintConstant(1)));
+    // An empty box must not pull the union to its 65535 / 0 sentinels.
+    spv::Id big = builder.makeFloatConstant(1.0e9f);
+    spv::Id neg_big = builder.makeFloatConstant(-1.0e9f);
+    source_low = builder.createTriOp(spv::OpSelect, type_float,
+                                     source_box.empty, big, source_low);
+    source_high = builder.createTriOp(spv::OpSelect, type_float,
+                                      source_box.empty, neg_big, source_high);
+    dest_low = builder.createTriOp(spv::OpSelect, type_float, dest_box.empty,
+                                   big, dest_low);
+    dest_high = builder.createTriOp(spv::OpSelect, type_float, dest_box.empty,
+                                    neg_big, dest_high);
+    *out_min = builder.createBuiltinCall(
+        type_float, builder.import("GLSL.std.450"), GLSLstd450FMin,
+        {source_low, dest_low});
+    *out_max = builder.createBuiltinCall(
+        type_float, builder.import("GLSL.std.450"), GLSLstd450FMax,
+        {source_high, dest_high});
+  };
+  spv::Id union_min_x, union_max_x, union_min_y, union_max_y;
+  union_axis(source_box.min_x, source_box.max_x, dest_box.min_x,
+             dest_box.max_x, source_scale_x, &union_min_x, &union_max_x);
+  union_axis(source_box.min_y, source_box.max_y, dest_box.min_y,
+             dest_box.max_y, source_scale_y, &union_min_y, &union_max_y);
+
+  // Pixels to NDC, with a pixel of slack on each side: the boxes are built
+  // from vertex positions, and a triangle covers pixel centres up to half a
+  // pixel outside the positions it is drawn from.
+  auto pixels_to_ndc = [&](spv::Id pixels, spv::Id scale, float slack) {
+    spv::Id slacked = builder.createNoContractionBinOp(
+        spv::OpFAdd, type_float, pixels, builder.makeFloatConstant(slack));
+    return builder.createNoContractionBinOp(
+        spv::OpFAdd, type_float,
+        builder.createNoContractionBinOp(spv::OpFMul, type_float, slacked,
+                                         scale),
+        builder.makeFloatConstant(-1.0f));
+  };
+  spv::Id box_ndc_min_x = pixels_to_ndc(union_min_x, pixels_to_ndc_x, -1.0f);
+  spv::Id box_ndc_max_x = pixels_to_ndc(union_max_x, pixels_to_ndc_x, 1.0f);
+  spv::Id box_ndc_min_y = pixels_to_ndc(union_min_y, pixels_to_ndc_y, -1.0f);
+  spv::Id box_ndc_max_y = pixels_to_ndc(union_max_y, pixels_to_ndc_y, 1.0f);
+
+  // Partial clamping applies only when the host said the two boxes share a
+  // pixel grid (a non-zero scale) and the copy is bounded at all.
+  spv::Id partial = builder.createBinOp(
+      spv::OpLogicalAnd, type_bool, bounded,
+      builder.createBinOp(spv::OpFOrdGreaterThan, type_bool, source_scale_x,
+                          const_float_0));
+  partial = builder.createBinOp(
+      spv::OpLogicalAnd, type_bool, partial,
+      builder.createUnaryOp(spv::OpLogicalNot, type_bool, union_empty));
+
   spv::Id x = builder.createCompositeExtract(position2, type_float, 0);
   spv::Id y = builder.createCompositeExtract(position2, type_float, 1);
+  auto clamp_axis = [&](spv::Id value, spv::Id low, spv::Id high) {
+    spv::Id clamped = builder.createBuiltinCall(
+        type_float, builder.import("GLSL.std.450"), GLSLstd450FClamp,
+        {value, low, high});
+    return builder.createTriOp(spv::OpSelect, type_float, partial, clamped,
+                               value);
+  };
+  x = clamp_axis(x, box_ndc_min_x, box_ndc_max_x);
+  y = clamp_axis(y, box_ndc_min_y, box_ndc_max_y);
   x = builder.createTriOp(spv::OpSelect, type_float, collapse, const_float_0,
                           x);
   y = builder.createTriOp(spv::OpSelect, type_float, collapse, const_float_0,

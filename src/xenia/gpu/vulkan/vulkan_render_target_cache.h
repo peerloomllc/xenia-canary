@@ -529,6 +529,15 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     // transfer; used only with dirty region tracking - kept lowest so the
     // vertex shader always reads push constant offset 0.
     kTransferUsedPushConstantDwordBoundedSlots,
+    // The rest of the bounded transfer constant, kept next to the slots so the
+    // whole of it is one push at offset 0: the source box's scale into
+    // destination pixels (0 when the two targets do not share a pixel grid,
+    // which turns partial clamping off and leaves only the empty collapse),
+    // and destination host pixels to NDC.
+    kTransferUsedPushConstantDwordBoundedSourceScaleX,
+    kTransferUsedPushConstantDwordBoundedSourceScaleY,
+    kTransferUsedPushConstantDwordBoundedPixelsToNdcX,
+    kTransferUsedPushConstantDwordBoundedPixelsToNdcY,
     kTransferUsedPushConstantDwordHostDepthAddress,
     kTransferUsedPushConstantDwordAddress,
     // Changed 8 times per transfer.
@@ -538,6 +547,20 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
     kTransferUsedPushConstantDwordBoundedSlotsBit =
         uint32_t(1) << kTransferUsedPushConstantDwordBoundedSlots,
+    kTransferUsedPushConstantDwordBoundedSourceScaleXBit =
+        uint32_t(1) << kTransferUsedPushConstantDwordBoundedSourceScaleX,
+    kTransferUsedPushConstantDwordBoundedSourceScaleYBit =
+        uint32_t(1) << kTransferUsedPushConstantDwordBoundedSourceScaleY,
+    kTransferUsedPushConstantDwordBoundedPixelsToNdcXBit =
+        uint32_t(1) << kTransferUsedPushConstantDwordBoundedPixelsToNdcX,
+    kTransferUsedPushConstantDwordBoundedPixelsToNdcYBit =
+        uint32_t(1) << kTransferUsedPushConstantDwordBoundedPixelsToNdcY,
+    kTransferUsedPushConstantDwordBoundedBits =
+        kTransferUsedPushConstantDwordBoundedSlotsBit |
+        kTransferUsedPushConstantDwordBoundedSourceScaleXBit |
+        kTransferUsedPushConstantDwordBoundedSourceScaleYBit |
+        kTransferUsedPushConstantDwordBoundedPixelsToNdcXBit |
+        kTransferUsedPushConstantDwordBoundedPixelsToNdcYBit,
     kTransferUsedPushConstantDwordHostDepthAddressBit =
         uint32_t(1) << kTransferUsedPushConstantDwordHostDepthAddress,
     kTransferUsedPushConstantDwordAddressBit =
@@ -545,6 +568,31 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     kTransferUsedPushConstantDwordStencilMaskBit =
         uint32_t(1) << kTransferUsedPushConstantDwordStencilMask,
   };
+
+  // The bounded transfer push constant, dwords 0 - 4, written as one push.
+  struct TransferBoundedConstant {
+    // Source slot | dest slot << 16; UINT32_MAX for an unbounded transfer.
+    uint32_t slots = UINT32_MAX;
+    // The source box's scale into destination pixels. 0 disables partial
+    // clamping (the copy is then either full or collapsed to nothing).
+    float source_scale_x = 0.0f;
+    float source_scale_y = 0.0f;
+    // Destination host pixels to NDC, the transfer viewport's scale.
+    float pixels_to_ndc_x = 0.0f;
+    float pixels_to_ndc_y = 0.0f;
+
+    bool operator==(const TransferBoundedConstant& other) const {
+      return slots == other.slots && source_scale_x == other.source_scale_x &&
+             source_scale_y == other.source_scale_y &&
+             pixels_to_ndc_x == other.pixels_to_ndc_x &&
+             pixels_to_ndc_y == other.pixels_to_ndc_y;
+    }
+    bool operator!=(const TransferBoundedConstant& other) const {
+      return !(*this == other);
+    }
+  };
+  static_assert(sizeof(TransferBoundedConstant) == sizeof(uint32_t) * 5,
+                "The bounded transfer constant is pushed as five dwords");
 
   enum class TransferPipelineLayoutIndex {
     kColor,
