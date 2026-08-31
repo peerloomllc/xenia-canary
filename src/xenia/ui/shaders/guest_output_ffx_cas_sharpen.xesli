@@ -9,6 +9,8 @@
 
 #include "xesl.xesli"
 
+#include "color_adjust.xesli"
+
 #include "amd_language.xesli"
 
 #if XE_GUEST_OUTPUT_DITHER
@@ -21,6 +23,7 @@ push_const_begin_xe(b0, space0)
   block_offset_member_xe(16, c0.x, int2_xe, xe_cas_output_offset)
   // CasSetup const1.x.
   block_offset_member_xe(24, c0.z, float, xe_cas_sharpness_post_setup)
+  block_offset_member_xe(32, c1.x, float4_xe, xe_cas_color_adjust)
 push_const_end_xe
 
 // FIXME(Triang3l): This approach doesn't work for MSL - the texture must be
@@ -60,6 +63,8 @@ entry_inputs_end_code_begin_xe
             cas_const_1, true);
   // Linear conversion approximation as recommended in the CAS presentation.
   cas_color.rgb = sqrt(cas_color.rgb);
+  cas_color.rgb =
+      XeColorAdjust(cas_color.rgb, push_const_xe(xe_cas_color_adjust));
   #if XE_GUEST_OUTPUT_DITHER
     // Clamping because on Vulkan, the surface may specify any format, including
     // floating-point.

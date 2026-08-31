@@ -867,7 +867,8 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
         switch (guest_output_paint_root_signature_index) {
           case kGuestOutputPaintRootSignatureIndexBilinear: {
             effect_constants_size = sizeof(effect_constants.bilinear);
-            effect_constants.bilinear.Initialize(guest_output_flow, i);
+            effect_constants.bilinear.Initialize(guest_output_flow, i,
+                                                 guest_output_paint_config);
           } break;
           case kGuestOutputPaintRootSignatureIndexCasSharpen: {
             effect_constants_size = sizeof(effect_constants.cas_sharpen);

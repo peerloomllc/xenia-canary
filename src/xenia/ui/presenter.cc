@@ -487,6 +487,15 @@ void Presenter::SetGuestOutputPaintConfigFromUIThread(
     modified = true;
     request_repaint = true;
   }
+  if (guest_output_paint_config_.GetBrightness() !=
+          new_config.GetBrightness() ||
+      guest_output_paint_config_.GetContrast() != new_config.GetContrast() ||
+      guest_output_paint_config_.GetSaturation() !=
+          new_config.GetSaturation() ||
+      guest_output_paint_config_.GetGamma() != new_config.GetGamma()) {
+    modified = true;
+    request_repaint = true;
+  }
   if (modified) {
     {
       std::unique_lock<std::mutex> config_lock(
