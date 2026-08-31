@@ -30,6 +30,13 @@
 #include "xenia/gpu/xenos.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
 
+DEFINE_bool(
+    log_rt_transfer_map, false,
+    "Every ~5 seconds, log the most frequent render target ownership "
+    "transfers (source -> destination, EDRAM tile range, count) to find "
+    "regions ping-ponging between render targets.",
+    "GPU");
+
 DEFINE_string(
     render_target_path_vulkan, "",
     "Render target emulation path to use on Vulkan.\n"
@@ -4659,6 +4666,39 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       stats_transfer_count_.fetch_add(transfer_total,
                                       std::memory_order_relaxed);
     }
+    if (cvars::log_rt_transfer_map && transfer_total) {
+      // GPU command processor thread only - no synchronization needed.
+      for (uint32_t i = 0; i < render_target_count; ++i) {
+        if (!render_targets[i]) {
+          continue;
+        }
+        for (const Transfer& transfer : render_target_transfers[i]) {
+          std::string key = fmt::format(
+              "{} -> {} tiles [{}, {})",
+              transfer.source->key().GetDebugName(),
+              render_targets[i]->key().GetDebugName(), transfer.start_tiles,
+              transfer.end_tiles);
+          ++transfer_map_[key];
+        }
+      }
+      auto now = std::chrono::steady_clock::now();
+      if (now - transfer_map_last_dump_ >= std::chrono::seconds(5)) {
+        transfer_map_last_dump_ = now;
+        std::vector<std::pair<uint64_t, std::string_view>> top;
+        top.reserve(transfer_map_.size());
+        for (const auto& entry : transfer_map_) {
+          top.emplace_back(entry.second, entry.first);
+        }
+        std::sort(top.begin(), top.end(), std::greater<>());
+        size_t show = std::min<size_t>(top.size(), 16);
+        XELOGI("RT transfer map: {} distinct transfers in ~5 s, top {}:",
+               transfer_map_.size(), show);
+        for (size_t j = 0; j < show; ++j) {
+          XELOGI("  {:6} x {}", top[j].first, top[j].second);
+        }
+        transfer_map_.clear();
+      }
+    }
   }
 
   const ui::vulkan::VulkanDevice* const vulkan_device =
@@ -6248,6 +6288,7 @@ uint32_t VulkanRenderTargetCache::PrepareEdramSnapshotRead() {
 
 bool VulkanRenderTargetCache::RestoreEdramSnapshot(const void* data,
                                                    size_t size) {
+
   const VkDeviceSize expected_size = VkDeviceSize(xenos::kEdramSizeBytes) *
                                      draw_resolution_scale_x() *
                                      draw_resolution_scale_y();

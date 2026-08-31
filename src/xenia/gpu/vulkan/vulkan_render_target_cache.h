@@ -15,6 +15,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <chrono>
 #include <unordered_map>
 
 #include "xenia/base/hash.h"
@@ -311,6 +312,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       EdramBufferModificationStatus::kUnmodified;
   VkDescriptorPool edram_storage_buffer_descriptor_pool_ = VK_NULL_HANDLE;
   VkDescriptorSet edram_storage_buffer_descriptor_set_;
+
+  // --log_rt_transfer_map aggregation (GPU command processor thread only).
+  std::unordered_map<std::string, uint64_t> transfer_map_;
+  std::chrono::steady_clock::time_point transfer_map_last_dump_{};
 
   VkPipelineLayout resolve_copy_pipeline_layout_ = VK_NULL_HANDLE;
   static const ResolveCopyShaderCode
