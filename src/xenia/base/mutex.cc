@@ -88,7 +88,17 @@ inline int futex_wake(std::atomic<uint32_t>* addr, int count) {
                  0);
 }
 
-inline pid_t gettid() { return static_cast<pid_t>(syscall(SYS_gettid)); }
+// The kernel thread id never changes for a thread, and every lock() asks for
+// it: cached per thread. Uncached this was ~39,000 gettid syscalls a second
+// on the GPU command processor thread (Eternal Sonata's intro cutscene) and
+// most of that thread's time in the kernel (Windows reads it from the TEB).
+inline pid_t gettid() {
+  static thread_local pid_t cached_tid = 0;
+  if (!cached_tid) {
+    cached_tid = static_cast<pid_t>(syscall(SYS_gettid));
+  }
+  return cached_tid;
+}
 
 }  // namespace
 
