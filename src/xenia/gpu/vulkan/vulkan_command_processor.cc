@@ -37,9 +37,13 @@
 #include "xenia/ui/vulkan/vulkan_util.h"
 
 DEFINE_bool(dirty_region_tracking, false,
-            "Track the screen-space bounding box every draw's vertices touch "
-            "per render target, on the GPU (host-render-target path only). "
-            "Groundwork for bounded render target ownership transfers.",
+            "Track on the GPU the screen-space bounding box every draw's "
+            "vertices touch per render target, and copy only that region "
+            "when ownership of a render target range moves between targets "
+            "instead of the whole range. Host render target path (fbo) "
+            "only. Lost Odyssey at 2x runs 46 -> 58 fps with it on; a copy "
+            "whose two targets do not share a pixel grid is still copied "
+            "whole. Experimental: verified in one static scene so far.",
             "GPU");
 DEFINE_bool(log_dirty_bbox, false,
             "With dirty_region_tracking: periodically read the accumulated "

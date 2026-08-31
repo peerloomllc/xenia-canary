@@ -100,6 +100,7 @@ DECLARE_int32(draw_resolution_scale_x);
 DECLARE_int32(draw_resolution_scale_y);
 DECLARE_string(render_target_path_vulkan);
 DECLARE_bool(vulkan_sparse_shared_memory);
+DECLARE_bool(dirty_region_tracking);
 DECLARE_int32(vulkan_pipeline_creation_threads);
 DECLARE_int32(anisotropic_override);
 DECLARE_string(occlusion_query);
@@ -3020,6 +3021,13 @@ void EmulatorWindow::GpuOptionsDialog::OnDraw(ImGuiIO& io) {
         {{"", "any: pick what suits the GPU"},
          {"fbo", "fbo: host framebuffers, faster, fewer formats"},
          {"fsi", "fsi: fragment shader interlock, most accurate"}});
+    GpuOptionCheckbox(
+        "Skip copying unchanged screen regions (experimental)",
+        "dirty_region_tracking", cvars::dirty_region_tracking);
+    ImGui::TextDisabled(
+        "Tracks what each draw touches so render target copies move only "
+        "what changed. Much faster above 1x in some games; the fbo render "
+        "target path only, and not yet verified in every scene.");
     GpuOptionInt<uint64_t>("Frame rate limit, fps (0 = 60 with VSync, else "
                            "unlimited)",
                            "framerate_limit", cvars::framerate_limit, 0, 1000);
