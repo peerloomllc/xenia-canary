@@ -94,6 +94,17 @@ class Backend {
   * */
   virtual void PrepareForReentry(void* ctx) {}
 
+  // Fills out_addresses with the guest return addresses currently on the
+  // thread's call stack, innermost first, and returns how many were written.
+  // Guest calls are not host calls, so a host unwinder cannot recover this;
+  // backends that already track guest frames can expose them here. Returns 0
+  // if the backend does not track them.
+  virtual size_t GetGuestCallChain(void* ctx, uint32_t* out_addresses,
+                                   uint32_t* out_stack_pointers,
+                                   size_t max_addresses) {
+    return 0;
+  }
+
   // returns true if populated st
   virtual bool PopulatePseudoStacktrace(GuestPseudoStackTrace* st) {
     return false;

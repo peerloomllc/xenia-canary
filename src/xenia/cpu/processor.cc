@@ -7,6 +7,8 @@
  ******************************************************************************
  */
 
+#include <cstdlib>
+
 #include "xenia/cpu/processor.h"
 
 #include "xenia/base/assert.h"
@@ -28,6 +30,8 @@
 #include "xenia/cpu/module.h"
 #include "xenia/cpu/ppc/ppc_decode_data.h"
 #include "xenia/cpu/ppc/ppc_frontend.h"
+#include "xenia/base/string_buffer.h"
+#include "xenia/cpu/ppc/ppc_opcode_info.h"
 #include "xenia/cpu/stack_walker.h"
 #include "xenia/cpu/thread.h"
 #include "xenia/cpu/thread_state.h"
@@ -52,6 +56,21 @@ DEFINE_path(trace_function_data_path, "", "File to write trace data to.",
             "CPU");
 DEFINE_bool(break_on_start, false, "Break into the debugger on startup.",
             "CPU");
+DEFINE_string(
+    watch_guest_pointer, "",
+    "Hex guest address to sample on every stack dump. Dumps the word there and "
+    "the memory it points at, for watching a value a spin loop polls.",
+    "CPU");
+DEFINE_string(
+    disasm_guest_windows, "",
+    "Comma-separated hex guest address ranges (start-end) to disassemble on "
+    "the first periodic stack dump. For reading code the dump only names.",
+    "CPU");
+DEFINE_int32(
+    stack_dump_interval_seconds, 0,
+    "If non-zero, periodically log every guest thread's call stack with guest "
+    "PCs resolved. For diagnosing hangs. Requires a working stack walker.",
+    "CPU");
 
 namespace xe {
 namespace kernel {
@@ -90,6 +109,11 @@ Processor::Processor(xe::Memory* memory, ExportResolver* export_resolver)
     : memory_(memory), export_resolver_(export_resolver) {}
 
 Processor::~Processor() {
+  stack_dump_running_ = false;
+  if (stack_dump_thread_.joinable()) {
+    stack_dump_thread_.join();
+  }
+
   {
     auto global_lock = global_critical_region_.Acquire();
     modules_.clear();
@@ -148,6 +172,32 @@ bool Processor::Setup(std::unique_ptr<backend::Backend> backend) {
     if (cvars::debug) {
       XELOGW("Disabling --debug due to lack of stack walker");
       cvars::debug = false;
+    }
+  }
+
+  // Optional hang-diagnosis watchdog: periodically log every guest thread's
+  // call stack with guest PCs resolved.
+  if (cvars::stack_dump_interval_seconds > 0) {
+    if (!stack_walker_) {
+      XELOGW("--stack_dump_interval_seconds needs a stack walker; ignoring");
+    } else {
+      stack_dump_running_ = true;
+      stack_dump_thread_ = std::thread([this]() {
+        xe::threading::set_name("Stack Dump Watchdog");
+        const auto interval =
+            std::chrono::seconds(cvars::stack_dump_interval_seconds);
+        while (stack_dump_running_) {
+          auto deadline = std::chrono::steady_clock::now() + interval;
+          while (stack_dump_running_ &&
+                 std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+          }
+          if (!stack_dump_running_) {
+            break;
+          }
+          DumpThreadStacks();
+        }
+      });
     }
   }
 
@@ -867,6 +917,267 @@ void Processor::UpdateThreadExecutionStates(
       }
     }
   }
+}
+
+namespace {
+// Disassembles a window of PPC instructions around a guest PC straight out of
+// guest memory. Cheaper than --disassemble_functions, which builds and keeps
+// the disassembly for every translated function.
+// A guest address is only safe to dereference if a heap owns it and the page
+// is committed. TranslateVirtual() happily hands back a pointer into unmapped
+// space, and reading that trips the access-violation handler.
+bool GuestAddressReadable(Memory* memory, uint32_t address) {
+  if (!address) {
+    return false;
+  }
+  const auto heap = memory->LookupHeap(address);
+  if (!heap) {
+    return false;
+  }
+  uint32_t protect = 0;
+  if (!const_cast<BaseHeap*>(heap)->QueryProtect(address, &protect)) {
+    return false;
+  }
+  return protect != 0;
+}
+
+void DumpGuestBytes(Memory* memory, uint32_t address, uint32_t count) {
+  if (!GuestAddressReadable(memory, address) ||
+      !GuestAddressReadable(memory, address + count - 1)) {
+    XELOGI("      [{:08X}] unmapped", address);
+    return;
+  }
+  auto host_ptr = memory->TranslateVirtual(address);
+  StringBuffer buffer;
+  for (uint32_t i = 0; i < count; ++i) {
+    buffer.AppendFormat("{:02X} ", host_ptr[i]);
+  }
+  XELOGI("      [{:08X}] {}", address, buffer.to_string());
+}
+
+void DumpGuestDisasmWindow(Memory* memory, uint32_t guest_pc, int before,
+                           int after);
+
+void DumpGuestStackWords(Memory* memory, uint32_t sp, uint32_t words) {
+  for (uint32_t i = 0; i < words; i += 4) {
+    StringBuffer line;
+    for (uint32_t j = 0; j < 4 && i + j < words; ++j) {
+      uint32_t address = sp + (i + j) * 4;
+      if (!GuestAddressReadable(memory, address)) {
+        line.AppendFormat("........  ");
+        continue;
+      }
+      uint32_t value =
+          xe::load_and_swap<uint32_t>(memory->TranslateVirtual(address));
+      bool code = value >= 0x82000000 && value < 0x90000000;
+      line.AppendFormat("{:08X}{} ", value, code ? "*" : " ");
+    }
+    XELOGI("      sp+{:03X}: {}", i * 4, line.to_string());
+  }
+}
+
+void DumpGuestBackChain(Memory* memory, uint32_t sp, int max_frames) {
+  uint32_t frame = sp;
+  int disasm_budget = 2;
+  for (int i = 0; i < max_frames; ++i) {
+    if (!frame || (frame & 3) || !GuestAddressReadable(memory, frame)) {
+      break;
+    }
+    uint32_t next = xe::load_and_swap<uint32_t>(memory->TranslateVirtual(frame));
+    if (next <= frame) {
+      break;  // back chain must grow upward
+    }
+    if (!GuestAddressReadable(memory, next) ||
+        !GuestAddressReadable(memory, frame + 8)) {
+      break;
+    }
+    // The saved LR lives at a small fixed offset in the caller's frame. Print
+    // both candidates and let the plausible one (a code address) speak.
+    // This game's compiler parks the caller's return address at +8 of the
+    // frame that saved it, not of the caller's frame, so read it from `frame`.
+    auto frame_ptr = memory->TranslateVirtual(frame);
+    uint32_t lr4 = xe::load_and_swap<uint32_t>(frame_ptr + 4);
+    uint32_t lr8 = xe::load_and_swap<uint32_t>(frame_ptr + 8);
+    const char* mark4 = (lr4 >= 0x82000000 && lr4 < 0x90000000) ? "*" : " ";
+    const char* mark8 = (lr8 >= 0x82000000 && lr8 < 0x90000000) ? "*" : " ";
+    XELOGI("      frame {:08X} -> {:08X}  lr+4={:08X}{} lr+8={:08X}{}", frame,
+           next, lr4, mark4, lr8, mark8);
+    // Disassemble around the first couple of plausible return addresses - the
+    // immediate callers are what matter when chasing a spin.
+    // The saved LR sits at +4 in some frames and +8 in others, so take
+    // whichever looks like code.
+    if (disasm_budget > 0 && *mark8 == '*') {
+      --disasm_budget;
+      DumpGuestDisasmWindow(memory, lr8, 8, 6);
+    }
+    frame = next;
+  }
+}
+
+void DumpGuestDisasmWindow(Memory* memory, uint32_t guest_pc, int before,
+                           int after) {
+  uint32_t start = guest_pc - uint32_t(before) * 4;
+  for (int i = 0; i < before + after + 1; ++i) {
+    uint32_t address = start + uint32_t(i) * 4;
+    if (!GuestAddressReadable(memory, address)) {
+      continue;
+    }
+    uint32_t code = xe::load_and_swap<uint32_t>(memory->TranslateVirtual(address));
+    StringBuffer buffer;
+    if (!xe::cpu::ppc::DisasmPPC(address, code, &buffer)) {
+      XELOGI("      {} {:08X}  {:08X}  <undecodable>",
+             address == guest_pc ? "->" : "  ", address, code);
+      continue;
+    }
+    XELOGI("      {} {:08X}  {:08X}  {}", address == guest_pc ? "->" : "  ",
+           address, code, buffer.to_string());
+  }
+}
+}  // namespace
+
+void Processor::DumpThreadStacks() {
+  if (!stack_walker_) {
+    XELOGW("DumpThreadStacks: no stack walker on this platform");
+    return;
+  }
+  UpdateThreadExecutionStates();
+  auto infos = QueryThreadDebugInfos();
+  XELOGI("===== guest thread stacks ({} threads) =====", infos.size());
+  static bool disasm_windows_done = false;
+  if (!disasm_windows_done && !cvars::disasm_guest_windows.empty()) {
+    disasm_windows_done = true;
+    const std::string& spec = cvars::disasm_guest_windows;
+    size_t pos = 0;
+    while (pos < spec.size()) {
+      size_t end = spec.find(',', pos);
+      if (end == std::string::npos) {
+        end = spec.size();
+      }
+      std::string token = spec.substr(pos, end - pos);
+      pos = end + 1;
+      size_t dash = token.find('-');
+      if (dash == std::string::npos) {
+        continue;
+      }
+      uint32_t lo = uint32_t(std::strtoul(token.substr(0, dash).c_str(),
+                                          nullptr, 16)) & ~3u;
+      uint32_t hi = uint32_t(std::strtoul(token.substr(dash + 1).c_str(),
+                                          nullptr, 16)) & ~3u;
+      if (hi < lo) {
+        continue;
+      }
+      XELOGI("===== disasm window {:08X}-{:08X} =====", lo, hi);
+      DumpGuestDisasmWindow(memory_, lo, 0, int((hi - lo) / 4));
+    }
+  }
+  if (!cvars::watch_guest_pointer.empty()) {
+    uint32_t watch = uint32_t(std::strtoul(
+        cvars::watch_guest_pointer.c_str(), nullptr, 16));
+    if (GuestAddressReadable(memory_, watch)) {
+      uint32_t target =
+          xe::load_and_swap<uint32_t>(memory_->TranslateVirtual(watch));
+      XELOGI("watch [{:08X}] = {:08X}", watch, target);
+      if (GuestAddressReadable(memory_, target)) {
+        DumpGuestBytes(memory_, target, 32);
+      } else {
+        XELOGI("      -> {:08X} unmapped", target);
+      }
+    } else {
+      XELOGI("watch [{:08X}] unmapped", watch);
+    }
+  }
+  for (auto* info : infos) {
+    if (!info->thread) {
+      continue;
+    }
+    XELOGI("thread {:08X} '{}' state={} frames={}", info->thread_id,
+           info->thread->thread_name(), static_cast<int>(info->state),
+           info->frames.size());
+    // Threads parked inside a kernel call have no guest frame, but their
+    // context still says where in guest code they called from.
+    {
+      const auto& ctx = info->guest_context;
+      uint32_t lr = uint32_t(ctx.lr);
+      XELOGI("    ctx lr={:08X} r1={:08X} r3={:08X} r4={:08X} r31={:08X}", lr,
+             uint32_t(ctx.r[1]), uint32_t(ctx.r[3]), uint32_t(ctx.r[4]),
+             uint32_t(ctx.r[31]));
+      // The backend records the guest LR at every function entry, which is an
+      // exact guest call chain - no ABI guessing, and no mistaking string data
+      // for a return address the way a stack scan does.
+      auto* thread_state = info->thread->thread_state();
+      if (thread_state && backend_) {
+        uint32_t chain[24];
+        uint32_t chain_sp[24];
+        size_t chain_count = backend_->GetGuestCallChain(
+            thread_state->context(), chain, chain_sp, xe::countof(chain));
+        if (chain_count) {
+          XELOGI("    guest call chain ({} frames, innermost first):",
+                 chain_count);
+          for (size_t c = 0; c < chain_count; ++c) {
+            XELOGI("      [{:2}] {:08X}  entry sp={:08X}", c, chain[c],
+                   chain_sp[c]);
+          }
+          // Callee-saved registers live just below each frame's entry stack
+          // pointer, so this is where a frame's arguments can be recovered
+          // after deeper calls have clobbered the registers.
+          for (size_t c = 0; c < chain_count && c <= 2; ++c) {
+            if (!chain_sp[c]) {
+              continue;
+            }
+            XELOGI("      saved regs below frame [{:2}] sp {:08X}:", c,
+                   chain_sp[c]);
+            DumpGuestBytes(memory_, chain_sp[c] - 0x20, 32);
+          }
+          // Disassemble around the innermost few callers - that is where a
+          // spin loop lives.
+          for (size_t c = 1; c < chain_count && c <= 3; ++c) {
+            if (chain[c] < 0x82000000 || chain[c] >= 0x90000000) {
+              continue;
+            }
+            XELOGI("      --- caller [{:2}] {:08X} ---", c, chain[c]);
+            DumpGuestDisasmWindow(memory_, chain[c], 10, 8);
+          }
+        } else {
+          // No backend support - fall back to the PowerPC stack back chain.
+          DumpGuestBackChain(memory_, uint32_t(ctx.r[1]), 12);
+        }
+      }
+      if (lr >= 0x82000000 && lr < 0x90000000) {
+        DumpGuestDisasmWindow(memory_, lr, 8, 6);
+        // Guest calls are not host calls, so the guest chain only exists in
+        // guest memory. Where a function stashes its caller's LR is decided by
+        // the game's compiler, so read the prologue rather than guessing an
+        // ABI offset.
+        // Dump the raw guest stack words and flag the ones that look like
+        // code, which shows where this game's compiler parks the saved LR
+        // instead of assuming an ABI offset.
+        DumpGuestStackWords(memory_, uint32_t(ctx.r[1]), 40);
+      }
+    }
+    size_t shown = 0;
+    for (auto& frame : info->frames) {
+      if (shown++ >= 12) {
+        break;
+      }
+      if (frame.guest_pc) {
+        XELOGI("    guest {:08X} (fn {:08X}) {}", frame.guest_pc,
+               frame.guest_function_address, frame.name);
+        DumpGuestDisasmWindow(memory_, frame.guest_pc, 10, 26);
+        // Guest registers for the frame, so addresses the code is polling can
+        // be turned into concrete guest pointers.
+        const auto& ctx = info->guest_context;
+        XELOGI("      r3={:08X} r11={:08X} r29={:08X} r31={:08X} lr={:08X}",
+               uint32_t(ctx.r[3]), uint32_t(ctx.r[11]), uint32_t(ctx.r[29]),
+               uint32_t(ctx.r[31]), uint32_t(ctx.lr));
+        // Spin loops usually poll memory hanging off a register. Dump a window
+        // around r29 so the polled value is visible across successive samples.
+        DumpGuestBytes(memory_, uint32_t(ctx.r[29]) + 0x2AB0, 32);
+      } else {
+        XELOGI("    host  {:016X} {}", frame.host_pc, frame.name);
+      }
+    }
+  }
+  XELOGI("===== end guest thread stacks =====");
 }
 
 void Processor::SuspendAllBreakpoints() {

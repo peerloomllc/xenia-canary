@@ -1804,6 +1804,41 @@ void X64Backend::DeinitializeBackendContext(void* ctx) {
   }
 }
 
+size_t X64Backend::GetGuestCallChain(void* ctx, uint32_t* out_addresses,
+                                     uint32_t* out_stack_pointers,
+                                     size_t max_addresses) {
+  // PushStackpoint already records the guest LR at every function entry, which
+  // is exactly a shadow call stack - it just had no reader until now. Walk it
+  // from the innermost frame outward.
+  if (!cvars::enable_host_guest_stack_synchronization || !ctx ||
+      !out_addresses || !max_addresses) {
+    return 0;
+  }
+  auto* backend_context = BackendContextForGuestContext(ctx);
+  if (!backend_context || !backend_context->stackpoints) {
+    return 0;
+  }
+  uint32_t depth = backend_context->current_stackpoint_depth;
+  if (!depth || depth > uint32_t(cvars::max_stackpoints)) {
+    return 0;
+  }
+  size_t count = 0;
+  for (uint32_t i = depth; i-- > 0 && count < max_addresses;) {
+    uint32_t return_address =
+        backend_context->stackpoints[i].guest_return_address_;
+    if (!return_address) {
+      continue;
+    }
+    if (out_stack_pointers) {
+      // The guest stack pointer as it was on entry to that frame, which is
+      // what the frame's prologue saved its registers relative to.
+      out_stack_pointers[count] = backend_context->stackpoints[i].guest_stack_;
+    }
+    out_addresses[count++] = return_address;
+  }
+  return count;
+}
+
 void X64Backend::PrepareForReentry(void* ctx) {
   X64BackendContext* bctx = BackendContextForGuestContext(ctx);
 

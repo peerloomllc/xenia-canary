@@ -10,9 +10,11 @@
 #ifndef XENIA_CPU_PROCESSOR_H_
 #define XENIA_CPU_PROCESSOR_H_
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "xenia/base/cvar.h"
@@ -228,6 +230,11 @@ class Processor {
       uint32_t override_handle = 0,
       HostThreadContext* override_context = nullptr);
 
+  // Logs every guest thread's call stack, with guest PCs resolved through the
+  // code cache. Intended for diagnosing hangs: run with
+  // --stack_dump_interval_seconds and read the log.
+  void DumpThreadStacks();
+
   // Suspends all breakpoints, uninstalling them as required.
   // No breakpoints will be triggered until they are resumed.
   void SuspendAllBreakpoints();
@@ -275,6 +282,10 @@ class Processor {
   // Maps thread ID to state. Updated on thread create, and threads are never
   // removed. Must be guarded with the global lock.
   std::map<uint32_t, std::unique_ptr<ThreadDebugInfo>> thread_debug_infos_;
+
+  // --stack_dump_interval_seconds watchdog.
+  std::atomic<bool> stack_dump_running_{false};
+  std::thread stack_dump_thread_;
 
   // TODO(benvanik): cleanup/change structures.
   std::vector<Breakpoint*> breakpoints_;
