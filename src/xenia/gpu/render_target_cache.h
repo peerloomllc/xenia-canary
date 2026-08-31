@@ -48,6 +48,17 @@ class RenderTargetCache {
   // of the host-render-target path); resolves are EDRAM-to-memory copies.
   // Dirty region tracking bounding box slot count (buffer is 4 uint32 each).
   static constexpr uint32_t kDirtyBboxSlotCount = 4096;
+  // Tail slots kept out of the render target allocation: the two the pair
+  // probe reads back, and the snapshots a bounded transfer draw reads. The
+  // boxes themselves are zeroed before the transfer draws, so the draws read
+  // the snapshot of what they were at the copy.
+  static constexpr uint32_t kDirtyBboxProbeSlotCount = 2;
+  static constexpr uint32_t kDirtyBboxSnapshotPairCount = 16;
+  static constexpr uint32_t kDirtyBboxSnapshotSlotFirst =
+      kDirtyBboxSlotCount - kDirtyBboxProbeSlotCount -
+      kDirtyBboxSnapshotPairCount * 2;
+  static constexpr uint32_t kDirtyBboxRenderTargetSlotCount =
+      kDirtyBboxSnapshotSlotFirst;
 
   // A new epoch value for dirty-box bookkeeping (monotonic).
   uint32_t NextDirtyBoxEpoch() { return ++dirty_box_epoch_source_; }

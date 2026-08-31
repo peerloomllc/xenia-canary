@@ -1512,7 +1512,8 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(
     render_target = CreateRenderTarget(key);
     if (render_target) {
       render_target->set_dirty_bbox_slot(dirty_bbox_next_slot_);
-      dirty_bbox_next_slot_ = (dirty_bbox_next_slot_ + 1) % kDirtyBboxSlotCount;
+      dirty_bbox_next_slot_ =
+          (dirty_bbox_next_slot_ + 1) % kDirtyBboxRenderTargetSlotCount;
       render_target->set_box_epoch(NextDirtyBoxEpoch());
     }
     uint32_t width = key.GetWidth();

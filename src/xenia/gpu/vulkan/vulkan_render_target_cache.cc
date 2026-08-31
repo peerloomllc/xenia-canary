@@ -39,6 +39,13 @@ DEFINE_bool(
     "regions ping-ponging between render targets.",
     "GPU");
 
+DEFINE_bool(
+    dirty_bbox_skip_reset, false,
+    "Diagnostic only, renders wrong: skip the post-copy dirty box resets "
+    "and their barriers, to measure what the forced render pass break at "
+    "each transfer costs.",
+    "GPU");
+
 DEFINE_string(
     render_target_path_vulkan, "",
     "Render target emulation path to use on Vulkan.\n"
@@ -4765,6 +4772,11 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
     bool host_depth_involved;
     bool was_eligible;
     const char* gate;
+    // Slots holding this pair's two boxes as they were at the copy, once the
+    // boxes themselves have been zeroed for the draws that follow. UINT32_MAX
+    // until one of the limited snapshot entries is given to the pair.
+    uint32_t snapshot_source_slot;
+    uint32_t snapshot_dest_slot;
   };
   std::vector<DirtyBoxPair> dirty_box_pairs;
   bool dirty_box_tracking = command_processor_.dirty_bbox_tracking_enabled();
@@ -4809,7 +4821,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                                        transfer.start_tiles,
                                        transfer.end_tiles,
                                        transfer_foreign_host_depth, false,
-                                       "no_record"});
+                                       "no_record", UINT32_MAX, UINT32_MAX});
           }
         }
       }
@@ -4934,6 +4946,116 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         resolve_clear_rectangle->height_pixels * resolve_clear_scale_y;
     resolve_clear_rect.baseArrayLayer = 0;
     resolve_clear_rect.layerCount = 1;
+  }
+
+  if (dirty_box_tracking && !dirty_box_pairs.empty() &&
+      !cvars::dirty_bbox_skip_reset) {
+    // Snapshot each pair's two boxes and zero the boxes, before the transfer
+    // draws rather than after them. The draws read the snapshot, so they still
+    // see what the boxes held at the copy, and the guest draws that follow
+    // accumulate from empty - the same result the post-copy reset gave.
+    //
+    // The reason for the order: a buffer copy or fill cannot be inside a
+    // render pass, and the pass the transfer draws use is the one the guest
+    // draws go on using afterwards. Ending it after the draws made every
+    // transfer re-enter a pass: 75.6k passes per 5 s instead of 51.7k in Lost
+    // Odyssey, which cost 2.2 fps - more than the bounding saved. Here the
+    // pass being ended is the one the transfers were about to replace anyway.
+    //
+    // A resolve clear in this call rewrites part of the destination behind the
+    // boxes' backs, so its box is set fully dirty instead of empty.
+    const VkBuffer dirty_bbox_buffer = command_processor_.dirty_bbox_buffer();
+    command_processor_.PushBufferMemoryBarrier(
+        dirty_bbox_buffer, 0, VK_WHOLE_SIZE,
+        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_SHADER_WRITE_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+    command_processor_.SubmitBarriers(true);
+    DeferredCommandBuffer& snapshot_command_buffer =
+        command_processor_.deferred_command_buffer();
+    constexpr VkDeviceSize kBoxSize = sizeof(uint32_t) * 4;
+    {
+      // With the transfer map diagnostic on, probe the ineligible big pairs
+      // (tiles >= 1440, the D24S8 ping-pong) instead: their boxes at copy
+      // time say whether a bounded copy was available at all.
+      const bool probe_ineligible_big = cvars::log_rt_transfer_map;
+      auto probe_wanted = [&](const DirtyBoxPair& pair) {
+        return probe_ineligible_big
+                   ? (!pair.was_eligible && pair.start_tiles >= 1440 &&
+                      pair.end_tiles - pair.start_tiles >= 250)
+                   : pair.was_eligible;
+      };
+      static uint32_t probe_rotation = 0;
+      uint32_t wanted_count = 0;
+      for (const DirtyBoxPair& pair : dirty_box_pairs) {
+        wanted_count += uint32_t(probe_wanted(pair));
+      }
+      if (wanted_count) {
+        uint32_t probe_target = probe_rotation++ % wanted_count;
+        uint32_t wanted_seen = 0;
+        for (const DirtyBoxPair& pair : dirty_box_pairs) {
+          if (probe_wanted(pair) && wanted_seen++ == probe_target) {
+            command_processor_.CaptureDirtyBboxPairProbe(
+                pair.source->dirty_bbox_slot(), pair.dest->dirty_bbox_slot(),
+                pair.was_eligible ? "eligible" : pair.gate, pair.start_tiles,
+                pair.end_tiles);
+            break;
+          }
+        }
+      }
+    }
+    uint32_t snapshot_pairs_used = 0;
+    for (DirtyBoxPair& pair : dirty_box_pairs) {
+      // Only a pair a draw will actually consult needs a snapshot, and there
+      // are a limited number of entries; a pair that misses out just copies
+      // unbounded.
+      if (!pair.was_eligible ||
+          snapshot_pairs_used >= kDirtyBboxSnapshotPairCount) {
+        pair.was_eligible = false;
+        continue;
+      }
+      pair.snapshot_source_slot =
+          kDirtyBboxSnapshotSlotFirst + snapshot_pairs_used * 2;
+      pair.snapshot_dest_slot = pair.snapshot_source_slot + 1;
+      ++snapshot_pairs_used;
+      VkBufferCopy snapshot_copies[2];
+      snapshot_copies[0].srcOffset =
+          VkDeviceSize(pair.source->dirty_bbox_slot()) * kBoxSize;
+      snapshot_copies[0].dstOffset =
+          VkDeviceSize(pair.snapshot_source_slot) * kBoxSize;
+      snapshot_copies[0].size = kBoxSize;
+      snapshot_copies[1].srcOffset =
+          VkDeviceSize(pair.dest->dirty_bbox_slot()) * kBoxSize;
+      snapshot_copies[1].dstOffset =
+          VkDeviceSize(pair.snapshot_dest_slot) * kBoxSize;
+      snapshot_copies[1].size = kBoxSize;
+      snapshot_command_buffer.CmdVkCopyBuffer(
+          dirty_bbox_buffer, dirty_bbox_buffer, 2, snapshot_copies);
+    }
+    // Transfer commands in one command buffer are not ordered against each
+    // other, so the zeroing has to wait for the snapshots to be read.
+    if (snapshot_pairs_used) {
+      command_processor_.PushBufferMemoryBarrier(
+          dirty_bbox_buffer, 0, VK_WHOLE_SIZE, VK_PIPELINE_STAGE_TRANSFER_BIT,
+          VK_PIPELINE_STAGE_TRANSFER_BIT,
+          VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+          VK_ACCESS_TRANSFER_WRITE_BIT);
+      command_processor_.SubmitBarriers(true);
+    }
+    for (const DirtyBoxPair& pair : dirty_box_pairs) {
+      snapshot_command_buffer.CmdVkFillBuffer(
+          dirty_bbox_buffer,
+          VkDeviceSize(pair.dest->dirty_bbox_slot()) * kBoxSize, kBoxSize,
+          resolve_clear_needed ? 0xFFFFu : 0u);
+      snapshot_command_buffer.CmdVkFillBuffer(
+          dirty_bbox_buffer,
+          VkDeviceSize(pair.source->dirty_bbox_slot()) * kBoxSize, kBoxSize, 0);
+    }
+    command_processor_.PushBufferMemoryBarrier(
+        dirty_bbox_buffer, 0, VK_WHOLE_SIZE,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
   }
 
   // Do host depth storing for the depth destination (assuming there can be only
@@ -5645,8 +5767,8 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                   bounded_pair.source == it->transfer.source) {
                 if (bounded_pair.was_eligible) {
                   bounded_slots_constant =
-                      (source_vulkan_rt.dirty_bbox_slot() & 0xFFFFu) |
-                      (dest_vulkan_rt.dirty_bbox_slot() << 16);
+                      (bounded_pair.snapshot_source_slot & 0xFFFFu) |
+                      (bounded_pair.snapshot_dest_slot << 16);
                   stats_transfer_bounded_pushed_.fetch_add(
                       1, std::memory_order_relaxed);
                 }
@@ -5898,67 +6020,13 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
     }
   }
 
-  if (dirty_box_tracking && !dirty_box_pairs.empty()) {
-    // The copies just made each pair's contents identical on the range:
-    // reset both sides' dirty boxes and re-arm the pair sync records so the
-    // next copy between them may be bounded. A resolve clear in this same
-    // call modifies destinations behind the vertex shaders' backs, so with
-    // one present the epochs are bumped without records - the next copy is
-    // full and re-establishes the sync.
-    const VkBuffer dirty_bbox_buffer = command_processor_.dirty_bbox_buffer();
-    command_processor_.PushBufferMemoryBarrier(
-        dirty_bbox_buffer, 0, VK_WHOLE_SIZE,
-        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_ACCESS_SHADER_WRITE_BIT,
-        VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
-    command_processor_.SubmitBarriers(true);
-    DeferredCommandBuffer& reset_command_buffer =
-        command_processor_.deferred_command_buffer();
-    {
-      // With the transfer map diagnostic on, probe the ineligible big pairs
-      // (tiles >= 1440, the D24S8 ping-pong) instead: their boxes at copy
-      // time say whether a bounded copy was available at all.
-      const bool probe_ineligible_big = cvars::log_rt_transfer_map;
-      auto probe_wanted = [&](const DirtyBoxPair& pair) {
-        return probe_ineligible_big
-                   ? (!pair.was_eligible && pair.start_tiles >= 1440 &&
-                      pair.end_tiles - pair.start_tiles >= 250)
-                   : pair.was_eligible;
-      };
-      static uint32_t probe_rotation = 0;
-      uint32_t wanted_count = 0;
-      for (const DirtyBoxPair& pair : dirty_box_pairs) {
-        wanted_count += uint32_t(probe_wanted(pair));
-      }
-      if (wanted_count) {
-        uint32_t probe_target = probe_rotation++ % wanted_count;
-        uint32_t wanted_seen = 0;
-        for (const DirtyBoxPair& pair : dirty_box_pairs) {
-          if (probe_wanted(pair) && wanted_seen++ == probe_target) {
-            command_processor_.CaptureDirtyBboxPairProbe(
-                pair.source->dirty_bbox_slot(), pair.dest->dirty_bbox_slot(),
-                pair.was_eligible ? "eligible" : pair.gate, pair.start_tiles,
-                pair.end_tiles);
-            break;
-          }
-        }
-      }
-    }
+  if (dirty_box_tracking && !dirty_box_pairs.empty() &&
+      !cvars::dirty_bbox_skip_reset) {
+    // The copies just made each pair's contents identical on the range, so
+    // re-arm the pair sync records. The boxes themselves were already zeroed
+    // before the draws; all that is left here is bookkeeping on the host, no
+    // commands, so it cannot end a render pass.
     for (const DirtyBoxPair& pair : dirty_box_pairs) {
-      // After the copy the pair is identical on the range except where later
-      // divergence lands in the boxes. A resolve clear in this same call
-      // rewrites part of the destination behind the boxes' backs, so the
-      // destination box is set to fully dirty instead of empty - the record
-      // stays valid and the next copy is simply unbounded.
-      reset_command_buffer.CmdVkFillBuffer(
-          dirty_bbox_buffer,
-          VkDeviceSize(pair.dest->dirty_bbox_slot()) * (sizeof(uint32_t) * 4),
-          sizeof(uint32_t) * 4, resolve_clear_needed ? 0xFFFFu : 0u);
-      reset_command_buffer.CmdVkFillBuffer(
-          dirty_bbox_buffer,
-          VkDeviceSize(pair.source->dirty_bbox_slot()) *
-              (sizeof(uint32_t) * 4),
-          sizeof(uint32_t) * 4, 0);
       pair.dest->set_box_epoch(NextDirtyBoxEpoch());
       pair.source->set_box_epoch(NextDirtyBoxEpoch());
       auto put_sync = [&](RenderTarget& record_holder, RenderTarget& peer) {
@@ -5990,11 +6058,6 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       put_sync(*pair.dest, *pair.source);
       put_sync(*pair.source, *pair.dest);
     }
-    command_processor_.PushBufferMemoryBarrier(
-        dirty_bbox_buffer, 0, VK_WHOLE_SIZE,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
-        VK_ACCESS_TRANSFER_WRITE_BIT,
-        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
   }
 }
 
