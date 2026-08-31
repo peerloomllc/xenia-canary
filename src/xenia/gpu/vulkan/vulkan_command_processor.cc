@@ -4348,7 +4348,10 @@ void VulkanCommandProcessor::CheckSubmissionCompletionAndDeviceLoss(
 }
 
 void VulkanCommandProcessor::CaptureDirtyBboxPairProbe(uint32_t source_slot,
-                                                       uint32_t dest_slot) {
+                                                       uint32_t dest_slot,
+                                                       const char* gate,
+                                                       uint32_t start_tiles,
+                                                       uint32_t end_tiles) {
   if (!dirty_bbox_enabled_ || dirty_bbox_pair_probe_pending_ ||
       dirty_bbox_readback_buffer_ == VK_NULL_HANDLE) {
     return;
@@ -4371,6 +4374,9 @@ void VulkanCommandProcessor::CaptureDirtyBboxPairProbe(uint32_t source_slot,
   dirty_bbox_pair_probe_submission_ = GetCurrentSubmission();
   dirty_bbox_pair_probe_slots_[0] = source_slot;
   dirty_bbox_pair_probe_slots_[1] = dest_slot;
+  dirty_bbox_pair_probe_gate_ = gate;
+  dirty_bbox_pair_probe_tiles_[0] = start_tiles;
+  dirty_bbox_pair_probe_tiles_[1] = end_tiles;
 }
 
 void VulkanCommandProcessor::StartGpuTimeSubmission() {
@@ -4617,16 +4623,28 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
       const uint32_t* probe_boxes =
           static_cast<const uint32_t*>(dirty_bbox_readback_mapping_) +
           size_t(RenderTargetCache::kDirtyBboxSlotCount - 2) * 4;
+      uint32_t probe_min_x[2], probe_max_x[2], probe_min_y[2], probe_max_y[2];
+      bool probe_empty[2];
       for (uint32_t probe_i = 0; probe_i < 2; ++probe_i) {
         const uint32_t* box = probe_boxes + probe_i * 4;
-        XELOGI(
-            "Dirty bbox pair probe {} slot {}: px x [{}, {}] y [{}, {}]",
-            probe_i ? "dest" : "source", dirty_bbox_pair_probe_slots_[probe_i],
-            65535 - std::min<uint32_t>(box[0], 65535),
-            std::min<uint32_t>(box[2], 65535),
-            65535 - std::min<uint32_t>(box[1], 65535),
-            std::min<uint32_t>(box[3], 65535));
+        probe_min_x[probe_i] = 65535 - std::min<uint32_t>(box[0], 65535);
+        probe_min_y[probe_i] = 65535 - std::min<uint32_t>(box[1], 65535);
+        probe_max_x[probe_i] = std::min<uint32_t>(box[2], 65535);
+        probe_max_y[probe_i] = std::min<uint32_t>(box[3], 65535);
+        probe_empty[probe_i] = probe_min_x[probe_i] > probe_max_x[probe_i] ||
+                               probe_min_y[probe_i] > probe_max_y[probe_i];
       }
+      XELOGI(
+          "Dirty bbox pair probe ({}) tiles [{}, {}): source slot {} px x "
+          "[{}, {}] y [{}, {}]{} | dest slot {} px x [{}, {}] y [{}, {}]{} | "
+          "union {}",
+          dirty_bbox_pair_probe_gate_, dirty_bbox_pair_probe_tiles_[0],
+          dirty_bbox_pair_probe_tiles_[1], dirty_bbox_pair_probe_slots_[0],
+          probe_min_x[0], probe_max_x[0], probe_min_y[0], probe_max_y[0],
+          probe_empty[0] ? " EMPTY" : "", dirty_bbox_pair_probe_slots_[1],
+          probe_min_x[1], probe_max_x[1], probe_min_y[1], probe_max_y[1],
+          probe_empty[1] ? " EMPTY" : "",
+          (probe_empty[0] && probe_empty[1]) ? "EMPTY" : "non-empty");
     }
     if (dirty_bbox_readback_pending_ &&
         completed_submission >= dirty_bbox_readback_submission_) {

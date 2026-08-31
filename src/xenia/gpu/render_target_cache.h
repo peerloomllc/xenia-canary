@@ -411,7 +411,11 @@ class RenderTargetCache {
       uint32_t peer_epoch = 0;
       bool valid = false;
     };
-    PairSync pair_syncs[2];
+    // A render target syncs with several peers, and with more than one tile
+    // range per peer (the same depth buffer is copied over two heights here).
+    // With two records they evicted each other every copy and a request kept
+    // finding the other range's record and failing the range check.
+    PairSync pair_syncs[8];
     uint32_t pair_sync_next = 0;
 
    protected:

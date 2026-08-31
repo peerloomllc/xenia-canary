@@ -4764,6 +4764,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
     uint32_t end_tiles;
     bool host_depth_involved;
     bool was_eligible;
+    const char* gate;
   };
   std::vector<DirtyBoxPair> dirty_box_pairs;
   bool dirty_box_tracking = command_processor_.dirty_bbox_tracking_enabled();
@@ -4807,44 +4808,57 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             dirty_box_pairs.push_back({render_targets[i], transfer.source,
                                        transfer.start_tiles,
                                        transfer.end_tiles,
-                                       transfer_foreign_host_depth, false});
+                                       transfer_foreign_host_depth, false,
+                                       "no_record"});
           }
         }
       }
       for (DirtyBoxPair& pair : dirty_box_pairs) {
+        const char*& pair_gate = pair.gate;
+        const RenderTarget::PairSync* failed_sync = nullptr;
         if (pair.host_depth_involved) {
-          continue;
-        }
-        const char* pair_gate = "no_record";
-        for (const RenderTarget::PairSync& pair_sync :
-             pair.dest->pair_syncs) {
-          if (pair_sync.valid && pair_sync.peer == pair.source->key()) {
-            if (pair_sync.start_tiles > pair.start_tiles ||
-                pair_sync.end_tiles < pair.end_tiles) {
-              pair_gate = "range";
-              continue;
+          pair_gate = "host_depth";
+        } else {
+          for (const RenderTarget::PairSync& pair_sync :
+               pair.dest->pair_syncs) {
+            if (pair_sync.valid && pair_sync.peer == pair.source->key()) {
+              if (pair_sync.start_tiles > pair.start_tiles ||
+                  pair_sync.end_tiles < pair.end_tiles) {
+                pair_gate = "range";
+                failed_sync = &pair_sync;
+                continue;
+              }
+              if (pair_sync.self_epoch != pair.dest->box_epoch() ||
+                  pair_sync.peer_epoch != pair.source->box_epoch()) {
+                pair_gate = "stale_epoch";
+                failed_sync = &pair_sync;
+                continue;
+              }
+              pair.was_eligible = true;
+              stats_transfer_bounded_eligible_.fetch_add(
+                  1, std::memory_order_relaxed);
+              break;
             }
-            if (pair_sync.self_epoch != pair.dest->box_epoch() ||
-                pair_sync.peer_epoch != pair.source->box_epoch()) {
-              pair_gate = "stale_epoch";
-              continue;
-            }
-            pair.was_eligible = true;
-            stats_transfer_bounded_eligible_.fetch_add(
-                1, std::memory_order_relaxed);
-            break;
           }
         }
-        if (!pair.was_eligible && cvars::log_rt_transfer_map) {
-          static std::atomic<uint32_t> ineligible_log_budget{40};
-          if (ineligible_log_budget.fetch_sub(1, std::memory_order_relaxed) >
-              0) {
+        // Diagnostic focus: only the big pairs (the [1440, ...) depth
+        // ping-pong); the tile-720 pair would exhaust the budget.
+        if (!pair.was_eligible && cvars::log_rt_transfer_map &&
+            pair.start_tiles >= 1440) {
+          static std::atomic<uint32_t> ineligible_log_count{0};
+          if (ineligible_log_count.fetch_add(1, std::memory_order_relaxed) <
+              40) {
             XELOGI(
                 "Pair not eligible ({}): source slot {} epoch {} -> dest "
-                "slot {} epoch {} tiles [{}, {})",
+                "slot {} epoch {} tiles [{}, {}) sync [{}, {}) self_epoch "
+                "{} peer_epoch {}",
                 pair_gate, pair.source->dirty_bbox_slot(),
                 pair.source->box_epoch(), pair.dest->dirty_bbox_slot(),
-                pair.dest->box_epoch(), pair.start_tiles, pair.end_tiles);
+                pair.dest->box_epoch(), pair.start_tiles, pair.end_tiles,
+                failed_sync ? failed_sync->start_tiles : 0,
+                failed_sync ? failed_sync->end_tiles : 0,
+                failed_sync ? failed_sync->self_epoch : 0,
+                failed_sync ? failed_sync->peer_epoch : 0);
           }
         }
       }
@@ -5901,18 +5915,30 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
     DeferredCommandBuffer& reset_command_buffer =
         command_processor_.deferred_command_buffer();
     {
+      // With the transfer map diagnostic on, probe the ineligible big pairs
+      // (tiles >= 1440, the D24S8 ping-pong) instead: their boxes at copy
+      // time say whether a bounded copy was available at all.
+      const bool probe_ineligible_big = cvars::log_rt_transfer_map;
+      auto probe_wanted = [&](const DirtyBoxPair& pair) {
+        return probe_ineligible_big
+                   ? (!pair.was_eligible && pair.start_tiles >= 1440 &&
+                      pair.end_tiles - pair.start_tiles >= 250)
+                   : pair.was_eligible;
+      };
       static uint32_t probe_rotation = 0;
-      uint32_t eligible_count = 0;
+      uint32_t wanted_count = 0;
       for (const DirtyBoxPair& pair : dirty_box_pairs) {
-        eligible_count += uint32_t(pair.was_eligible);
+        wanted_count += uint32_t(probe_wanted(pair));
       }
-      if (eligible_count) {
-        uint32_t probe_target = probe_rotation++ % eligible_count;
-        uint32_t eligible_seen = 0;
+      if (wanted_count) {
+        uint32_t probe_target = probe_rotation++ % wanted_count;
+        uint32_t wanted_seen = 0;
         for (const DirtyBoxPair& pair : dirty_box_pairs) {
-          if (pair.was_eligible && eligible_seen++ == probe_target) {
+          if (probe_wanted(pair) && wanted_seen++ == probe_target) {
             command_processor_.CaptureDirtyBboxPairProbe(
-                pair.source->dirty_bbox_slot(), pair.dest->dirty_bbox_slot());
+                pair.source->dirty_bbox_slot(), pair.dest->dirty_bbox_slot(),
+                pair.was_eligible ? "eligible" : pair.gate, pair.start_tiles,
+                pair.end_tiles);
             break;
           }
         }
@@ -5936,10 +5962,16 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       pair.dest->set_box_epoch(NextDirtyBoxEpoch());
       pair.source->set_box_epoch(NextDirtyBoxEpoch());
       auto put_sync = [&](RenderTarget& record_holder, RenderTarget& peer) {
+        // The copy just made the two identical over its range, so a record
+        // for the same peer covering no more than this range is superseded
+        // rather than kept beside it - otherwise the narrower record is the
+        // one a later lookup finds and fails on.
         for (RenderTarget::PairSync& pair_sync : record_holder.pair_syncs) {
           if (pair_sync.valid && pair_sync.peer == peer.key() &&
-              pair_sync.start_tiles == pair.start_tiles &&
-              pair_sync.end_tiles == pair.end_tiles) {
+              pair_sync.start_tiles >= pair.start_tiles &&
+              pair_sync.end_tiles <= pair.end_tiles) {
+            pair_sync.start_tiles = pair.start_tiles;
+            pair_sync.end_tiles = pair.end_tiles;
             pair_sync.self_epoch = record_holder.box_epoch();
             pair_sync.peer_epoch = peer.box_epoch();
             return;

@@ -621,9 +621,14 @@ class VulkanCommandProcessor final : public CommandProcessor {
   bool dirty_bbox_pair_probe_pending_ = false;
   uint64_t dirty_bbox_pair_probe_submission_ = 0;
   uint32_t dirty_bbox_pair_probe_slots_[2] = {};
+  const char* dirty_bbox_pair_probe_gate_ = "eligible";
+  uint32_t dirty_bbox_pair_probe_tiles_[2] = {};
   // Public entry for the render target cache.
  public:
-  void CaptureDirtyBboxPairProbe(uint32_t source_slot, uint32_t dest_slot);
+  void CaptureDirtyBboxPairProbe(uint32_t source_slot, uint32_t dest_slot,
+                                 const char* gate = "eligible",
+                                 uint32_t start_tiles = 0,
+                                 uint32_t end_tiles = 0);
 
  private:
 
