@@ -27,6 +27,12 @@ DEFINE_path(mappings_file, "gamecontrollerdb.txt",
             "Filename of a database with custom game controller mappings.",
             "SDL");
 
+DEFINE_bool(log_input_latency, false,
+            "Log a warning when controller event processing stalls: the UI "
+            "thread takes over 50 ms to run a queued event pump, or over "
+            "150 ms pass between pumps while a title is polling input.",
+            "SDL");
+
 namespace xe {
 namespace hid {
 namespace sdl {
@@ -730,7 +736,32 @@ void SDLInputDriver::QueueControllerUpdate() {
   bool is_queued = false;
   sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);
   if (!is_queued) {
-    window()->app_context().CallInUIThread([this]() {
+    auto queued_at = std::chrono::steady_clock::now();
+    window()->app_context().CallInUIThread([this, queued_at]() {
+      auto now = std::chrono::steady_clock::now();
+      if (cvars::log_input_latency) {
+        // The pump runs on the UI thread; a stall there is invisible input
+        // loss (the guest keeps polling a state nobody updates).
+        auto queue_delay_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now -
+                                                                  queued_at)
+                .count();
+        if (queue_delay_ms > 50) {
+          XELOGW("SDL input: event pump ran {} ms after it was queued (UI "
+                 "thread stall)",
+                 queue_delay_ms);
+        }
+        if (last_pump_time_.time_since_epoch().count() != 0) {
+          auto pump_gap_ms =
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  now - last_pump_time_)
+                  .count();
+          if (pump_gap_ms > 150) {
+            XELOGW("SDL input: {} ms between event pumps", pump_gap_ms);
+          }
+        }
+        last_pump_time_ = now;
+      }
       SDL_PumpEvents();
       sdl_pumpevents_queued_ = false;
     });

@@ -12,6 +12,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <optional>
 
@@ -86,6 +87,8 @@ class SDLInputDriver final : public InputDriver {
   bool sdl_gamecontroller_initialized_;
   int sdl_events_unflushed_;
   std::atomic<bool> sdl_pumpevents_queued_;
+  // UI thread only: when the last event pump ran (--log_input_latency).
+  std::chrono::steady_clock::time_point last_pump_time_{};
   std::array<ControllerState, HID_SDL_USER_COUNT> controllers_;
   std::array<KeystrokeState, HID_SDL_USER_COUNT> keystroke_states_;
 };
