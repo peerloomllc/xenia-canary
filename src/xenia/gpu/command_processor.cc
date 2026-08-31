@@ -112,6 +112,7 @@ std::atomic<uint64_t> CommandProcessor::stats_gpu_total_ns_{0};
 std::atomic<uint64_t> CommandProcessor::stats_gpu_transfer_ns_{0};
 std::atomic<uint64_t> CommandProcessor::stats_gpu_resolve_ns_{0};
 std::atomic<uint64_t> CommandProcessor::stats_scissor_area_sum_{0};
+std::atomic<uint64_t> CommandProcessor::stats_gpu_fragment_invocations_{0};
 
 // This should be written completely differently with support for different
 // types.

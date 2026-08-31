@@ -639,6 +639,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_FEATURE(fillModeNonSolid)
     XE_UI_VULKAN_FEATURE(samplerAnisotropy)
     XE_UI_VULKAN_FEATURE(occlusionQueryPrecise)
+    XE_UI_VULKAN_FEATURE(pipelineStatisticsQuery)
     XE_UI_VULKAN_FEATURE(vertexPipelineStoresAndAtomics)
     XE_UI_VULKAN_FEATURE(fragmentStoresAndAtomics)
     XE_UI_VULKAN_FEATURE(shaderClipDistance)

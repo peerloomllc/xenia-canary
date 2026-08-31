@@ -260,6 +260,22 @@ bool VulkanCommandProcessor::SetupContext() {
         XELOGW("--gpu_time_stats: failed to create the timestamp query pool");
         gpu_time_query_pool_ = VK_NULL_HANDLE;
       }
+      if (gpu_time_query_pool_ != VK_NULL_HANDLE &&
+          device_properties.pipelineStatisticsQuery) {
+        VkQueryPoolCreateInfo stat_pool_create_info = {};
+        stat_pool_create_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        stat_pool_create_info.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
+        stat_pool_create_info.queryCount = kGpuStatPoolQueries;
+        stat_pool_create_info.pipelineStatistics =
+            VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT;
+        if (dfn.vkCreateQueryPool(device, &stat_pool_create_info, nullptr,
+                                  &gpu_stat_query_pool_) != VK_SUCCESS) {
+          XELOGW(
+              "--gpu_time_stats: failed to create the pipeline statistics "
+              "query pool");
+          gpu_stat_query_pool_ = VK_NULL_HANDLE;
+        }
+      }
     } else {
       XELOGW("--gpu_time_stats: device timestamps not supported");
     }
@@ -1304,6 +1320,8 @@ void VulkanCommandProcessor::ShutdownContext() {
 
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyQueryPool, device,
                                          gpu_time_query_pool_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyQueryPool, device,
+                                         gpu_stat_query_pool_);
 
   for (SwapFramebuffer& swap_framebuffer : swap_framebuffers_) {
     ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyFramebuffer, device,
@@ -4255,6 +4273,26 @@ void VulkanCommandProcessor::StartGpuTimeSubmission() {
                                                kGpuTimeQueriesPerSubmission);
   deferred_command_buffer_.CmdVkWriteTimestamp(
       VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_time_query_pool_, base);
+  gpu_stat_active_ = false;
+  if (gpu_stat_query_pool_ != VK_NULL_HANDLE) {
+    uint32_t stat_query = gpu_stat_cursor_ % kGpuStatPoolQueries;
+    bool stat_query_pending = false;
+    for (const GpuTimeRecord& record : gpu_time_records_) {
+      if (record.stat_valid && record.stat_query == stat_query) {
+        stat_query_pending = true;
+        break;
+      }
+    }
+    if (!stat_query_pending) {
+      ++gpu_stat_cursor_;
+      gpu_stat_active_ = true;
+      gpu_stat_query_ = stat_query;
+      deferred_command_buffer_.CmdVkResetQueryPool(gpu_stat_query_pool_,
+                                                   stat_query, 1);
+      deferred_command_buffer_.CmdVkBeginQuery(gpu_stat_query_pool_,
+                                               stat_query, 0);
+    }
+  }
 }
 
 void VulkanCommandProcessor::FinishGpuTimeSubmission() {
@@ -4271,6 +4309,16 @@ void VulkanCommandProcessor::FinishGpuTimeSubmission() {
   record.base = gpu_time_base_;
   record.query_count = gpu_time_queries_used_;
   record.region_categories = std::move(gpu_time_region_categories_);
+  if (gpu_stat_active_) {
+    gpu_stat_active_ = false;
+    // A pipeline statistics query begun outside a render pass must also end
+    // outside one.
+    EndRenderPass();
+    deferred_command_buffer_.CmdVkEndQuery(gpu_stat_query_pool_,
+                                           gpu_stat_query_);
+    record.stat_valid = true;
+    record.stat_query = gpu_stat_query_;
+  }
 }
 
 void VulkanCommandProcessor::DrainGpuTimeRecords(
@@ -4297,6 +4345,17 @@ void VulkanCommandProcessor::DrainGpuTimeRecords(
       };
       stats_gpu_total_ns_.fetch_add(region_ns(0, 1),
                                     std::memory_order_relaxed);
+      if (record.stat_valid) {
+        uint64_t fragment_invocations = 0;
+        if (dfn.vkGetQueryPoolResults(
+                device, gpu_stat_query_pool_, record.stat_query, 1,
+                sizeof(fragment_invocations), &fragment_invocations,
+                sizeof(fragment_invocations),
+                VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+          stats_gpu_fragment_invocations_.fetch_add(fragment_invocations,
+                                                    std::memory_order_relaxed);
+        }
+      }
       for (size_t i = 0; i < record.region_categories.size(); ++i) {
         uint32_t begin_index = uint32_t(2 + 2 * i);
         uint64_t ns = region_ns(begin_index, begin_index + 1);

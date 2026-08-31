@@ -598,11 +598,18 @@ class VulkanCommandProcessor final : public CommandProcessor {
   static constexpr uint32_t kGpuTimePoolQueries = 16384;
   static constexpr uint32_t kGpuTimeQueriesPerSubmission = 2048;
   VkQueryPool gpu_time_query_pool_ = VK_NULL_HANDLE;
+  static constexpr uint32_t kGpuStatPoolQueries = 64;
+  VkQueryPool gpu_stat_query_pool_ = VK_NULL_HANDLE;
+  uint32_t gpu_stat_cursor_ = 0;
+  bool gpu_stat_active_ = false;
+  uint32_t gpu_stat_query_ = 0;
   float gpu_time_timestamp_period_ = 0.0f;
   struct GpuTimeRecord {
     uint64_t submission;
     uint32_t base;
     uint32_t query_count;
+    bool stat_valid = false;
+    uint32_t stat_query = 0;
     std::vector<uint8_t> region_categories;
   };
   std::deque<GpuTimeRecord> gpu_time_records_;

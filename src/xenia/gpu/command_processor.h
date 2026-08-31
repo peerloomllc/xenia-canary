@@ -199,6 +199,9 @@ class CommandProcessor {
   // Sum of per-draw guest scissor areas in pixels (with stats_draw_count_ as
   // the divisor): how much of the surface draws could touch at most.
   static std::atomic<uint64_t> stats_scissor_area_sum_;
+  // Fragment shader invocations measured per submission with pipeline
+  // statistics queries (--gpu_time_stats), cumulative.
+  static std::atomic<uint64_t> stats_gpu_fragment_invocations_;
   bool is_paused() const { return paused_; }
   // capture_edram: read the EDRAM contents back on the worker thread before
   // it stops, for a save state (CommandProcessor::Save writes them).
