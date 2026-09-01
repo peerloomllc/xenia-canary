@@ -21,6 +21,15 @@ DECLARE_bool(debug);
 DEFINE_bool(store_all_context_values, false,
             "Don't strip dead context stores to aid in debugging.", "CPU");
 
+DEFINE_bool(
+    promote_vector_context_values, false,
+    "Let a vector value loaded from the guest context be reused instead of "
+    "reloaded, the same as every other type. Off since a74fe21f7 (2026-01-25, "
+    "\"Disable context promotion only for vertex type\"), so it is off here "
+    "too until the reason is understood; on, it removes a large number of "
+    "vector loads from vector-heavy guest code.",
+    "CPU");
+
 DEFINE_bool(full_optimization_even_with_debug, false,
             "For developer use to analyze the quality of the generated code, "
             "not intended for actual debugging of the code",
@@ -113,7 +122,8 @@ void ContextPromotionPass::PromoteBlock(Block* block) {
         i->set_src1(previous_value);
       } else {
         // Store the loaded value into the table.
-        if (i->dest->type != TypeName::VEC128_TYPE) {
+        if (cvars::promote_vector_context_values ||
+            i->dest->type != TypeName::VEC128_TYPE) {
           context_values_[offset] = i->dest;
           validity.set(static_cast<uint32_t>(offset));
         }
@@ -121,7 +131,8 @@ void ContextPromotionPass::PromoteBlock(Block* block) {
     } else if (i->opcode == &OPCODE_STORE_CONTEXT_info) {
       const size_t offset = i->src1.offset;
       Value* value = i->src2.value;
-      if (value->type != TypeName::VEC128_TYPE) {
+      if (cvars::promote_vector_context_values ||
+          value->type != TypeName::VEC128_TYPE) {
         // Store value into the table for later.
         context_values_[offset] = value;
         validity.set(static_cast<uint32_t>(offset));
