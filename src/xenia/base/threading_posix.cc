@@ -283,6 +283,32 @@ class PosixConditionBase;
 // condvar is marked abandoned and leaked instead of destroyed.
 thread_local PosixConditionBase* current_wait_condition_ = nullptr;
 
+// A wait on several objects at once cannot block on their condition
+// variables, so it used to poll them every millisecond. Instead, every signal
+// bumps this epoch and wakes this one condition variable, and a multi-object
+// wait blocks on it: no CPU while idle, and it wakes as soon as something is
+// signalled rather than up to a millisecond later.
+//
+// The counter keeps the cost off the signalling path: with no multi-object
+// wait in progress - the usual case - signalling is one atomic load. Both
+// sides are sequentially consistent, so a waiter that has registered itself
+// cannot be missed by a signal that has already changed the state.
+std::mutex multi_wait_mutex;
+std::condition_variable multi_wait_condition;
+std::atomic<uint64_t> multi_wait_epoch{0};
+std::atomic<uint32_t> multi_wait_waiters{0};
+
+void NotifyMultiObjectWaiters() {
+  if (multi_wait_waiters.load(std::memory_order_seq_cst) == 0) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(multi_wait_mutex);
+    multi_wait_epoch.fetch_add(1, std::memory_order_seq_cst);
+  }
+  multi_wait_condition.notify_all();
+}
+
 class PosixConditionBase {
  public:
   static void MarkCurrentWaitAbandoned();
@@ -384,7 +410,21 @@ class PosixConditionBase {
                         : start_time + timeout;
 
     BlockingWaitMark blocked;
+    // Registered before the first check, and every signal after this point
+    // wakes this thread (both sides are sequentially consistent), so the
+    // block below cannot sleep through a signal it has not already seen.
+    multi_wait_waiters.fetch_add(1, std::memory_order_seq_cst);
+    struct MultiWaitRegistration {
+      ~MultiWaitRegistration() {
+        multi_wait_waiters.fetch_sub(1, std::memory_order_seq_cst);
+      }
+    } multi_wait_registration;
     while (true) {
+      // The epoch before the handles are read: a signal that lands while they
+      // are being read changes it, and the block below then re-checks instead
+      // of sleeping.
+      uint64_t epoch_before_check =
+          multi_wait_epoch.load(std::memory_order_seq_cst);
       // Check all handles to see if any/all are signaled
       // Use try_lock to avoid deadlocks from lock ordering issues
       size_t first_signaled = std::numeric_limits<size_t>::max();
@@ -470,11 +510,16 @@ class PosixConditionBase {
         return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
       }
 
-      // Sleep for a short time before polling again
+      // Block until something is signalled rather than polling. The cap is
+      // only a backstop: a wake is expected, not a timeout.
       auto remaining =
           std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
-      auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
-      std::this_thread::sleep_for(sleep_time);
+      auto block_time = std::min(remaining, std::chrono::milliseconds(50));
+      std::unique_lock<std::mutex> multi_wait_lock(multi_wait_mutex);
+      if (multi_wait_epoch.load(std::memory_order_seq_cst) ==
+          epoch_before_check) {
+        multi_wait_condition.wait_for(multi_wait_lock, block_time);
+      }
     }
   }
 
@@ -516,6 +561,7 @@ class PosixCondition<Event> : public PosixConditionBase {
     RobustLock lock(mutex_);
     signal_ = true;
     cond_->notify_all();
+    NotifyMultiObjectWaiters();
     return true;
   }
 
@@ -589,6 +635,7 @@ class PosixCondition<Semaphore> final : public PosixConditionBase {
     }
     count_ += release_count;
     cond_->notify_all();
+    NotifyMultiObjectWaiters();
     return true;
   }
 
@@ -597,6 +644,7 @@ class PosixCondition<Semaphore> final : public PosixConditionBase {
   void post_execution() override {
     count_--;
     cond_->notify_all();
+    NotifyMultiObjectWaiters();
   }
   uint32_t count_;
   const uint32_t maximum_count_;
@@ -622,6 +670,7 @@ class PosixCondition<Mutant> final : public PosixConditionBase {
       // Free to be acquired by another thread
       if (count_ == 0) {
         cond_->notify_all();
+        NotifyMultiObjectWaiters();
       }
       return true;
     }
@@ -656,6 +705,7 @@ class PosixCondition<Timer> final : public PosixConditionBase {
     RobustLock lock(mutex_);
     signal_ = true;
     cond_->notify_all();
+    NotifyMultiObjectWaiters();
     return true;
   }
 
@@ -1024,6 +1074,7 @@ class PosixCondition<Thread> final : public PosixConditionBase {
       sem_post(&suspend_sem_);
     }
     state_signal_.notify_all();
+    NotifyMultiObjectWaiters();
     return true;
   }
 
@@ -1099,6 +1150,7 @@ class PosixCondition<Thread> final : public PosixConditionBase {
       exit_code_ = exit_code;
       signaled_ = true;
       cond_->notify_all();
+      NotifyMultiObjectWaiters();
     }
     if (is_current_thread) {
       pthread_exit(reinterpret_cast<void*>(exit_code));
@@ -1504,6 +1556,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
       thread->handle_.suspend_count_ = 1;
     }
     thread->handle_.state_signal_.notify_all();
+    NotifyMultiObjectWaiters();
   }
 
   if (create_suspended) {
@@ -1542,6 +1595,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
     thread->handle_.exit_code_ = 0;
     thread->handle_.signaled_ = true;
     thread->handle_.cond_->notify_all();
+    NotifyMultiObjectWaiters();
     if (lock_result == 0 || lock_result == EOWNERDEAD) {
       pthread_mutex_unlock(native_mutex);
     }
