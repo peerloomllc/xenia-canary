@@ -28,6 +28,7 @@
 #include <fstream>
 #include <cmath>
 #include <algorithm>
+#include <array>
 #include <chrono>
 
 #include "third_party/imgui/imgui.h"
@@ -5435,6 +5436,20 @@ GtkWidget* HelpIcon(const char* name) {
   return icon;
 }
 
+// Grey a whole settings row, name included: setting only the control leaves
+// its label bright, which reads as "this works" next to something that does
+// not.
+void SetRowSensitive(GtkWidget* grid, int row_index, GtkWidget* control,
+                     bool sensitive) {
+  if (control) {
+    gtk_widget_set_sensitive(control, sensitive);
+  }
+  GtkWidget* label = gtk_grid_get_child_at(GTK_GRID(grid), 0, row_index);
+  if (label) {
+    gtk_widget_set_sensitive(label, sensitive);
+  }
+}
+
 // A settings row's first column: the name, then the help icon.
 GtkWidget* LabelWithHelp(const char* text, const char* name) {
   GtkWidget* row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
@@ -5464,8 +5479,8 @@ GtkWidget* HeadingLabel(const char* text) {
   return label;
 }
 
-void AddCheck(GtkWidget* grid, int& row, const char* label, const char* name,
-              bool value) {
+GtkWidget* AddCheck(GtkWidget* grid, int& row, const char* label,
+                    const char* name, bool value) {
   GtkWidget* check = gtk_check_button_new_with_label(label);
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(check), value);
   std::string cvar_name = name;
@@ -5478,10 +5493,12 @@ void AddCheck(GtkWidget* grid, int& row, const char* label, const char* name,
   gtk_box_pack_start(GTK_BOX(check_row), HelpIcon(name), FALSE, FALSE, 0);
   gtk_widget_set_halign(check_row, GTK_ALIGN_START);
   gtk_grid_attach(GTK_GRID(grid), check_row, 0, row++, 2, 1);
+  return check_row;
 }
 
 // Combo over (value, label) pairs; on_change gets the chosen value.
-void AddCombo(GtkWidget* grid, int& row, const char* label, const char* name,
+GtkWidget* AddCombo(GtkWidget* grid, int& row, const char* label,
+                    const char* name,
               const std::vector<std::pair<std::string, std::string>>& choices,
               const std::string& current,
               std::function<void(const std::string&)> on_change) {
@@ -5504,9 +5521,11 @@ void AddCombo(GtkWidget* grid, int& row, const char* label, const char* name,
     }
   });
   gtk_grid_attach(GTK_GRID(grid), combo, 1, row++, 1, 1);
+  return combo;
 }
 
-void AddSpin(GtkWidget* grid, int& row, const char* label, const char* name,
+GtkWidget* AddSpin(GtkWidget* grid, int& row, const char* label,
+                   const char* name,
              double value, double min_value, double max_value,
              std::function<void(double)> on_change) {
   gtk_grid_attach(GTK_GRID(grid), LabelWithHelp(label, name), 0, row, 1, 1);
@@ -5517,25 +5536,27 @@ void AddSpin(GtkWidget* grid, int& row, const char* label, const char* name,
     on_change(gtk_spin_button_get_value(GTK_SPIN_BUTTON(w)));
   });
   gtk_grid_attach(GTK_GRID(grid), spin, 1, row++, 1, 1);
+  return spin;
 }
 
 // Horizontal slider with the value shown; on_change fires on every step of a
 // drag, so callers should use SetGpuOptionDeferred.
-void AddScale(GtkWidget* grid, int& row, const char* label, const char* name,
+GtkWidget* AddScale(GtkWidget* grid, int& row, const char* label,
+                    const char* name,
               double value, double min_value, double max_value, double step,
               std::function<void(double)> on_change) {
-  gtk_grid_attach(GTK_GRID(grid), LeftLabel(label), 0, row, 1, 1);
+  gtk_grid_attach(GTK_GRID(grid), LabelWithHelp(label, name), 0, row, 1, 1);
   GtkWidget* scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL,
                                               min_value, max_value, step);
   gtk_scale_set_digits(GTK_SCALE(scale), 2);
   gtk_scale_set_value_pos(GTK_SCALE(scale), GTK_POS_RIGHT);
   gtk_range_set_value(GTK_RANGE(scale), value);
   gtk_widget_set_hexpand(scale, TRUE);
-  SetTooltipFromCvar(scale, name);
   AttachSettingsCallback(scale, "value-changed", [on_change](GtkWidget* w) {
     on_change(gtk_range_get_value(GTK_RANGE(w)));
   });
   gtk_grid_attach(GTK_GRID(grid), scale, 1, row++, 1, 1);
+  return scale;
 }
 
 // Override a cvar now and write the config file 500 ms after the last change
@@ -6046,7 +6067,10 @@ void EmulatorWindow::ToggleSettingsWindow() {
     GtkWidget* in_use = LeftLabel("");
     remember("scale_in_use", in_use);
     gtk_grid_attach(GTK_GRID(grid), in_use, 1, row++, 1, 1);
-    AddSpin(grid, row, "Frame rate limit, fps (0 = 60 with VSync, else unlimited; relaunch)",
+    AddSpin(grid, row,
+            cvars::vsync
+                ? "Frame rate limit, fps (0 = 60, from VSync; relaunch)"
+                : "Frame rate limit, fps (0 = unlimited, VSync is off; relaunch)",
             "framerate_limit", double(cvars::framerate_limit), 0, 1000,
             [](double v) { SetGpuOption<uint64_t>("framerate_limit", uint64_t(v)); });
     {
@@ -6061,7 +6085,13 @@ void EmulatorWindow::ToggleSettingsWindow() {
       });
       gtk_grid_attach(GTK_GRID(grid), fps, 0, row++, 2, 1);
     }
-    AddCheck(grid, row, "VSync", "vsync", cvars::vsync);
+    {
+      // The frame rate limit's meaning depends on this, so its label is
+      // rebuilt when this changes.
+      GtkWidget* vsync_row =
+          AddCheck(grid, row, "VSync", "vsync", cvars::vsync);
+      (void)vsync_row;
+    }
 
     grid = NewSection(box, "Filters (take effect now)", true);
     row = 0;
@@ -6077,39 +6107,100 @@ void EmulatorWindow::ToggleSettingsWindow() {
                  SetGpuOption<std::string>("postprocess_antialiasing", v);
                  ApplyDisplayConfigForCvars();
                });
-      AddCombo(grid, row, "Scaling and sharpening",
-               "postprocess_scaling_and_sharpening",
-               {{"", "Bilinear (plain stretch)"},
-                {"cas", "AMD CAS sharpening (up to 2x2 scaling)"},
-                {"fsr", "AMD FSR 1.0 upscaling, CAS when not upscaling"}},
-               GetCvarValueForGuestOutputPaintEffect(
-                   GetGuestOutputPaintEffectForCvarValue(
-                       cvars::postprocess_scaling_and_sharpening)),
-               [this](const std::string& v) {
-                 SetGpuOption<std::string>("postprocess_scaling_and_sharpening",
-                                           v);
-                 ApplyDisplayConfigForCvars();
-               });
-      AddScale(grid, row, "CAS additional sharpness",
-               "postprocess_ffx_cas_additional_sharpness",
-               cvars::postprocess_ffx_cas_additional_sharpness,
-               PaintConfig::kCasAdditionalSharpnessMin,
-               PaintConfig::kCasAdditionalSharpnessMax, 0.01,
-               [this](double v) {
-                 SetGpuOptionDeferred<double>(
-                     "postprocess_ffx_cas_additional_sharpness", v);
-                 ApplyDisplayConfigForCvars();
-               });
-      AddScale(grid, row, "FSR sharpness reduction (lower is sharper)",
-               "postprocess_ffx_fsr_sharpness_reduction",
-               cvars::postprocess_ffx_fsr_sharpness_reduction,
-               PaintConfig::kFsrSharpnessReductionMin,
-               PaintConfig::kFsrSharpnessReductionMax, 0.01,
-               [this](double v) {
-                 SetGpuOptionDeferred<double>(
-                     "postprocess_ffx_fsr_sharpness_reduction", v);
-                 ApplyDisplayConfigForCvars();
-               });
+      // Filled in below; the scaling mode decides which of these can do
+      // anything, so they are created first and wired afterwards.
+      GtkWidget* scaling_combo = nullptr;
+      GtkWidget* cas_sharpness = nullptr;
+      GtkWidget* fsr_reduction = nullptr;
+      GtkWidget* scaling_note = LeftLabel("");
+      int cas_row = 0;
+      int fsr_row = 0;
+      auto update_scaling_dependents = [&, this]() {
+        std::string mode = GetCvarValueForGuestOutputPaintEffect(
+            GetGuestOutputPaintEffectForCvarValue(
+                cvars::postprocess_scaling_and_sharpening));
+        bool is_fsr = mode == "fsr";
+        bool is_cas = mode == "cas";
+        // CAS sharpness is used by CAS, and by FSR for its sharpening pass.
+        // The FSR reduction is only read on the FSR path.
+        SetRowSensitive(grid, cas_row, cas_sharpness, is_fsr || is_cas);
+        SetRowSensitive(grid, fsr_row, fsr_reduction, is_fsr);
+        std::string note;
+        if (is_fsr) {
+          // FSR only upscales while the frame is smaller than the output
+          // (presenter.cc, the EASU pass loop); once the resolution scale
+          // has caught up with the window it is just a sharpener.
+          uint32_t scaled_width = 1280u * std::max(
+              1, std::min(cvars::draw_resolution_scale_x, 7));
+          uint32_t window_width = window_ ? window_->GetActualPhysicalWidth() : 0;
+          if (window_width && scaled_width >= window_width) {
+            note =
+                "At this resolution scale the image already fills the window, "
+                "so FSR has nothing to upscale and only sharpens. Lower the "
+                "scale to let it upscale, or pick CAS.";
+          }
+        } else if (is_cas) {
+          note = "FSR settings do not apply to CAS.";
+        } else {
+          note = "Bilinear does no sharpening, so neither slider applies.";
+        }
+        gtk_label_set_text(GTK_LABEL(scaling_note), note.c_str());
+        gtk_widget_set_visible(scaling_note, !note.empty());
+      };
+
+      scaling_combo = AddCombo(
+          grid, row, "Scaling and sharpening",
+          "postprocess_scaling_and_sharpening",
+          {{"", "Bilinear (plain stretch)"},
+           {"cas", "AMD CAS sharpening (up to 2x2 scaling)"},
+           {"fsr", "AMD FSR 1.0 upscaling, CAS when not upscaling"}},
+          GetCvarValueForGuestOutputPaintEffect(
+              GetGuestOutputPaintEffectForCvarValue(
+                  cvars::postprocess_scaling_and_sharpening)),
+          [this](const std::string& v) {
+            SetGpuOption<std::string>("postprocess_scaling_and_sharpening", v);
+            // The sliders this mode uses were irrelevant until now, so
+            // whatever they hold is left over from another mode: start them
+            // at the value that suits this one.
+            using PaintConfigLocal = ui::Presenter::GuestOutputPaintConfig;
+            if (v == "fsr") {
+              SetGpuOption<double>(
+                  "postprocess_ffx_fsr_sharpness_reduction",
+                  PaintConfigLocal::kFsrSharpnessReductionDefault);
+            } else if (v == "cas") {
+              SetGpuOption<double>(
+                  "postprocess_ffx_cas_additional_sharpness",
+                  PaintConfigLocal::kCasAdditionalSharpnessDefault);
+            }
+            ApplyDisplayConfigForCvars();
+            RefreshSettingsWindow();
+          });
+      gtk_grid_attach(GTK_GRID(grid), scaling_note, 0, row++, 2, 1);
+      cas_row = row;
+      cas_sharpness = AddScale(
+          grid, row, "CAS additional sharpness",
+          "postprocess_ffx_cas_additional_sharpness",
+          cvars::postprocess_ffx_cas_additional_sharpness,
+          PaintConfig::kCasAdditionalSharpnessMin,
+          PaintConfig::kCasAdditionalSharpnessMax, 0.01,
+          [this](double v) {
+            SetGpuOptionDeferred<double>(
+                "postprocess_ffx_cas_additional_sharpness", v);
+            ApplyDisplayConfigForCvars();
+          });
+      fsr_row = row;
+      fsr_reduction = AddScale(
+          grid, row, "FSR sharpness reduction (lower is sharper)",
+          "postprocess_ffx_fsr_sharpness_reduction",
+          cvars::postprocess_ffx_fsr_sharpness_reduction,
+          PaintConfig::kFsrSharpnessReductionMin,
+          PaintConfig::kFsrSharpnessReductionMax, 0.01,
+          [this](double v) {
+            SetGpuOptionDeferred<double>(
+                "postprocess_ffx_fsr_sharpness_reduction", v);
+            ApplyDisplayConfigForCvars();
+          });
+      update_scaling_dependents();
       {
         GtkWidget* dither =
             gtk_check_button_new_with_label("Dither the output to 8 bits");
@@ -6217,12 +6308,27 @@ void EmulatorWindow::ToggleSettingsWindow() {
              {{"", "any: pick what suits the GPU"},
               {"fbo", "fbo: host framebuffers, faster, fewer formats"},
               {"fsi", "fsi: fragment shader interlock, most accurate"}},
-             cvars::render_target_path_vulkan, [](const std::string& v) {
+             cvars::render_target_path_vulkan, [this](const std::string& v) {
                SetGpuOption<std::string>("render_target_path_vulkan", v);
+               // Whether the copy-skipping box can do anything depends on
+               // this, so rebuild the page to show it.
+               RefreshSettingsWindow();
              });
-    AddCheck(grid, row,
-             "Skip copying unchanged screen regions (experimental; relaunch)",
-             "dirty_region_tracking", cvars::dirty_region_tracking);
+    {
+      // Gated on the host render target path in vulkan_pipeline_cache.cc: on
+      // fragment shader interlock the tracking is never built, so the box
+      // would sit ticked while doing nothing.
+      GtkWidget* dirty_row = AddCheck(
+          grid, row,
+          "Skip copying unchanged screen regions (experimental; relaunch)",
+          "dirty_region_tracking", cvars::dirty_region_tracking);
+      if (cvars::render_target_path_vulkan == "fsi") {
+        gtk_widget_set_sensitive(dirty_row, FALSE);
+        GtkWidget* why = LeftLabel(
+            "Needs the fbo render target path; it does nothing on fsi.");
+        gtk_grid_attach(GTK_GRID(grid), why, 0, row++, 2, 1);
+      }
+    }
     AddCheck(grid, row, "Sparse shared memory (Vulkan; relaunch)",
              "vulkan_sparse_shared_memory", cvars::vulkan_sparse_shared_memory);
     AddSpin(grid, row, "Pipeline creation threads (-1 = automatic; relaunch)",
@@ -6233,18 +6339,38 @@ void EmulatorWindow::ToggleSettingsWindow() {
             });
     AddCheck(grid, row, "Asynchronous shader compilation (new pipelines)",
              "async_shader_compilation", cvars::async_shader_compilation);
-    AddSpin(grid, row, "Texture cache soft limit, MB",
-            "texture_cache_memory_limit_soft",
-            cvars::texture_cache_memory_limit_soft, 16, 65536, [](double v) {
-              SetGpuOption<uint32_t>("texture_cache_memory_limit_soft",
-                                     uint32_t(v));
-            });
-    AddSpin(grid, row, "Texture cache hard limit, MB",
-            "texture_cache_memory_limit_hard",
-            cvars::texture_cache_memory_limit_hard, 16, 65536, [](double v) {
-              SetGpuOption<uint32_t>("texture_cache_memory_limit_hard",
-                                     uint32_t(v));
-            });
+    // The soft limit is where the cache starts evicting and the hard limit is
+    // where it must; a soft limit above the hard one is meaningless, so each
+    // pushes the other rather than allowing the pair to be inverted.
+    // Each spin button needs the other, and both callbacks outlive this
+    // function, so the pair is held by value in a shared block rather than
+    // captured by reference off the stack.
+    auto tex_limits = std::make_shared<std::array<GtkWidget*, 2>>(
+        std::array<GtkWidget*, 2>{nullptr, nullptr});
+    (*tex_limits)[0] = AddSpin(
+        grid, row, "Texture cache soft limit, MB",
+        "texture_cache_memory_limit_soft",
+        cvars::texture_cache_memory_limit_soft, 16, 65536,
+        [tex_limits](double v) {
+          SetGpuOption<uint32_t>("texture_cache_memory_limit_soft",
+                                 uint32_t(v));
+          GtkWidget* hard = (*tex_limits)[1];
+          if (hard && v > gtk_spin_button_get_value(GTK_SPIN_BUTTON(hard))) {
+            gtk_spin_button_set_value(GTK_SPIN_BUTTON(hard), v);
+          }
+        });
+    (*tex_limits)[1] = AddSpin(
+        grid, row, "Texture cache hard limit, MB",
+        "texture_cache_memory_limit_hard",
+        cvars::texture_cache_memory_limit_hard, 16, 65536,
+        [tex_limits](double v) {
+          SetGpuOption<uint32_t>("texture_cache_memory_limit_hard",
+                                 uint32_t(v));
+          GtkWidget* soft = (*tex_limits)[0];
+          if (soft && v < gtk_spin_button_get_value(GTK_SPIN_BUTTON(soft))) {
+            gtk_spin_button_set_value(GTK_SPIN_BUTTON(soft), v);
+          }
+        });
     AddSpin(grid, row, "Texture unused for, s (soft limit)",
             "texture_cache_memory_limit_soft_lifetime",
             cvars::texture_cache_memory_limit_soft_lifetime, 0, 3600,
