@@ -6098,7 +6098,12 @@ void EmulatorWindow::ToggleSettingsWindow() {
                                              description.c_str());
     GtkWidget* message_area =
         gtk_message_dialog_get_message_area(GTK_MESSAGE_DIALOG(dialog));
-    GtkWidget* question = gtk_label_new("Restart now?");
+    // Same weight and size the dialog gives its primary text, so the
+    // question reads as the question rather than as a footnote.
+    GtkWidget* question = gtk_label_new(nullptr);
+    gtk_label_set_markup(
+        GTK_LABEL(question),
+        "<span weight=\"bold\" size=\"larger\">Restart now?</span>");
     gtk_label_set_xalign(GTK_LABEL(question), 0.5f);
     gtk_widget_set_halign(question, GTK_ALIGN_CENTER);
     gtk_widget_set_margin_top(question, 8);
