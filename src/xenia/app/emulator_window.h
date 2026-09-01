@@ -43,6 +43,17 @@ struct RecentTitleEntry {
   std::time_t last_run_time;
 };
 
+// Which tab of the Preferences window a .patch.toml entry appears on. The
+// file format has no category field, so this is guessed from the entry's
+// name and description unless the user has moved it (patch_categories.txt
+// in the storage root).
+enum class PatchCategory {
+  kFix = 0,    // fixes, graphics and speed
+  kCheat = 1,  // gameplay advantages
+  kExtra = 2,  // debug menus, free camera, skipped intros
+};
+constexpr int kPatchCategoryCount = 3;
+
 class EmulatorWindow {
  public:
   // Keyboard actions the user can rebind (HID > Keyboard hotkeys).
@@ -283,17 +294,31 @@ class EmulatorWindow {
   void BuildProfilesTab(void* notebook);
   void RefreshProfilesTab();
   void BuildConsoleTab(void* notebook);
-  // Patches tab: the title's .patch.toml entries with checkboxes that
-  // edit is_enabled in the file, and the community repository lookup.
+  // Patches, Cheats and Extras tabs: the title's .patch.toml entries with
+  // checkboxes that edit is_enabled in the file, split by category, and the
+  // community repository lookup (on the Patches tab only).
   void BuildPatchesTab(void* notebook);
+  void BuildPatchCategoryPage(void* notebook, int category);
   void RefreshPatchesTab();
   void RefreshCommunityPatchList();
   void LookupCommunityPatches();
   void DownloadCommunityPatch(const std::string& name);
   std::map<uint32_t, std::string> PatchTitles();
-  void* patches_status_ = nullptr;      // GtkLabel*
-  void* patches_combo_ = nullptr;       // GtkComboBoxText*
-  void* patches_box_ = nullptr;         // GtkBox*: the title's patches
+  // The tab an entry belongs on: the user's choice if there is one,
+  // otherwise guessed from its name and description.
+  PatchCategory PatchCategoryOf(const std::filesystem::path& file,
+                                const std::string& name,
+                                const std::string& desc);
+  void SetPatchCategory(const std::filesystem::path& file,
+                        const std::string& name, PatchCategory category);
+  void LoadPatchCategories();
+  void SavePatchCategories();
+  std::map<std::string, PatchCategory> patch_categories_;  // "file|patch"
+  bool patch_categories_loaded_ = false;
+  void* patches_status_[kPatchCategoryCount] = {};  // GtkLabel*
+  void* patches_combo_[kPatchCategoryCount] = {};   // GtkComboBoxText*
+  void* patches_box_[kPatchCategoryCount] = {};     // GtkBox*: the entries
+  void* patches_enable_[kPatchCategoryCount] = {};  // GtkCheckButton*
   void* community_status_ = nullptr;    // GtkLabel*
   void* community_box_ = nullptr;       // GtkBox*
   void* community_show_all_ = nullptr;  // GtkCheckButton*

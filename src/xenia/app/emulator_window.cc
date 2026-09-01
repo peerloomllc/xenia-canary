@@ -5993,6 +5993,69 @@ std::optional<ui::VirtualKey> VirtualKeyFromGdk(guint keyval) {
   }
 }
 
+// Guess which tab a patch entry belongs on from its name. The .patch.toml
+// format has no category field, so the community files mix graphics fixes,
+// gameplay cheats and debug toys in one list. The name decides: descriptions
+// mention cheats too often to be safe ("No clipping, collision bugs..." under
+// a 60 FPS entry, "Cheat Engine address: ..." under a camera one), and only
+// the two most unmistakable phrases are read out of one. Anything the words
+// do not recognise is a plain patch; the user can move an entry with the
+// button beside it and the choice is remembered.
+PatchCategory GuessPatchCategory(const std::string& name,
+                                 const std::string& desc) {
+  auto lower = [](const std::string& text) {
+    std::string out = text;
+    std::transform(out.begin(), out.end(), out.begin(),
+                   [](unsigned char c) { return char(::tolower(c)); });
+    return out;
+  };
+  std::string lower_name = lower(name);
+  std::string lower_desc = lower(desc);
+  auto name_has = [&lower_name](const char* needle) {
+    return lower_name.find(needle) != std::string::npos;
+  };
+  // A stability or rendering fix wins over any word below: entries like
+  // "Skip infinite loop on race end" are fixes that read as something else.
+  if (name_has("fix") || name_has("loop") || name_has("crash") ||
+      name_has("hash check")) {
+    return PatchCategory::kFix;
+  }
+  // The game's own toys, checked first: "Enable Debug Menu" is an extra even
+  // though such menus are where the cheats usually live.
+  static const char* kExtraWords[] = {
+      "debug menu",     "debug settings",   "developer menu",
+      "developer settings", "dev menu",     "test menu",
+      "level select",   "free cam",         "freecam",
+      "free camera",    "helicam",          "fly around",
+      "wireframe",      "skip intro",       "skip logo",
+      "skip video",     "skip movie",       "camera bounding box",
+  };
+  for (const char* word : kExtraWords) {
+    if (name_has(word)) {
+      return PatchCategory::kExtra;
+    }
+  }
+  static const char* kCheatWords[] = {
+      "infinite",     "unlimited",    "god mode",     "godmode",
+      "invincib",     "no clip",      "noclip",       "one hit kill",
+      "one-hit kill", "instant kill", "unlock all",   "all items",
+      "all weapons",  "all character", "all cars",    "bottomless",
+      "max money",    "max health",   "max ammo",     "max level",
+      "max stats",    "never die",    "always win",   "no reload",
+      "cheat",
+  };
+  for (const char* word : kCheatWords) {
+    if (name_has(word)) {
+      return PatchCategory::kCheat;
+    }
+  }
+  if (lower_desc.find("god mode") != std::string::npos ||
+      lower_desc.find("invincib") != std::string::npos) {
+    return PatchCategory::kCheat;
+  }
+  return PatchCategory::kFix;
+}
+
 }  // namespace
 
 namespace {
@@ -6775,9 +6838,12 @@ void EmulatorWindow::ToggleSettingsWindow() {
                    G_CALLBACK(+[](GtkWidget*, gpointer data) {
                      auto* self = static_cast<EmulatorWindow*>(data);
                      self->settings_window_ = nullptr;
-                     self->patches_status_ = nullptr;
-                     self->patches_combo_ = nullptr;
-                     self->patches_box_ = nullptr;
+                     for (int i = 0; i < kPatchCategoryCount; ++i) {
+                       self->patches_status_[i] = nullptr;
+                       self->patches_combo_[i] = nullptr;
+                       self->patches_box_[i] = nullptr;
+                       self->patches_enable_[i] = nullptr;
+                     }
                      self->community_status_ = nullptr;
                      self->community_box_ = nullptr;
                      self->community_show_all_ = nullptr;
@@ -7755,26 +7821,158 @@ std::map<uint32_t, std::string> EmulatorWindow::PatchTitles() {
   return titles;
 }
 
+namespace {
+
+const char* PatchCategoryTabName(PatchCategory category) {
+  switch (category) {
+    case PatchCategory::kCheat:
+      return "Cheats";
+    case PatchCategory::kExtra:
+      return "Extras";
+    default:
+      return "Patches";
+  }
+}
+
+const char* PatchCategoryIntro(PatchCategory category) {
+  switch (category) {
+    case PatchCategory::kCheat:
+      return "Cheats give an advantage in the game: infinite ammo or health, "
+             "god mode, everything unlocked. Most games have none.";
+    case PatchCategory::kExtra:
+      return "Extras are the game's own toys: debug menus, a free camera, "
+             "wireframe drawing, skipped intro videos.";
+    default:
+      return "Patches change how the game runs: frame rate, resolution, "
+             "filtering, broken effects.";
+  }
+}
+
+const char* PatchCategoryKeyword(PatchCategory category) {
+  switch (category) {
+    case PatchCategory::kCheat:
+      return "cheat";
+    case PatchCategory::kExtra:
+      return "extra";
+    default:
+      return "fix";
+  }
+}
+
+std::string PatchCategoryKey(const std::filesystem::path& file,
+                             const std::string& name) {
+  return file.filename().string() + "|" + name;
+}
+
+}  // namespace
+
+// The user's own placements, one per line: <category> <file> <patch>, tab
+// separated. Names never contain a tab; the file is rewritten whole.
+void EmulatorWindow::LoadPatchCategories() {
+  if (patch_categories_loaded_) {
+    return;
+  }
+  patch_categories_loaded_ = true;
+  std::ifstream in(emulator_->storage_root() / "patch_categories.txt");
+  if (!in) {
+    return;
+  }
+  std::string line;
+  while (std::getline(in, line)) {
+    size_t first = line.find('\t');
+    if (first == std::string::npos) {
+      continue;
+    }
+    size_t second = line.find('\t', first + 1);
+    if (second == std::string::npos) {
+      continue;
+    }
+    std::string keyword = line.substr(0, first);
+    std::string file = line.substr(first + 1, second - first - 1);
+    std::string name = line.substr(second + 1);
+    PatchCategory category = PatchCategory::kFix;
+    if (keyword == "cheat") {
+      category = PatchCategory::kCheat;
+    } else if (keyword == "extra") {
+      category = PatchCategory::kExtra;
+    }
+    patch_categories_[file + "|" + name] = category;
+  }
+}
+
+void EmulatorWindow::SavePatchCategories() {
+  std::filesystem::path path =
+      emulator_->storage_root() / "patch_categories.txt";
+  std::ofstream out(path, std::ios::trunc);
+  if (!out) {
+    XELOGE("Patches: cannot write {}", path.string());
+    return;
+  }
+  out << "# Where each patch entry appears in the Preferences window.\n";
+  out << "# <category>\\t<patch file>\\t<patch name>\n";
+  for (const auto& [key, category] : patch_categories_) {
+    size_t bar = key.find('|');
+    if (bar == std::string::npos) {
+      continue;
+    }
+    out << PatchCategoryKeyword(category) << '\t' << key.substr(0, bar) << '\t'
+        << key.substr(bar + 1) << '\n';
+  }
+}
+
+PatchCategory EmulatorWindow::PatchCategoryOf(
+    const std::filesystem::path& file, const std::string& name,
+    const std::string& desc) {
+  LoadPatchCategories();
+  auto it = patch_categories_.find(PatchCategoryKey(file, name));
+  if (it != patch_categories_.end()) {
+    return it->second;
+  }
+  return GuessPatchCategory(name, desc);
+}
+
+void EmulatorWindow::SetPatchCategory(const std::filesystem::path& file,
+                                      const std::string& name,
+                                      PatchCategory category) {
+  LoadPatchCategories();
+  patch_categories_[PatchCategoryKey(file, name)] = category;
+  SavePatchCategories();
+}
+
 void EmulatorWindow::BuildPatchesTab(void* notebook_ptr) {
+  for (int index = 0; index < kPatchCategoryCount; ++index) {
+    BuildPatchCategoryPage(notebook_ptr, index);
+  }
+  RefreshPatchesTab();
+}
+
+void EmulatorWindow::BuildPatchCategoryPage(void* notebook_ptr,
+                                            int category_index) {
   auto* notebook = static_cast<GtkWidget*>(notebook_ptr);
+  PatchCategory category = PatchCategory(category_index);
   GtkWidget* box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
   gtk_container_set_border_width(GTK_CONTAINER(box), 12);
 
   std::filesystem::path folder = emulator_->storage_root() / "patches";
   GtkWidget* intro = LeftLabel(
-      fmt::format("Patch files (<tt>&lt;title id&gt; - &lt;name&gt;.patch.toml</tt>) "
-                  "in {}. A change here applies when the game next starts.",
-                  folder.string())
+      fmt::format("{} They all come from the same patch files "
+                  "(<tt>&lt;title id&gt; - &lt;name&gt;.patch.toml</tt>) in {}, "
+                  "sorted onto these tabs by what each one does. A change here "
+                  "applies when the game next starts.",
+                  PatchCategoryIntro(category), folder.string())
           .c_str());
   gtk_label_set_use_markup(GTK_LABEL(intro), TRUE);
   gtk_label_set_line_wrap(GTK_LABEL(intro), TRUE);
   gtk_box_pack_start(GTK_BOX(box), intro, FALSE, FALSE, 0);
 
-  GtkWidget* enable =
-      gtk_check_button_new_with_label("Apply enabled patches when a game starts");
+  GtkWidget* enable = gtk_check_button_new_with_label(
+      "Apply enabled patches when a game starts");
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(enable), cvars::apply_patches);
   SetTooltipFromCvar(enable, "apply_patches");
   AttachSettingsCallback(enable, "toggled", [this](GtkWidget* w) {
+    if (patches_refreshing_) {
+      return;
+    }
     SetGpuOption<bool>("apply_patches",
                        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(w)));
     RefreshPatchesTab();
@@ -7812,71 +8010,83 @@ void EmulatorWindow::BuildPatchesTab(void* notebook_ptr) {
   GtkWidget* list = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
   gtk_box_pack_start(GTK_BOX(box), list, FALSE, FALSE, 0);
 
-  // Community repository.
-  gtk_box_pack_start(GTK_BOX(box),
-                     HeadingLabel("Community patches (xenia-canary/game-patches "
-                                  "on GitHub)"),
-                     FALSE, FALSE, 0);
-  GtkWidget* actions = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-  GtkWidget* lookup = gtk_button_new_with_label("Look up");
-  gtk_widget_set_tooltip_text(
-      lookup, "Fetch the list of patch files in the repository (needs curl "
-              "and a network connection) and match it against your games.");
-  AttachSettingsCallback(lookup, "clicked",
-                         [this](GtkWidget*) { LookupCommunityPatches(); });
-  gtk_box_pack_start(GTK_BOX(actions), lookup, FALSE, FALSE, 0);
-  GtkWidget* get_all = gtk_button_new_with_label("Download all for my games");
-  AttachSettingsCallback(get_all, "clicked", [this](GtkWidget*) {
-    std::map<uint32_t, std::string> titles = PatchTitles();
-    auto recorded = LoadCommunityShas(emulator_->storage_root());
-    for (const CommunityPatchFile& file : community_patch_files_) {
-      if (!titles.count(file.title_id)) {
-        continue;
-      }
-      if (StateOfCommunityFile(emulator_->storage_root(), file.name, file.sha,
-                               recorded) == CommunityFileState::kCurrent) {
-        continue;
-      }
-      DownloadCommunityPatch(file.name);
-    }
-  });
-  gtk_box_pack_start(GTK_BOX(actions), get_all, FALSE, FALSE, 0);
-  GtkWidget* show_all = gtk_check_button_new_with_label("All titles");
-  AttachSettingsCallback(show_all, "toggled",
-                         [this](GtkWidget*) { RefreshCommunityPatchList(); });
-  gtk_box_pack_start(GTK_BOX(actions), show_all, FALSE, FALSE, 0);
-  GtkWidget* filter = gtk_entry_new();
-  gtk_entry_set_placeholder_text(GTK_ENTRY(filter), "Filter by name or title id");
-  gtk_widget_set_hexpand(filter, TRUE);
-  AttachSettingsCallback(filter, "changed",
-                         [this](GtkWidget*) { RefreshCommunityPatchList(); });
-  gtk_box_pack_start(GTK_BOX(actions), filter, TRUE, TRUE, 0);
-  gtk_box_pack_start(GTK_BOX(box), actions, FALSE, FALSE, 0);
-  GtkWidget* community_status = LeftLabel("Not looked up yet.");
-  gtk_label_set_line_wrap(GTK_LABEL(community_status), TRUE);
-  gtk_box_pack_start(GTK_BOX(box), community_status, FALSE, FALSE, 0);
-  GtkWidget* community_list = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-  gtk_box_pack_start(GTK_BOX(box), community_list, FALSE, FALSE, 0);
+  patches_status_[category_index] = status;
+  patches_combo_[category_index] = combo;
+  patches_box_[category_index] = list;
+  patches_enable_[category_index] = enable;
 
-  patches_status_ = status;
-  patches_combo_ = combo;
-  patches_box_ = list;
-  community_status_ = community_status;
-  community_box_ = community_list;
-  community_show_all_ = show_all;
-  community_filter_ = filter;
+  // The community repository, on the Patches tab only: a file holds entries
+  // of every category, so there is one download for all three tabs.
+  if (category == PatchCategory::kFix) {
+    gtk_box_pack_start(GTK_BOX(box),
+                       HeadingLabel("Community patches "
+                                    "(xenia-canary/game-patches on GitHub)"),
+                       FALSE, FALSE, 0);
+    GtkWidget* actions = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget* lookup = gtk_button_new_with_label("Look up");
+    gtk_widget_set_tooltip_text(
+        lookup, "Fetch the list of patch files in the repository (needs curl "
+                "and a network connection) and match it against your games.");
+    AttachSettingsCallback(lookup, "clicked",
+                           [this](GtkWidget*) { LookupCommunityPatches(); });
+    gtk_box_pack_start(GTK_BOX(actions), lookup, FALSE, FALSE, 0);
+    GtkWidget* get_all = gtk_button_new_with_label("Download all for my games");
+    AttachSettingsCallback(get_all, "clicked", [this](GtkWidget*) {
+      std::map<uint32_t, std::string> titles = PatchTitles();
+      auto recorded = LoadCommunityShas(emulator_->storage_root());
+      for (const CommunityPatchFile& file : community_patch_files_) {
+        if (!titles.count(file.title_id)) {
+          continue;
+        }
+        if (StateOfCommunityFile(emulator_->storage_root(), file.name, file.sha,
+                                 recorded) == CommunityFileState::kCurrent) {
+          continue;
+        }
+        DownloadCommunityPatch(file.name);
+      }
+    });
+    gtk_box_pack_start(GTK_BOX(actions), get_all, FALSE, FALSE, 0);
+    GtkWidget* show_all = gtk_check_button_new_with_label("All titles");
+    AttachSettingsCallback(show_all, "toggled",
+                           [this](GtkWidget*) { RefreshCommunityPatchList(); });
+    gtk_box_pack_start(GTK_BOX(actions), show_all, FALSE, FALSE, 0);
+    GtkWidget* filter = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(filter),
+                                   "Filter by name or title id");
+    gtk_widget_set_hexpand(filter, TRUE);
+    AttachSettingsCallback(filter, "changed",
+                           [this](GtkWidget*) { RefreshCommunityPatchList(); });
+    gtk_box_pack_start(GTK_BOX(actions), filter, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(box), actions, FALSE, FALSE, 0);
+    GtkWidget* community_status = LeftLabel("Not looked up yet.");
+    gtk_label_set_line_wrap(GTK_LABEL(community_status), TRUE);
+    gtk_box_pack_start(GTK_BOX(box), community_status, FALSE, FALSE, 0);
+    GtkWidget* community_list = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_box_pack_start(GTK_BOX(box), community_list, FALSE, FALSE, 0);
+    community_status_ = community_status;
+    community_box_ = community_list;
+    community_show_all_ = show_all;
+    community_filter_ = filter;
+  } else {
+    GtkWidget* note = LeftLabel(
+        "New files are downloaded on the Patches tab; one file carries the "
+        "entries for all three.");
+    gtk_label_set_line_wrap(GTK_LABEL(note), TRUE);
+    gtk_widget_set_margin_top(note, 8);
+    gtk_widget_set_sensitive(note, FALSE);
+    gtk_box_pack_start(GTK_BOX(box), note, FALSE, FALSE, 0);
+  }
 
   GtkWidget* scroller = gtk_scrolled_window_new(nullptr, nullptr);
   gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroller),
                                  GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
   gtk_container_add(GTK_CONTAINER(scroller), box);
   gtk_notebook_append_page(GTK_NOTEBOOK(notebook), scroller,
-                           gtk_label_new("Patches"));
-  RefreshPatchesTab();
+                           gtk_label_new(PatchCategoryTabName(category)));
 }
 
 void EmulatorWindow::RefreshPatchesTab() {
-  if (!patches_box_) {
+  if (!patches_box_[0]) {
     return;
   }
   patches_refreshing_ = true;
@@ -7884,9 +8094,8 @@ void EmulatorWindow::RefreshPatchesTab() {
   std::map<uint32_t, std::string> titles = PatchTitles();
   uint32_t running = emulator_->is_title_open() ? emulator_->title_id() : 0;
 
-  // The game combo: the running title first, then the rest by name.
-  auto* combo = GTK_COMBO_BOX_TEXT(patches_combo_);
-  gtk_combo_box_text_remove_all(combo);
+  // The game combo, the same list on each tab: the running title first, then
+  // the rest by name.
   patches_combo_title_ids_.clear();
   std::vector<std::pair<std::string, uint32_t>> ordered;
   for (const auto& [id, name] : titles) {
@@ -7901,20 +8110,17 @@ void EmulatorWindow::RefreshPatchesTab() {
   if (!patches_selected_title_ || !titles.count(patches_selected_title_)) {
     patches_selected_title_ = ordered.empty() ? 0 : ordered.front().second;
   }
+  std::vector<std::string> labels;
   int active = 0;
   for (const auto& [name, id] : ordered) {
-    std::string label = fmt::format("{} ({:08X}){}", name.empty() ? "?" : name,
-                                    id, id == running ? "  [running]" : "");
-    gtk_combo_box_text_append_text(combo, label.c_str());
+    labels.push_back(fmt::format("{} ({:08X}){}", name.empty() ? "?" : name, id,
+                                 id == running ? "  [running]" : ""));
     if (id == patches_selected_title_) {
       active = int(patches_combo_title_ids_.size());
     }
     patches_combo_title_ids_.push_back(id);
   }
-  gtk_combo_box_set_active(GTK_COMBO_BOX(combo), active);
 
-  // The title's patch files.
-  ClearChildren(GTK_WIDGET(patches_box_));
   std::filesystem::path folder = emulator_->storage_root() / "patches";
   std::optional<uint64_t> running_hash;
   if (running && emulator_->kernel_state()) {
@@ -7923,121 +8129,189 @@ void EmulatorWindow::RefreshPatchesTab() {
       running_hash = module->hash();
     }
   }
-  size_t file_count = 0;
-  if (patcher && patches_selected_title_) {
-    for (const auto& file : patcher->patch_db()->GetAllPatches()) {
-      if (file.title_id != patches_selected_title_) {
-        continue;
-      }
-      ++file_count;
-      std::string heading = file.file_path.filename().string();
-      // A file for another version of the running game (its hashes do not
-      // include the running module's) is folded away: it will not apply.
-      bool other_version = false;
-      std::string note_text;
-      if (running_hash && file.title_id == running) {
-        bool match = std::find(file.hashes.begin(), file.hashes.end(),
-                               *running_hash) != file.hashes.end();
-        std::string hashes;
-        for (uint64_t h : file.hashes) {
-          hashes += fmt::format("{}{:016X}", hashes.empty() ? "" : ", ", h);
+
+  for (int index = 0; index < kPatchCategoryCount; ++index) {
+    PatchCategory category = PatchCategory(index);
+    auto* combo = GTK_COMBO_BOX_TEXT(patches_combo_[index]);
+    gtk_combo_box_text_remove_all(combo);
+    for (const std::string& label : labels) {
+      gtk_combo_box_text_append_text(combo, label.c_str());
+    }
+    gtk_combo_box_set_active(GTK_COMBO_BOX(combo), active);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(patches_enable_[index]),
+                                 cvars::apply_patches);
+
+    GtkWidget* list = GTK_WIDGET(patches_box_[index]);
+    ClearChildren(list);
+    size_t file_count = 0;
+    size_t entry_count = 0;
+    if (patcher && patches_selected_title_) {
+      for (const auto& file : patcher->patch_db()->GetAllPatches()) {
+        if (file.title_id != patches_selected_title_) {
+          continue;
         }
-        other_version = !match;
-        note_text = match ? "Matches the running copy of the game."
-                          : fmt::format("For a different version of the game "
-                                        "(file: {}; running: {:016X}); it "
-                                        "will not apply.",
-                                        hashes, *running_hash);
-      }
-      GtkWidget* section = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-      if (other_version) {
-        GtkWidget* expander = gtk_expander_new(nullptr);
-        GtkWidget* title = gtk_label_new(nullptr);
-        gtk_label_set_markup(
-            GTK_LABEL(title),
-            fmt::format("{}   <i>another version of the game, not applied</i>",
-                        g_markup_escape_text(heading.c_str(), -1))
-                .c_str());
-        gtk_expander_set_label_widget(GTK_EXPANDER(expander), title);
-        gtk_expander_set_expanded(GTK_EXPANDER(expander), FALSE);
-        gtk_widget_set_margin_top(expander, 8);
-        gtk_container_add(GTK_CONTAINER(expander), section);
-        gtk_widget_set_margin_start(section, 16);
-        gtk_box_pack_start(GTK_BOX(patches_box_), expander, FALSE, FALSE, 0);
-      } else {
-        GtkWidget* head = HeadingLabel(heading.c_str());
-        gtk_box_pack_start(GTK_BOX(patches_box_), head, FALSE, FALSE, 0);
-        gtk_box_pack_start(GTK_BOX(patches_box_), section, FALSE, FALSE, 0);
-      }
-      if (!note_text.empty()) {
-        GtkWidget* note = LeftLabel(note_text.c_str());
-        gtk_label_set_line_wrap(GTK_LABEL(note), TRUE);
-        gtk_box_pack_start(GTK_BOX(section), note, FALSE, FALSE, 0);
-      }
-      for (const auto& patch : file.patch_info) {
-        GtkWidget* check =
-            gtk_check_button_new_with_label(patch.patch_name.c_str());
-        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(check),
-                                     patch.is_enabled);
-        std::string tip = patch.patch_desc;
-        if (!patch.patch_author.empty()) {
-          tip += (tip.empty() ? "" : "\n") + std::string("Author: ") +
-                 patch.patch_author;
+        ++file_count;
+        std::vector<const xe::patcher::PatchInfoEntry*> entries;
+        for (const auto& patch : file.patch_info) {
+          if (PatchCategoryOf(file.file_path, patch.patch_name,
+                              patch.patch_desc) == category) {
+            entries.push_back(&patch);
+          }
         }
-        if (!tip.empty()) {
-          gtk_widget_set_tooltip_text(check, tip.c_str());
+        if (entries.empty()) {
+          continue;
         }
-        std::filesystem::path path = file.file_path;
-        std::string name = patch.patch_name;
-        AttachSettingsCallback(
-            check, "toggled", [this, path, name](GtkWidget* w) {
-              bool on = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(w));
-              bool ok = SetPatchEnabledInFile(path, name, on);
-              XELOGI("Patches: {} '{}' in {} {}", on ? "enable" : "disable",
-                     name, path.filename().string(), ok ? "ok" : "FAILED");
-              if (auto* patcher = emulator_->patcher()) {
-                patcher->patch_db()->Reload(true);
-              }
-              gtk_label_set_text(
-                  GTK_LABEL(patches_status_),
-                  ok ? (emulator_->is_title_open()
-                            ? "Saved. Restart the game to apply the change."
-                            : "Saved. Applies when the game starts.")
-                     : "Could not write the patch file.");
-            });
-        gtk_box_pack_start(GTK_BOX(section), check, FALSE, FALSE, 0);
-        if (!patch.patch_desc.empty()) {
-          GtkWidget* desc = LeftLabel(patch.patch_desc.c_str());
-          gtk_label_set_line_wrap(GTK_LABEL(desc), TRUE);
-          gtk_widget_set_margin_start(desc, 28);
-          gtk_widget_set_sensitive(desc, FALSE);
-          gtk_box_pack_start(GTK_BOX(section), desc, FALSE, FALSE, 0);
+        entry_count += entries.size();
+        std::string heading = file.file_path.filename().string();
+        // A file for another version of the running game (its hashes do not
+        // include the running module's) is folded away: it will not apply.
+        bool other_version = false;
+        std::string note_text;
+        if (running_hash && file.title_id == running) {
+          bool match = std::find(file.hashes.begin(), file.hashes.end(),
+                                 *running_hash) != file.hashes.end();
+          std::string hashes;
+          for (uint64_t h : file.hashes) {
+            hashes += fmt::format("{}{:016X}", hashes.empty() ? "" : ", ", h);
+          }
+          other_version = !match;
+          note_text = match ? "Matches the running copy of the game."
+                            : fmt::format("For a different version of the game "
+                                          "(file: {}; running: {:016X}); it "
+                                          "will not apply.",
+                                          hashes, *running_hash);
+        }
+        GtkWidget* section = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+        if (other_version) {
+          GtkWidget* expander = gtk_expander_new(nullptr);
+          GtkWidget* title = gtk_label_new(nullptr);
+          gtk_label_set_markup(
+              GTK_LABEL(title),
+              fmt::format(
+                  "{}   <i>another version of the game, not applied</i>",
+                  g_markup_escape_text(heading.c_str(), -1))
+                  .c_str());
+          gtk_expander_set_label_widget(GTK_EXPANDER(expander), title);
+          gtk_expander_set_expanded(GTK_EXPANDER(expander), FALSE);
+          gtk_widget_set_margin_top(expander, 8);
+          gtk_container_add(GTK_CONTAINER(expander), section);
+          gtk_widget_set_margin_start(section, 16);
+          gtk_box_pack_start(GTK_BOX(list), expander, FALSE, FALSE, 0);
+        } else {
+          GtkWidget* head = HeadingLabel(heading.c_str());
+          gtk_box_pack_start(GTK_BOX(list), head, FALSE, FALSE, 0);
+          gtk_box_pack_start(GTK_BOX(list), section, FALSE, FALSE, 0);
+        }
+        if (!note_text.empty()) {
+          GtkWidget* note = LeftLabel(note_text.c_str());
+          gtk_label_set_line_wrap(GTK_LABEL(note), TRUE);
+          gtk_box_pack_start(GTK_BOX(section), note, FALSE, FALSE, 0);
+        }
+        for (const xe::patcher::PatchInfoEntry* patch : entries) {
+          GtkWidget* row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+          GtkWidget* check =
+              gtk_check_button_new_with_label(patch->patch_name.c_str());
+          gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(check),
+                                       patch->is_enabled);
+          gtk_widget_set_hexpand(check, TRUE);
+          std::string tip = patch->patch_desc;
+          if (!patch->patch_author.empty()) {
+            tip += (tip.empty() ? "" : "\n") + std::string("Author: ") +
+                   patch->patch_author;
+          }
+          if (!tip.empty()) {
+            gtk_widget_set_tooltip_text(check, tip.c_str());
+          }
+          std::filesystem::path path = file.file_path;
+          std::string name = patch->patch_name;
+          AttachSettingsCallback(
+              check, "toggled", [this, path, name, index](GtkWidget* w) {
+                if (patches_refreshing_) {
+                  return;
+                }
+                bool on = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(w));
+                bool ok = SetPatchEnabledInFile(path, name, on);
+                XELOGI("Patches: {} '{}' in {} {}", on ? "enable" : "disable",
+                       name, path.filename().string(), ok ? "ok" : "FAILED");
+                if (auto* patcher = emulator_->patcher()) {
+                  patcher->patch_db()->Reload(true);
+                }
+                gtk_label_set_text(
+                    GTK_LABEL(patches_status_[index]),
+                    ok ? (emulator_->is_title_open()
+                              ? "Saved. Restart the game to apply the change."
+                              : "Saved. Applies when the game starts.")
+                       : "Could not write the patch file.");
+              });
+          gtk_box_pack_start(GTK_BOX(row), check, TRUE, TRUE, 0);
+          // Move it to one of the other two tabs. Buttons rather than a combo
+          // box: the wheel over a combo in a scrolling list changes it.
+          for (int other = 0; other < kPatchCategoryCount; ++other) {
+            if (other == index) {
+              continue;
+            }
+            PatchCategory target = PatchCategory(other);
+            GtkWidget* move = gtk_button_new_with_label(
+                fmt::format("To {}", PatchCategoryTabName(target)).c_str());
+            gtk_widget_set_valign(move, GTK_ALIGN_CENTER);
+            gtk_widget_set_tooltip_text(
+                move, fmt::format("Show '{}' on the {} tab instead.",
+                                  patch->patch_name,
+                                  PatchCategoryTabName(target))
+                          .c_str());
+            AttachSettingsCallback(
+                move, "clicked", [this, path, name, target](GtkWidget*) {
+                  SetPatchCategory(path, name, target);
+                  // The click's widget is inside the list this rebuilds, so
+                  // do it once the signal has returned.
+                  PostToUIThread([this]() { RefreshPatchesTab(); });
+                });
+            gtk_box_pack_start(GTK_BOX(row), move, FALSE, FALSE, 0);
+          }
+          gtk_box_pack_start(GTK_BOX(section), row, FALSE, FALSE, 0);
+          if (!patch->patch_desc.empty()) {
+            GtkWidget* desc = LeftLabel(patch->patch_desc.c_str());
+            gtk_label_set_line_wrap(GTK_LABEL(desc), TRUE);
+            gtk_widget_set_margin_start(desc, 28);
+            gtk_widget_set_sensitive(desc, FALSE);
+            gtk_box_pack_start(GTK_BOX(section), desc, FALSE, FALSE, 0);
+          }
         }
       }
     }
+    if (running && entry_count) {
+      GtkWidget* restart = gtk_button_new_with_label("Restart the game");
+      gtk_widget_set_halign(restart, GTK_ALIGN_START);
+      gtk_widget_set_margin_top(restart, 6);
+      AttachSettingsCallback(restart, "clicked",
+                             [this](GtkWidget*) { ResetGame(); });
+      gtk_box_pack_start(GTK_BOX(list), restart, FALSE, FALSE, 0);
+    }
+    std::string status;
+    if (!patcher) {
+      status = "No patcher.";
+    } else if (titles.empty()) {
+      status = "No games known yet: run one, or set the games folder.";
+    } else if (!file_count) {
+      status = fmt::format(
+          "No patch file for this game in {}.{}", folder.string(),
+          category == PatchCategory::kFix
+              ? " Look it up in the community list below."
+              : " Look it up on the Patches tab.");
+    } else if (!entry_count) {
+      status = fmt::format(
+          "This game's patch file has no {}. {}",
+          category == PatchCategory::kCheat
+              ? "cheats"
+              : category == PatchCategory::kExtra ? "extras" : "patches",
+          "Anything sorted onto another tab can be moved here with its "
+          "button.");
+    } else if (!cvars::apply_patches) {
+      status = "Patching is off: enable it above for these to apply.";
+    }
+    gtk_label_set_text(GTK_LABEL(patches_status_[index]), status.c_str());
+    gtk_widget_show_all(list);
   }
-  if (running && file_count) {
-    GtkWidget* restart = gtk_button_new_with_label("Restart the game");
-    gtk_widget_set_halign(restart, GTK_ALIGN_START);
-    gtk_widget_set_margin_top(restart, 6);
-    AttachSettingsCallback(restart, "clicked",
-                           [this](GtkWidget*) { ResetGame(); });
-    gtk_box_pack_start(GTK_BOX(patches_box_), restart, FALSE, FALSE, 0);
-  }
-  std::string status;
-  if (!patcher) {
-    status = "No patcher.";
-  } else if (titles.empty()) {
-    status = "No games known yet: run one, or set the games folder.";
-  } else if (!file_count) {
-    status = fmt::format("No patch file for this game in {}. Look it up in the "
-                         "community list below.",
-                         folder.string());
-  } else if (!cvars::apply_patches) {
-    status = "Patching is off: enable it above for these to apply.";
-  }
-  gtk_label_set_text(GTK_LABEL(patches_status_), status.c_str());
-  gtk_widget_show_all(GTK_WIDGET(patches_box_));
   patches_refreshing_ = false;
   RefreshCommunityPatchList();
 }
