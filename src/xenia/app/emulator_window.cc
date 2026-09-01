@@ -5412,7 +5412,25 @@ GtkWidget* NewSection(GtkWidget* box, const char* title, bool expanded) {
 GtkWidget* LeftLabel(const char* text) {
   GtkWidget* label = gtk_label_new(text);
   gtk_widget_set_halign(label, GTK_ALIGN_START);
+  // Wrap rather than demand the width of the longest line: an unwrapped
+  // explanatory label sets the page's minimum width, which the notebook
+  // passes to the window, and the window can then never be made narrower.
+  gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
+  gtk_label_set_line_wrap_mode(GTK_LABEL(label), PANGO_WRAP_WORD_CHAR);
+  gtk_label_set_max_width_chars(GTK_LABEL(label), 60);
+  gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
   return label;
+}
+
+// Every settings tab goes through this: a scrolled window has a small
+// minimum size of its own, so whatever the page wants, the window stays
+// freely resizable in both directions.
+GtkWidget* TabScroller(GtkWidget* child) {
+  GtkWidget* scroller = gtk_scrolled_window_new(nullptr, nullptr);
+  gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroller),
+                                 GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+  gtk_container_add(GTK_CONTAINER(scroller), child);
+  return scroller;
 }
 
 GtkWidget* HeadingLabel(const char* text) {
@@ -6212,9 +6230,7 @@ void EmulatorWindow::ToggleSettingsWindow() {
                                      uint32_t(v));
             });
 
-    GtkWidget* scroller = gtk_scrolled_window_new(nullptr, nullptr);
-    gtk_container_add(GTK_CONTAINER(scroller), box);
-    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), scroller,
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), TabScroller(box),
                              gtk_label_new("GPU"));
   }
   // ---- CPU ----
@@ -6237,7 +6253,7 @@ void EmulatorWindow::ToggleSettingsWindow() {
         "never written down, so treat it as under test: watch for odd "
         "animation or physics rather than a wrong-looking frame.");
     gtk_grid_attach(GTK_GRID(grid), vecnote, 0, row++, 2, 1);
-    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), box,
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), TabScroller(box),
                              gtk_label_new("CPU"));
   }
 
@@ -6283,7 +6299,7 @@ void EmulatorWindow::ToggleSettingsWindow() {
     GtkWidget* note = LeftLabel(
         "The media player panel is still an in-window (ImGui) panel.");
     gtk_grid_attach(GTK_GRID(grid), note, 0, row++, 2, 1);
-    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), grid,
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), TabScroller(grid),
                              gtk_label_new("Audio"));
 
   }
@@ -6359,7 +6375,7 @@ void EmulatorWindow::ToggleSettingsWindow() {
         "Pause/Break, Ctrl+O, Numpad + - *.");
     gtk_label_set_line_wrap(GTK_LABEL(note), TRUE);
     gtk_grid_attach(GTK_GRID(grid), note, 0, row++, 4, 1);
-    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), grid,
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), TabScroller(grid),
                              gtk_label_new("Input"));
   }
 
@@ -6408,7 +6424,7 @@ void EmulatorWindow::ToggleSettingsWindow() {
       });
       gtk_grid_attach(GTK_GRID(grid), clear, 1, row++, 1, 1);
     }
-    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), grid,
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), TabScroller(grid),
                              gtk_label_new("Folders"));
   }
 
@@ -7990,7 +8006,7 @@ void EmulatorWindow::BuildProfilesTab(void* notebook_ptr) {
 
   profiles_list_ = list;
   profiles_status_ = status;
-  gtk_notebook_append_page(GTK_NOTEBOOK(notebook), box,
+  gtk_notebook_append_page(GTK_NOTEBOOK(notebook), TabScroller(box),
                            gtk_label_new("Profiles"));
   RefreshProfilesTab();
 }
