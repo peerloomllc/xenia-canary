@@ -1450,6 +1450,25 @@ bool SimplificationPass::SimplifyVectorOps(hir::Instr* i,
                 i->set_src1(value_extracted_from);
                 return true;
               }
+              // Otherwise, splatting a known lane of a vector is a swizzle of
+              // that lane, which is one instruction. Emitted as written it is
+              // four: the extract moves the lane out to a general register
+              // and the splat moves it straight back
+              //   vmovd r11d, xmm4 / vmovd xmm0, r11d / vpbroadcastd xmm4,
+              //   xmm0
+              // and the round trip through the general register buys nothing.
+              // Both opcodes number lanes the same way (VEC128_D is the
+              // identity, and the swizzle mask reaches vpshufd unchanged), so
+              // the lane index just repeats into all four mask fields.
+              Value* extract_index = splat_input_definition->src2.value;
+              if (extract_index && extract_index->IsConstant()) {
+                uint8_t lane =
+                    static_cast<uint8_t>(extract_index->constant.i8) & 3;
+                i->Replace(&OPCODE_SWIZZLE_info, splat_type);
+                i->set_src1(value_extracted_from);
+                i->src2.offset = uint32_t(lane) * 0x55u;
+                return true;
+              }
             }
           }
         }
