@@ -273,6 +273,11 @@ class EmulatorWindow {
   void RefreshSettingsWindow();
   void* settings_window_ = nullptr;  // GtkWidget*
   std::vector<std::pair<std::string, void*>> settings_refresh_labels_;
+  // Re-evaluated by RefreshSettingsWindow: a setting whose availability or
+  // wording depends on another one registers here, so changing the other
+  // updates it without rebuilding the window. Cleared with the labels when
+  // the window is built or destroyed.
+  std::vector<std::function<void()>> settings_refresh_hooks_;
   int settings_capture_action_ = -1;
   // Profiles and Console tabs of the Preferences window.
   void BuildProfilesTab(void* notebook);

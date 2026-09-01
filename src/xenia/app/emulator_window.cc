@@ -5436,6 +5436,39 @@ GtkWidget* HelpIcon(const char* name) {
   return icon;
 }
 
+// Set while a settings window is open, so the row helpers - which are free
+// functions - can ask it to re-evaluate the settings that depend on others.
+std::function<void()> settings_changed_notifier;
+void NotifySettingsChanged() {
+  if (settings_changed_notifier) {
+    settings_changed_notifier();
+  }
+}
+
+// Settings the emulator only reads while starting up. Changing one in the
+// window does nothing to the running title, so the user is told and offered
+// the restart rather than left wondering why nothing happened.
+const std::set<std::string>& RelaunchCvars() {
+  static const std::set<std::string> names = {
+      "draw_resolution_scale_x",   "draw_resolution_scale_y",
+      "framerate_limit",           "render_target_path_vulkan",
+      "vulkan_sparse_shared_memory", "vulkan_pipeline_creation_threads",
+      "promote_vector_context_values", "dirty_region_tracking",
+  };
+  return names;
+}
+
+// Asks the window to offer a restart for this setting. Set while a settings
+// window is open; each setting asks at most once, so holding a spin button's
+// arrow does not produce a queue of dialogs.
+std::function<void(const std::string&)> settings_restart_prompt;
+void NoteSettingChanged(const char* name) {
+  NotifySettingsChanged();
+  if (name && settings_restart_prompt && RelaunchCvars().count(name)) {
+    settings_restart_prompt(name);
+  }
+}
+
 // Grey a whole settings row, name included: setting only the control leaves
 // its label bright, which reads as "this works" next to something that does
 // not.
@@ -5448,6 +5481,19 @@ void SetRowSensitive(GtkWidget* grid, int row_index, GtkWidget* control,
   if (label) {
     gtk_widget_set_sensitive(label, sensitive);
   }
+}
+
+// The GtkLabel inside a row built by LabelWithHelp, so a hook can retitle a
+// setting whose wording depends on another one.
+GtkWidget* RowLabelText(GtkWidget* grid, int row_index) {
+  GtkWidget* box = gtk_grid_get_child_at(GTK_GRID(grid), 0, row_index);
+  if (!box || !GTK_IS_CONTAINER(box)) {
+    return nullptr;
+  }
+  GList* children = gtk_container_get_children(GTK_CONTAINER(box));
+  GtkWidget* label = children ? GTK_WIDGET(children->data) : nullptr;
+  g_list_free(children);
+  return (label && GTK_IS_LABEL(label)) ? label : nullptr;
 }
 
 // A settings row's first column: the name, then the help icon.
@@ -5487,6 +5533,7 @@ GtkWidget* AddCheck(GtkWidget* grid, int& row, const char* label,
   AttachSettingsCallback(check, "toggled", [cvar_name](GtkWidget* w) {
     SetGpuOption<bool>(cvar_name.c_str(),
                        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(w)));
+    NoteSettingChanged(cvar_name.c_str());
   });
   GtkWidget* check_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
   gtk_box_pack_start(GTK_BOX(check_row), check, FALSE, FALSE, 0);
@@ -5514,11 +5561,14 @@ GtkWidget* AddCombo(GtkWidget* grid, int& row, const char* label,
   }
   gtk_combo_box_set_active(GTK_COMBO_BOX(combo), active);
   gtk_widget_set_hexpand(combo, TRUE);
-  AttachSettingsCallback(combo, "changed", [choices, on_change](GtkWidget* w) {
+  std::string cvar_name = name ? name : "";
+  AttachSettingsCallback(combo, "changed",
+                         [choices, on_change, cvar_name](GtkWidget* w) {
     int index = gtk_combo_box_get_active(GTK_COMBO_BOX(w));
     if (index >= 0 && index < int(choices.size())) {
       on_change(choices[index].first);
     }
+    NoteSettingChanged(cvar_name.c_str());
   });
   gtk_grid_attach(GTK_GRID(grid), combo, 1, row++, 1, 1);
   return combo;
@@ -5532,9 +5582,13 @@ GtkWidget* AddSpin(GtkWidget* grid, int& row, const char* label,
   GtkWidget* spin = gtk_spin_button_new_with_range(min_value, max_value, 1.0);
   gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin), value);
   gtk_widget_set_halign(spin, GTK_ALIGN_START);
-  AttachSettingsCallback(spin, "value-changed", [on_change](GtkWidget* w) {
-    on_change(gtk_spin_button_get_value(GTK_SPIN_BUTTON(w)));
-  });
+  std::string spin_cvar = name ? name : "";
+  AttachSettingsCallback(spin, "value-changed",
+                         [on_change, spin_cvar](GtkWidget* w) {
+                           on_change(gtk_spin_button_get_value(
+                               GTK_SPIN_BUTTON(w)));
+                           NoteSettingChanged(spin_cvar.c_str());
+                         });
   gtk_grid_attach(GTK_GRID(grid), spin, 1, row++, 1, 1);
   return spin;
 }
@@ -5962,6 +6016,9 @@ void ApplyComboListStyle() {
 }  // namespace
 
 void EmulatorWindow::RefreshSettingsWindow() {
+  for (auto& hook : settings_refresh_hooks_) {
+    hook();
+  }
   for (auto& [key, widget] : settings_refresh_labels_) {
     std::string text;
     if (key == "save_state_dir") {
@@ -6010,6 +6067,63 @@ void EmulatorWindow::ToggleSettingsWindow() {
                                  GTK_WINDOW(gtk_main->window()));
   }
   settings_refresh_labels_.clear();
+  settings_refresh_hooks_.clear();
+  settings_changed_notifier = [this]() { RefreshSettingsWindow(); };
+  // Offer the restart a start-up-only setting needs, once per setting so
+  // that holding a spin button's arrow does not queue up dialogs.
+  auto asked = std::make_shared<std::set<std::string>>();
+  settings_restart_prompt = [this, asked](const std::string& name) {
+    if (!asked->insert(name).second) {
+      return;
+    }
+    std::string description = name;
+    if (cvar::ConfigVars) {
+      auto it = cvar::ConfigVars->find(name);
+      if (it != cvar::ConfigVars->end()) {
+        description = it->second->description();
+        size_t stop = description.find('\n');
+        if (stop != std::string::npos) {
+          description = description.substr(0, stop);
+        }
+      }
+    }
+    GtkWidget* dialog = gtk_message_dialog_new(
+        GTK_WINDOW(settings_window_), GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_QUESTION, GTK_BUTTONS_NONE,
+        "Xenia reads this setting when it starts, so it will not change "
+        "anything until it restarts.");
+    // What was changed sits with the explanation; the question goes last,
+    // centred over the buttons that answer it.
+    gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(dialog), "%s",
+                                             description.c_str());
+    GtkWidget* message_area =
+        gtk_message_dialog_get_message_area(GTK_MESSAGE_DIALOG(dialog));
+    GtkWidget* question = gtk_label_new("Restart now?");
+    gtk_label_set_xalign(GTK_LABEL(question), 0.5f);
+    gtk_widget_set_halign(question, GTK_ALIGN_CENTER);
+    gtk_widget_set_margin_top(question, 8);
+    gtk_box_pack_start(GTK_BOX(message_area), question, FALSE, FALSE, 0);
+    gtk_widget_show(question);
+    gtk_dialog_add_button(GTK_DIALOG(dialog), "Later", GTK_RESPONSE_CANCEL);
+    gtk_dialog_add_button(GTK_DIALOG(dialog), "Restart now",
+                          GTK_RESPONSE_ACCEPT);
+    gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_CANCEL);
+    gint response = gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+    if (response == GTK_RESPONSE_ACCEPT) {
+      // The config has to be on disk before the new process reads it.
+      config::SaveConfig();
+      auto path = last_launched_path_;
+      if (path.empty()) {
+        for (const auto& recent : recently_launched_titles_) {
+          path = recent.path_to_file;
+          break;
+        }
+      }
+      XELOGI("Restarting for a setting change: {}", name);
+      RelaunchProcess(path);
+    }
+  };
   settings_capture_action_ = -1;
   auto remember = [this](const std::string& key, GtkWidget* label) {
     settings_refresh_labels_.emplace_back(key, label);
@@ -6067,12 +6181,25 @@ void EmulatorWindow::ToggleSettingsWindow() {
     GtkWidget* in_use = LeftLabel("");
     remember("scale_in_use", in_use);
     gtk_grid_attach(GTK_GRID(grid), in_use, 1, row++, 1, 1);
+    int framerate_row = row;
     AddSpin(grid, row,
             cvars::vsync
                 ? "Frame rate limit, fps (0 = 60, from VSync; relaunch)"
                 : "Frame rate limit, fps (0 = unlimited, VSync is off; relaunch)",
             "framerate_limit", double(cvars::framerate_limit), 0, 1000,
             [](double v) { SetGpuOption<uint64_t>("framerate_limit", uint64_t(v)); });
+    // What 0 means depends on VSync, so the wording follows it live.
+    settings_refresh_hooks_.push_back([grid, framerate_row]() {
+      GtkWidget* label = RowLabelText(grid, framerate_row);
+      if (label) {
+        gtk_label_set_text(
+            GTK_LABEL(label),
+            cvars::vsync
+                ? "Frame rate limit, fps (0 = 60, from VSync; relaunch)"
+                : "Frame rate limit, fps (0 = unlimited, VSync is off; "
+                  "relaunch)");
+      }
+    });
     {
       GtkWidget* fps = gtk_check_button_new_with_label("Show FPS overlay");
       gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(fps), cvars::show_fps);
@@ -6115,7 +6242,11 @@ void EmulatorWindow::ToggleSettingsWindow() {
       GtkWidget* scaling_note = LeftLabel("");
       int cas_row = 0;
       int fsr_row = 0;
-      auto update_scaling_dependents = [&, this]() {
+      // Registered as a refresh hook below, so it re-runs whenever another
+      // setting changes rather than only when the window is built.
+      auto update_scaling_dependents = [this, &grid, &cas_sharpness,
+                                        &fsr_reduction, &scaling_note,
+                                        &cas_row, &fsr_row]() {
         std::string mode = GetCvarValueForGuestOutputPaintEffect(
             GetGuestOutputPaintEffectForCvarValue(
                 cvars::postprocess_scaling_and_sharpening));
@@ -6159,19 +6290,12 @@ void EmulatorWindow::ToggleSettingsWindow() {
                   cvars::postprocess_scaling_and_sharpening)),
           [this](const std::string& v) {
             SetGpuOption<std::string>("postprocess_scaling_and_sharpening", v);
-            // The sliders this mode uses were irrelevant until now, so
-            // whatever they hold is left over from another mode: start them
-            // at the value that suits this one.
-            using PaintConfigLocal = ui::Presenter::GuestOutputPaintConfig;
-            if (v == "fsr") {
-              SetGpuOption<double>(
-                  "postprocess_ffx_fsr_sharpness_reduction",
-                  PaintConfigLocal::kFsrSharpnessReductionDefault);
-            } else if (v == "cas") {
-              SetGpuOption<double>(
-                  "postprocess_ffx_cas_additional_sharpness",
-                  PaintConfigLocal::kCasAdditionalSharpnessDefault);
-            }
+            // Deliberately does not reset the sliders to this mode's
+            // defaults. CAS sharpness is read by CAS and by FSR's sharpening
+            // pass, so a value set under one is already in use by the other,
+            // and switching modes and back would erase whatever was tuned.
+            // Which sliders this mode actually reads is shown by greying the
+            // ones it does not, below.
             ApplyDisplayConfigForCvars();
             RefreshSettingsWindow();
           });
@@ -6201,6 +6325,38 @@ void EmulatorWindow::ToggleSettingsWindow() {
             ApplyDisplayConfigForCvars();
           });
       update_scaling_dependents();
+      // The same check, holding what it needs by value: the locals above are
+      // gone by the time a later change fires this.
+      settings_refresh_hooks_.push_back(
+          [this, grid, cas_sharpness, fsr_reduction, scaling_note, cas_row,
+           fsr_row]() {
+            std::string mode = GetCvarValueForGuestOutputPaintEffect(
+                GetGuestOutputPaintEffectForCvarValue(
+                    cvars::postprocess_scaling_and_sharpening));
+            bool is_fsr = mode == "fsr";
+            bool is_cas = mode == "cas";
+            SetRowSensitive(grid, cas_row, cas_sharpness, is_fsr || is_cas);
+            SetRowSensitive(grid, fsr_row, fsr_reduction, is_fsr);
+            std::string note;
+            if (is_fsr) {
+              uint32_t scaled_width =
+                  1280u * std::max(1, std::min(cvars::draw_resolution_scale_x, 7));
+              uint32_t window_width =
+                  window_ ? window_->GetActualPhysicalWidth() : 0;
+              if (window_width && scaled_width >= window_width) {
+                note =
+                    "At this resolution scale the image already fills the "
+                    "window, so FSR has nothing to upscale and only sharpens. "
+                    "Lower the scale to let it upscale, or pick CAS.";
+              }
+            } else if (is_cas) {
+              note = "FSR settings do not apply to CAS.";
+            } else {
+              note = "Bilinear does no sharpening, so neither slider applies.";
+            }
+            gtk_label_set_text(GTK_LABEL(scaling_note), note.c_str());
+            gtk_widget_set_visible(scaling_note, !note.empty());
+          });
       {
         GtkWidget* dither =
             gtk_check_button_new_with_label("Dither the output to 8 bits");
@@ -6317,17 +6473,22 @@ void EmulatorWindow::ToggleSettingsWindow() {
     {
       // Gated on the host render target path in vulkan_pipeline_cache.cc: on
       // fragment shader interlock the tracking is never built, so the box
-      // would sit ticked while doing nothing.
+      // would sit ticked while doing nothing. Decided in a hook so changing
+      // the path above updates it without reopening the window.
       GtkWidget* dirty_row = AddCheck(
           grid, row,
           "Skip copying unchanged screen regions (experimental; relaunch)",
           "dirty_region_tracking", cvars::dirty_region_tracking);
-      if (cvars::render_target_path_vulkan == "fsi") {
-        gtk_widget_set_sensitive(dirty_row, FALSE);
-        GtkWidget* why = LeftLabel(
-            "Needs the fbo render target path; it does nothing on fsi.");
-        gtk_grid_attach(GTK_GRID(grid), why, 0, row++, 2, 1);
-      }
+      GtkWidget* why = LeftLabel(
+          "Needs the fbo render target path; it does nothing on fsi.");
+      gtk_grid_attach(GTK_GRID(grid), why, 0, row++, 2, 1);
+      auto update_dirty_row = [dirty_row, why]() {
+        bool usable = cvars::render_target_path_vulkan != "fsi";
+        gtk_widget_set_sensitive(dirty_row, usable);
+        gtk_widget_set_visible(why, !usable);
+      };
+      update_dirty_row();
+      settings_refresh_hooks_.push_back(update_dirty_row);
     }
     AddCheck(grid, row, "Sparse shared memory (Vulkan; relaunch)",
              "vulkan_sparse_shared_memory", cvars::vulkan_sparse_shared_memory);
@@ -6617,6 +6778,9 @@ void EmulatorWindow::ToggleSettingsWindow() {
                      self->community_show_all_ = nullptr;
                      self->community_filter_ = nullptr;
                      self->settings_refresh_labels_.clear();
+                     self->settings_refresh_hooks_.clear();
+                     settings_changed_notifier = nullptr;
+                     settings_restart_prompt = nullptr;
                      self->settings_capture_action_ = -1;
                      self->profiles_list_ = nullptr;
                      self->profiles_status_ = nullptr;
