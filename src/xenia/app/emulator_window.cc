@@ -6215,7 +6215,30 @@ void EmulatorWindow::ToggleSettingsWindow() {
     GtkWidget* scroller = gtk_scrolled_window_new(nullptr, nullptr);
     gtk_container_add(GTK_CONTAINER(scroller), box);
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), scroller,
-                             gtk_label_new("Graphics"));
+                             gtk_label_new("GPU"));
+  }
+  // ---- CPU ----
+  {
+    GtkWidget* box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_container_set_border_width(GTK_CONTAINER(box), 8);
+    GtkWidget* grid = NewSection(box, "Code generation (relaunch)", true);
+    int row = 0;
+    GtkWidget* note = LeftLabel(
+        "These change the code the emulator generates for the game, so they "
+        "apply to a title launched afterwards.");
+    gtk_grid_attach(GTK_GRID(grid), note, 0, row++, 2, 1);
+    AddCheck(grid, row,
+             "Reuse vector values instead of reloading them (experimental)",
+             "promote_vector_context_values",
+             cvars::promote_vector_context_values);
+    GtkWidget* vecnote = LeftLabel(
+        "Worth about +23% in scenes limited by the CPU rather than the "
+        "graphics card. Off upstream since January for a reason that was "
+        "never written down, so treat it as under test: watch for odd "
+        "animation or physics rather than a wrong-looking frame.");
+    gtk_grid_attach(GTK_GRID(grid), vecnote, 0, row++, 2, 1);
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), box,
+                             gtk_label_new("CPU"));
   }
 
   // ---- Audio ----
@@ -6263,29 +6286,6 @@ void EmulatorWindow::ToggleSettingsWindow() {
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), grid,
                              gtk_label_new("Audio"));
 
-  // ---- CPU ----
-  {
-    GtkWidget* box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
-    gtk_container_set_border_width(GTK_CONTAINER(box), 8);
-    GtkWidget* grid = NewSection(box, "Code generation (relaunch)", true);
-    int row = 0;
-    GtkWidget* note = LeftLabel(
-        "These change the code the emulator generates for the game, so they "
-        "apply to a title launched afterwards.");
-    gtk_grid_attach(GTK_GRID(grid), note, 0, row++, 2, 1);
-    AddCheck(grid, row,
-             "Reuse vector values instead of reloading them (experimental)",
-             "promote_vector_context_values",
-             cvars::promote_vector_context_values);
-    GtkWidget* vecnote = LeftLabel(
-        "Worth about +23% in scenes limited by the CPU rather than the "
-        "graphics card. Off upstream since January for a reason that was "
-        "never written down, so treat it as under test: watch for odd "
-        "animation or physics rather than a wrong-looking frame.");
-    gtk_grid_attach(GTK_GRID(grid), vecnote, 0, row++, 2, 1);
-    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), box,
-                             gtk_label_new("CPU"));
-  }
   }
 
   // ---- Input: controllers and keyboard hotkeys ----
