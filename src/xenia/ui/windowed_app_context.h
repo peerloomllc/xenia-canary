@@ -10,6 +10,7 @@
 #ifndef XENIA_UI_WINDOWED_APP_CONTEXT_H_
 #define XENIA_UI_WINDOWED_APP_CONTEXT_H_
 
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -24,6 +25,14 @@ namespace ui {
 // Context for inputs provided by the entry point and interacting with the
 // platform's UI loop, to be implemented by platforms.
 class WindowedAppContext {
+ public:
+  // Diagnostics: how many queued functions the UI thread has executed, and how
+  // many are waiting. A UI thread that stops servicing its window while the
+  // emulator runs shows up here as a runaway rate or a queue that never
+  // drains, which is otherwise invisible from the outside.
+  static std::atomic<uint64_t> stats_ui_calls_executed_;
+  static std::atomic<uint64_t> stats_ui_calls_queued_;
+
  public:
   WindowedAppContext(const WindowedAppContext& context) = delete;
   WindowedAppContext& operator=(const WindowedAppContext& context) = delete;

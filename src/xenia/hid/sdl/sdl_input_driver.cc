@@ -27,6 +27,13 @@ DEFINE_path(mappings_file, "gamecontrollerdb.txt",
             "Filename of a database with custom game controller mappings.",
             "SDL");
 
+DEFINE_uint32(
+    input_pump_min_interval_ms, 4,
+    "Shortest interval between SDL event pumps queued to the UI thread. A "
+    "guest polling for a button press queues one per poll otherwise, waking "
+    "the UI thread at the guest's polling rate. 0 disables the cap.",
+    "HID");
+
 DEFINE_bool(log_input_latency, false,
             "Log a warning when controller event processing stalls: the UI "
             "thread takes over 50 ms to run a queued event pump, or over "
@@ -36,6 +43,8 @@ DEFINE_bool(log_input_latency, false,
 namespace xe {
 namespace hid {
 namespace sdl {
+
+std::atomic<uint64_t> SDLInputDriver::stats_pumps_run_{0};
 
 SDLInputDriver::SDLInputDriver(xe::ui::Window* window, size_t window_z_order)
     : InputDriver(window, window_z_order),
@@ -734,6 +743,18 @@ void SDLInputDriver::QueueControllerUpdate() {
   const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                              std::chrono::steady_clock::now().time_since_epoch())
                              .count();
+  // A guest waiting for a button press polls input as fast as it can, and
+  // every poll that finds no pump in flight queues one, so the UI thread is
+  // woken at the guest's polling rate rather than at a rate input needs. Cap
+  // it: one pump per interval is far more often than a controller reports.
+  if (cvars::input_pump_min_interval_ms > 0) {
+    int64_t since_last_ms = now_ms - pump_ran_at_ms_.load(
+                                          std::memory_order_relaxed);
+    if (since_last_ms >= 0 &&
+        since_last_ms < int64_t(cvars::input_pump_min_interval_ms)) {
+      return;
+    }
+  }
   // To minimize consecutive event pumps do not queue before previous pump is
   // finished.
   bool is_queued = false;
@@ -779,6 +800,12 @@ void SDLInputDriver::QueueControllerUpdate() {
         last_pump_time_ = now;
       }
       SDL_PumpEvents();
+      pump_ran_at_ms_.store(
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count(),
+          std::memory_order_relaxed);
+      stats_pumps_run_.fetch_add(1, std::memory_order_relaxed);
       sdl_pumpevents_queued_ = false;
     });
     if (!call_queued) {

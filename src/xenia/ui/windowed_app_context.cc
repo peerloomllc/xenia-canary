@@ -15,6 +15,9 @@
 namespace xe {
 namespace ui {
 
+std::atomic<uint64_t> WindowedAppContext::stats_ui_calls_executed_{0};
+std::atomic<uint64_t> WindowedAppContext::stats_ui_calls_queued_{0};
+
 WindowedAppContext::~WindowedAppContext() {
   // The UI thread is responsible for managing the lifetime of the context.
   assert_true(IsInUIThread());
@@ -57,6 +60,7 @@ bool WindowedAppContext::CallInUIThreadDeferred(
       return false;
     }
     pending_functions_.emplace_back(std::move(function));
+    stats_ui_calls_queued_.fetch_add(1, std::memory_order_relaxed);
   }
   // Notify unconditionally, even if currently running pending functions. It's
   // possible for pending functions themselves to run inner platform message
@@ -159,6 +163,7 @@ void WindowedAppContext::ExecutePendingFunctionsFromUIThread(bool is_final) {
     // instead of std::recursive_mutex.
     pending_functions_lock.unlock();
     function();
+    stats_ui_calls_executed_.fetch_add(1, std::memory_order_relaxed);
     pending_functions_lock.lock();
   }
   if (is_final) {

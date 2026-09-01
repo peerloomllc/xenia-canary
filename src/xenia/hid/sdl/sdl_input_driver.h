@@ -88,6 +88,10 @@ class SDLInputDriver final : public InputDriver {
   bool sdl_gamecontroller_initialized_;
   int sdl_events_unflushed_;
   std::atomic<bool> sdl_pumpevents_queued_;
+  // When the last event pump actually ran, for the queueing interval cap.
+  std::atomic<int64_t> pump_ran_at_ms_ = {0};
+  // Diagnostics: pumps that have run, for the STATS line.
+  static std::atomic<uint64_t> stats_pumps_run_;
   // UI thread only: when the last event pump ran (--log_input_latency).
   std::chrono::steady_clock::time_point last_pump_time_{};
   // When the pending pump was queued (steady clock, ms); lets a poll reclaim
