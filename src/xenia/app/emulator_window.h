@@ -312,7 +312,12 @@ class EmulatorWindow {
   void SetPatchCategory(const std::filesystem::path& file,
                         const std::string& name, PatchCategory category);
   void LoadPatchCategories();
+  // Switches off any enabled patch for this title that writes the same
+  // guest address as the one just enabled; returns their names.
+  std::vector<std::string> DisableConflictingPatches(
+      const std::filesystem::path& file, const std::string& name);
   void SavePatchCategories();
+  std::string patches_notice_;  // survives the rebuild after a conflict
   std::map<std::string, PatchCategory> patch_categories_;  // "file|patch"
   bool patch_categories_loaded_ = false;
   void* patches_status_[kPatchCategoryCount] = {};  // GtkLabel*

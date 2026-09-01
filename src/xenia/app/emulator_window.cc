@@ -7939,6 +7939,83 @@ void EmulatorWindow::SetPatchCategory(const std::filesystem::path& file,
   SavePatchCategories();
 }
 
+// The guest addresses a patch entry writes, as [first, last) pairs.
+static std::vector<std::pair<uint32_t, uint32_t>> PatchWriteRanges(
+    const xe::patcher::PatchInfoEntry& patch) {
+  std::vector<std::pair<uint32_t, uint32_t>> ranges;
+  for (const auto& data : patch.patch_data) {
+    uint32_t size = uint32_t(std::max<size_t>(1, data.data.alloc_size));
+    ranges.emplace_back(data.address, data.address + size);
+  }
+  return ranges;
+}
+
+static bool PatchRangesOverlap(
+    const std::vector<std::pair<uint32_t, uint32_t>>& a,
+    const std::vector<std::pair<uint32_t, uint32_t>>& b) {
+  for (const auto& x : a) {
+    for (const auto& y : b) {
+      if (x.first < y.second && y.first < x.second) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Two enabled patches that write the same address fight, and whichever the
+// file loads last wins with nothing on screen to say so. Switching one on
+// switches those off and says which.
+std::vector<std::string> EmulatorWindow::DisableConflictingPatches(
+    const std::filesystem::path& file, const std::string& name) {
+  std::vector<std::string> turned_off;
+  auto* patcher = emulator_->patcher();
+  if (!patcher) {
+    return turned_off;
+  }
+  const xe::patcher::PatchInfoEntry* self = nullptr;
+  uint32_t title = 0;
+  for (const auto& f : patcher->patch_db()->GetAllPatches()) {
+    if (f.file_path != file) {
+      continue;
+    }
+    for (const auto& patch : f.patch_info) {
+      if (patch.patch_name == name) {
+        self = &patch;
+        title = f.title_id;
+      }
+    }
+  }
+  if (!self) {
+    return turned_off;
+  }
+  auto mine = PatchWriteRanges(*self);
+  for (const auto& f : patcher->patch_db()->GetAllPatches()) {
+    if (f.title_id != title) {
+      continue;
+    }
+    for (const auto& patch : f.patch_info) {
+      if (!patch.is_enabled ||
+          (f.file_path == file && patch.patch_name == name)) {
+        continue;
+      }
+      if (!PatchRangesOverlap(mine, PatchWriteRanges(patch))) {
+        continue;
+      }
+      if (SetPatchEnabledInFile(f.file_path, patch.patch_name, false)) {
+        turned_off.push_back(patch.patch_name);
+        XELOGI("Patches: switched off '{}' in {}, it writes the same "
+               "address as '{}'",
+               patch.patch_name, f.file_path.filename().string(), name);
+      }
+    }
+  }
+  if (!turned_off.empty()) {
+    patcher->patch_db()->Reload(true);
+  }
+  return turned_off;
+}
+
 void EmulatorWindow::BuildPatchesTab(void* notebook_ptr) {
   for (int index = 0; index < kPatchCategoryCount; ++index) {
     BuildPatchCategoryPage(notebook_ptr, index);
@@ -8236,12 +8313,32 @@ void EmulatorWindow::RefreshPatchesTab() {
                 if (auto* patcher = emulator_->patcher()) {
                   patcher->patch_db()->Reload(true);
                 }
-                gtk_label_set_text(
-                    GTK_LABEL(patches_status_[index]),
+                std::vector<std::string> dropped;
+                if (ok && on) {
+                  dropped = DisableConflictingPatches(path, name);
+                }
+                std::string message =
                     ok ? (emulator_->is_title_open()
                               ? "Saved. Restart the game to apply the change."
                               : "Saved. Applies when the game starts.")
-                       : "Could not write the patch file.");
+                       : "Could not write the patch file.";
+                if (!dropped.empty()) {
+                  std::string list;
+                  for (const std::string& other : dropped) {
+                    list += (list.empty() ? "" : ", ") + ("'" + other + "'");
+                  }
+                  message = fmt::format(
+                      "Switched {} off: {} the same place in the game as '{}'. "
+                      "{}",
+                      list, dropped.size() > 1 ? "they change" : "it changes",
+                      name, message);
+                  // The rebuild below rewrites the status labels, so hand the
+                  // explanation to it rather than letting it wipe it.
+                  patches_notice_ = message;
+                  PostToUIThread([this]() { RefreshPatchesTab(); });
+                }
+                gtk_label_set_text(GTK_LABEL(patches_status_[index]),
+                                   message.c_str());
               });
           gtk_box_pack_start(GTK_BOX(row), check, TRUE, TRUE, 0);
           // Move it to one of the other two tabs. Buttons rather than a combo
@@ -8309,9 +8406,13 @@ void EmulatorWindow::RefreshPatchesTab() {
     } else if (!cvars::apply_patches) {
       status = "Patching is off: enable it above for these to apply.";
     }
+    if (!patches_notice_.empty()) {
+      status = patches_notice_;
+    }
     gtk_label_set_text(GTK_LABEL(patches_status_[index]), status.c_str());
     gtk_widget_show_all(list);
   }
+  patches_notice_.clear();
   patches_refreshing_ = false;
   RefreshCommunityPatchList();
 }
