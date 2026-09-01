@@ -5422,6 +5422,28 @@ GtkWidget* LeftLabel(const char* text) {
   return label;
 }
 
+// The cvar's description, on a small icon beside the setting's name rather
+// than on the control itself: a tooltip that only appears when the pointer
+// happens to rest on a combo box is not discoverable, and hovering a control
+// to read about it invites changing it by accident.
+GtkWidget* HelpIcon(const char* name) {
+  GtkWidget* icon =
+      gtk_image_new_from_icon_name("help-about-symbolic", GTK_ICON_SIZE_MENU);
+  gtk_widget_set_valign(icon, GTK_ALIGN_CENTER);
+  gtk_widget_set_opacity(icon, 0.55);
+  SetTooltipFromCvar(icon, name);
+  return icon;
+}
+
+// A settings row's first column: the name, then the help icon.
+GtkWidget* LabelWithHelp(const char* text, const char* name) {
+  GtkWidget* row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+  gtk_box_pack_start(GTK_BOX(row), LeftLabel(text), FALSE, FALSE, 0);
+  gtk_box_pack_start(GTK_BOX(row), HelpIcon(name), FALSE, FALSE, 0);
+  gtk_widget_set_halign(row, GTK_ALIGN_START);
+  return row;
+}
+
 // Every settings tab goes through this: a scrolled window has a small
 // minimum size of its own, so whatever the page wants, the window stays
 // freely resizable in both directions.
@@ -5446,13 +5468,16 @@ void AddCheck(GtkWidget* grid, int& row, const char* label, const char* name,
               bool value) {
   GtkWidget* check = gtk_check_button_new_with_label(label);
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(check), value);
-  SetTooltipFromCvar(check, name);
   std::string cvar_name = name;
   AttachSettingsCallback(check, "toggled", [cvar_name](GtkWidget* w) {
     SetGpuOption<bool>(cvar_name.c_str(),
                        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(w)));
   });
-  gtk_grid_attach(GTK_GRID(grid), check, 0, row++, 2, 1);
+  GtkWidget* check_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+  gtk_box_pack_start(GTK_BOX(check_row), check, FALSE, FALSE, 0);
+  gtk_box_pack_start(GTK_BOX(check_row), HelpIcon(name), FALSE, FALSE, 0);
+  gtk_widget_set_halign(check_row, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), check_row, 0, row++, 2, 1);
 }
 
 // Combo over (value, label) pairs; on_change gets the chosen value.
@@ -5460,7 +5485,7 @@ void AddCombo(GtkWidget* grid, int& row, const char* label, const char* name,
               const std::vector<std::pair<std::string, std::string>>& choices,
               const std::string& current,
               std::function<void(const std::string&)> on_change) {
-  gtk_grid_attach(GTK_GRID(grid), LeftLabel(label), 0, row, 1, 1);
+  gtk_grid_attach(GTK_GRID(grid), LabelWithHelp(label, name), 0, row, 1, 1);
   GtkWidget* combo = gtk_combo_box_text_new();
   int active = 0;
   for (size_t i = 0; i < choices.size(); ++i) {
@@ -5472,7 +5497,6 @@ void AddCombo(GtkWidget* grid, int& row, const char* label, const char* name,
   }
   gtk_combo_box_set_active(GTK_COMBO_BOX(combo), active);
   gtk_widget_set_hexpand(combo, TRUE);
-  SetTooltipFromCvar(combo, name);
   AttachSettingsCallback(combo, "changed", [choices, on_change](GtkWidget* w) {
     int index = gtk_combo_box_get_active(GTK_COMBO_BOX(w));
     if (index >= 0 && index < int(choices.size())) {
@@ -5485,11 +5509,10 @@ void AddCombo(GtkWidget* grid, int& row, const char* label, const char* name,
 void AddSpin(GtkWidget* grid, int& row, const char* label, const char* name,
              double value, double min_value, double max_value,
              std::function<void(double)> on_change) {
-  gtk_grid_attach(GTK_GRID(grid), LeftLabel(label), 0, row, 1, 1);
+  gtk_grid_attach(GTK_GRID(grid), LabelWithHelp(label, name), 0, row, 1, 1);
   GtkWidget* spin = gtk_spin_button_new_with_range(min_value, max_value, 1.0);
   gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin), value);
   gtk_widget_set_halign(spin, GTK_ALIGN_START);
-  SetTooltipFromCvar(spin, name);
   AttachSettingsCallback(spin, "value-changed", [on_change](GtkWidget* w) {
     on_change(gtk_spin_button_get_value(GTK_SPIN_BUTTON(w)));
   });
