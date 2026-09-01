@@ -22,7 +22,43 @@
 // rdtsc would be too slow and skew the results by consuming extra cpu time, so
 // we have lower time precision but better overall accuracy
 #define XE_X64_PROFILER_AVAILABLE 1
+#elif XE_PLATFORM_LINUX == 1 && XE_ARCH_AMD64 == 1
+// Linux has no equivalent of KUSER_SHARED's systemtime at a fixed address, so
+// a thread keeps one updated instead: the emitted code is then the same two
+// loads as on Windows, rather than an rdtsc that would clobber registers the
+// prologue and epilogue still need. Same trade as above - coarse per-call
+// precision, accurate in aggregate over many calls.
+#define XE_X64_PROFILER_AVAILABLE 1
+#define XE_X64_PROFILER_TIME_SOURCE_IS_VARIABLE 1
 #endif
+
+#if XE_X64_PROFILER_AVAILABLE == 1 && \
+    defined(XE_X64_PROFILER_TIME_SOURCE_IS_VARIABLE)
+namespace xe {
+namespace cpu {
+namespace backend {
+namespace x64 {
+// Updated by a thread while instrument_call_times is on, in the same units as
+// Clock::QueryHostSystemTime so the reported times need no conversion. The
+// emitted profiler code loads from this address.
+extern volatile uint64_t g_profiler_time_source;
+}  // namespace x64
+}  // namespace backend
+}  // namespace cpu
+}  // namespace xe
+#endif
+
+namespace xe {
+namespace cpu {
+namespace backend {
+namespace x64 {
+// --dump_guest_code_map: names one compiled function for a sampling profiler.
+void RecordGuestCodeForProfiler(uint32_t guest_address, void* host_code,
+                                size_t host_code_length);
+}  // namespace x64
+}  // namespace backend
+}  // namespace cpu
+}  // namespace xe
 
 DECLARE_int64(x64_extension_mask);
 DECLARE_int64(max_stackpoints);

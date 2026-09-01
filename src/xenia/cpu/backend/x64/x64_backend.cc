@@ -7,6 +7,14 @@
  ******************************************************************************
  */
 
+#include <cstdio>
+#include <mutex>
+#include <string>
+
+#if XE_PLATFORM_LINUX == 1
+#include <unistd.h>
+#endif
+
 #include "xenia/cpu/backend/x64/x64_backend.h"
 
 #include <array>
@@ -24,6 +32,7 @@
 #include "xenia/cpu/backend/x64/x64_sequences.h"
 #include "xenia/cpu/backend/x64/x64_stack_layout.h"
 #include "xenia/cpu/breakpoint.h"
+#include "xenia/cpu/module.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/stack_walker.h"
 #include "xenia/cpu/xex_module.h"
@@ -40,6 +49,13 @@ DEFINE_bool(enable_host_guest_stack_synchronization, true,
             "x64");
 #if XE_X64_PROFILER_AVAILABLE == 1
 DECLARE_bool(instrument_call_times);
+
+DEFINE_bool(
+    dump_guest_code_map, false,
+    "Write /tmp/perf-<pid>.map naming every compiled guest function by its "
+    "host code address, so a sampling profiler can attribute time inside the "
+    "code cache. Rewritten every 30 seconds as more functions are compiled.",
+    "CPU");
 #endif
 
 namespace xe {
@@ -226,9 +242,17 @@ static void WriteGuestProfilerData() {
     std::sort(unsorted_profile.begin(), unsorted_profile.end(),
               [](auto& x, auto& y) { return x.second < y.second; });
 
-    fopen_s(&output_file, "profile_times.txt", "w");
-    FILE* idapy_file = nullptr;
-    fopen_s(&idapy_file, "profile_print_times.py", "w");
+    output_file = std::fopen("profile_times.txt", "w");
+    FILE* idapy_file = std::fopen("profile_print_times.py", "w");
+    if (!output_file || !idapy_file) {
+      if (output_file) {
+        std::fclose(output_file);
+      }
+      if (idapy_file) {
+        std::fclose(idapy_file);
+      }
+      return;
+    }
 
     for (auto&& sorted_entry : unsorted_profile) {
       // double time_in_seconds =
@@ -253,12 +277,58 @@ static void WriteGuestProfilerData() {
   }
 }
 
+#if defined(XE_X64_PROFILER_TIME_SOURCE_IS_VARIABLE)
+volatile uint64_t g_profiler_time_source = 0;
+static std::unique_ptr<xe::threading::Thread> g_profiler_time_source_thread{};
+
+// Stands in for the kernel-updated clock the Windows build reads at a fixed
+// address. 250 us is far finer than the ~15 ms that clock usually moves at, so
+// attribution is better here, and a function shorter than the interval still
+// accumulates correctly across many calls.
+static void GuestProfilerTimeSourceThreadProc() {
+  while (true) {
+    g_profiler_time_source = Clock::QueryHostSystemTime();
+    xe::threading::NanoSleep(250000);
+  }
+}
+#endif
+
+// Names the compiled code for a sampling profiler: one line per function as
+// it is compiled, in the format perf reads for JITs. The call-time profiler
+// above measures whole calls, so its totals include everything a function
+// calls; sampling against this map gives the time spent in a function itself,
+// which is what says where the generated code is worth improving.
+static std::mutex g_code_map_mutex;
+static FILE* g_code_map_file = nullptr;
+
+void RecordGuestCodeForProfiler(uint32_t guest_address, void* host_code,
+                                size_t host_code_length) {
+  if (!cvars::dump_guest_code_map || !host_code || !host_code_length) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(g_code_map_mutex);
+  if (!g_code_map_file) {
+    std::string path =
+        "/tmp/perf-" + std::to_string(static_cast<long>(getpid())) + ".map";
+    g_code_map_file = std::fopen(path.c_str(), "w");
+    if (!g_code_map_file) {
+      return;
+    }
+  }
+  fprintf(g_code_map_file, "%llx %llx guest_%08X\n",
+          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(host_code)),
+          static_cast<unsigned long long>(host_code_length), guest_address);
+  fflush(g_code_map_file);
+}
+
 static void GuestProfilerUpdateThreadProc() {
   nanosecond_lifetime_start = Clock::QueryHostSystemTime();
 
   do {
     xe::threading::Sleep(std::chrono::seconds(30));
-    WriteGuestProfilerData();
+    if (cvars::instrument_call_times) {
+      WriteGuestProfilerData();
+    }
   } while (true);
 }
 static std::unique_ptr<xe::threading::Thread> g_profiler_update_thread{};
@@ -353,7 +423,7 @@ bool X64Backend::Initialize(Processor* processor) {
   }
 
 #if XE_X64_PROFILER_AVAILABLE == 1
-  if (cvars::instrument_call_times) {
+  if (cvars::instrument_call_times || cvars::dump_guest_code_map) {
     backend_profiler_data = &profiler_data_;
     xe::threading::Thread::CreationParameters slimparams;
 
@@ -363,6 +433,19 @@ bool X64Backend::Initialize(Processor* processor) {
 
     g_profiler_update_thread = std::move(xe::threading::Thread::Create(
         slimparams, GuestProfilerUpdateThreadProc));
+#if defined(XE_X64_PROFILER_TIME_SOURCE_IS_VARIABLE)
+    if (cvars::instrument_call_times) {
+    // Must be running before any guest code is emitted: a time source stuck at
+    // zero would record every function as taking no time at all.
+    g_profiler_time_source = Clock::QueryHostSystemTime();
+    xe::threading::Thread::CreationParameters timesource_params;
+    timesource_params.create_suspended = false;
+    timesource_params.initial_priority = xe::threading::ThreadPriority::kHighest;
+    timesource_params.stack_size = 65536 * 4;
+    g_profiler_time_source_thread = std::move(xe::threading::Thread::Create(
+        timesource_params, GuestProfilerTimeSourceThreadProc));
+    }
+#endif
   }
 #endif
 

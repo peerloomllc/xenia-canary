@@ -155,6 +155,8 @@ void* X64Emitter::Emplace(const EmitFunctionInfo& func_info,
   if (function) {
     code_cache_->PlaceGuestCode(function->address(), top_, func_info, function,
                                 new_execute_address, new_write_address);
+    RecordGuestCodeForProfiler(function->address(), new_execute_address,
+                               func_info.code_size.total);
   } else {
     code_cache_->PlaceHostCode(0, top_, func_info, new_execute_address,
                                new_write_address);
@@ -232,7 +234,11 @@ bool X64Emitter::Emit(HIRBuilder* builder, EmitFunctionInfo& func_info) {
 
 #if XE_X64_PROFILER_AVAILABLE == 1
   if (cvars::instrument_call_times) {
+#if defined(XE_X64_PROFILER_TIME_SOURCE_IS_VARIABLE)
+    mov(rdx, reinterpret_cast<uintptr_t>(&g_profiler_time_source));
+#else
     mov(rdx, 0x7ffe0014);  // load pointer to kusershared systemtime
+#endif
     mov(rdx, qword[rdx]);
     mov(qword[rsp + StackLayout::GUEST_PROFILER_START],
         rdx);  // save time for end of function
@@ -358,7 +364,11 @@ void X64Emitter::EmitProfilerEpilogue() {
     uint64_t* profiler_entry =
         backend()->GetProfilerRecordForFunction(current_guest_function_);
 
+#if defined(XE_X64_PROFILER_TIME_SOURCE_IS_VARIABLE)
+    mov(rcx, reinterpret_cast<uintptr_t>(&g_profiler_time_source));
+#else
     mov(ecx, 0x7ffe0014);
+#endif
     mov(rdx, qword[rcx]);
     mov(r10, (uintptr_t)profiler_entry);
     sub(rdx, qword[rsp + StackLayout::GUEST_PROFILER_START]);
