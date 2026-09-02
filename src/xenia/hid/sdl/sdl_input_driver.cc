@@ -16,11 +16,11 @@
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/threading.h"
 #include "xenia/helper/sdl/sdl_helper.h"
 #include "xenia/hid/hid_flags.h"
 #include "xenia/ui/virtual_key.h"
 #include "xenia/ui/window.h"
-#include "xenia/ui/windowed_app_context.h"
 
 // TODO(joellinn) make this path relative to the config folder.
 DEFINE_path(mappings_file, "gamecontrollerdb.txt",
@@ -29,52 +29,33 @@ DEFINE_path(mappings_file, "gamecontrollerdb.txt",
 
 DEFINE_uint32(
     input_pump_min_interval_ms, 4,
-    "Shortest interval between SDL event pumps queued to the UI thread. A "
-    "guest polling for a button press queues one per poll otherwise, waking "
-    "the UI thread at the guest's polling rate. 0 disables the cap.",
+    "Interval between SDL event pumps on the input thread, in milliseconds. "
+    "Clamped to at least 1.",
     "HID");
 
 DEFINE_bool(log_input_latency, false,
-            "Log a warning when controller event processing stalls: the UI "
-            "thread takes over 50 ms to run a queued event pump, or over "
-            "150 ms pass between pumps while a title is polling input.",
+            "Log a warning when over 150 ms pass between SDL event pumps.",
             "SDL");
 
 namespace xe {
 namespace hid {
 namespace sdl {
 
-std::atomic<uint64_t> SDLInputDriver::stats_pumps_run_{0};
-
 SDLInputDriver::SDLInputDriver(xe::ui::Window* window, size_t window_z_order)
     : InputDriver(window, window_z_order),
       sdl_events_initialized_(false),
       sdl_gamecontroller_initialized_(false),
       sdl_events_unflushed_(0),
-      sdl_pumpevents_queued_(false),
+      sdl_thread_should_exit_(false),
       controllers_(),
       keystroke_states_() {}
 
 SDLInputDriver::~SDLInputDriver() {
-  // Make sure the CallInUIThread is executed before destroying the references.
-  if (sdl_pumpevents_queued_) {
-    window()->app_context().CallInUIThreadSynchronous([this]() {
-      window()->app_context().ExecutePendingFunctionsFromUIThread();
-    });
-  }
-  for (size_t i = 0; i < controllers_.size(); i++) {
-    if (controllers_.at(i).sdl) {
-      SDL_GameControllerClose(controllers_.at(i).sdl);
-      controllers_.at(i) = {};
-    }
-  }
-  if (sdl_events_initialized_) {
-    SDL_QuitSubSystem(SDL_INIT_EVENTS);
-    sdl_events_initialized_ = false;
-  }
-  if (sdl_gamecontroller_initialized_) {
-    SDL_QuitSubSystem(SDL_INIT_GAMECONTROLLER);
-    sdl_gamecontroller_initialized_ = false;
+  // Everything SDL owns is closed on the thread that opened it, in
+  // SDLEventThread's teardown, so all this has to do is stop that thread.
+  if (sdl_thread_.joinable()) {
+    sdl_thread_should_exit_.store(true, std::memory_order_release);
+    sdl_thread_.join();
   }
 }
 
@@ -83,56 +64,102 @@ X_STATUS SDLInputDriver::Setup() {
     return X_STATUS_UNSUCCESSFUL;
   }
 
-  // SDL_PumpEvents should only be run in the thread that initialized SDL - we
-  // are hijacking the UI thread for that. If this function fails to be queued,
-  // the "initialized" variables will be false - that's handled safely.
-  window()->app_context().CallInUIThreadSynchronous([this]() {
-    if (!xe::helper::sdl::SDLHelper::Prepare()) {
-      return;
-    }
-    // Initialize the event system early, so we catch device events for already
-    // connected controllers.
-    if (SDL_InitSubSystem(SDL_INIT_EVENTS) < 0) {
-      return;
-    }
-    sdl_events_initialized_ = true;
+  std::promise<X_STATUS> init_promise;
+  auto init_future = init_promise.get_future();
+  sdl_thread_ =
+      std::thread(&SDLInputDriver::SDLEventThread, this,
+                  std::move(init_promise));
+  const X_STATUS result = init_future.get();
+  if (result != X_STATUS_SUCCESS && sdl_thread_.joinable()) {
+    sdl_thread_.join();
+  }
+  return result;
+}
 
-    // With an event watch we will always get notified, even if the event queue
-    // is full, which can happen if another subsystem does not clear its events.
-    SDL_AddEventWatch(
-        [](void* userdata, SDL_Event* event) -> int {
-          if (!userdata || !event) {
-            assert_always();
-            return 0;
-          }
+void SDLInputDriver::SDLEventThread(std::promise<X_STATUS> init_result) {
+  xe::threading::set_name("SDL Input");
 
-          const auto type = event->type;
-          if (type < SDL_JOYAXISMOTION || type >= SDL_FINGERDOWN) {
-            return 0;
-          }
+  // SDL_PumpEvents is bound to the thread that initialized SDL_INIT_EVENTS,
+  // so this thread owns init, the pump and teardown alike.
+  if (!xe::helper::sdl::SDLHelper::Prepare()) {
+    init_result.set_value(X_STATUS_UNSUCCESSFUL);
+    return;
+  }
 
-          // If another part of xenia uses another SDL subsystem that generates
-          // events, this may seem like a bad idea. They will however not
-          // subscribe to controller events so we get away with that.
-          const auto driver = static_cast<SDLInputDriver*>(userdata);
-          driver->HandleEvent(*event);
+  // Initialize the event system early, so we catch device events for already
+  // connected controllers.
+  if (SDL_InitSubSystem(SDL_INIT_EVENTS) < 0) {
+    init_result.set_value(X_STATUS_UNSUCCESSFUL);
+    return;
+  }
+  sdl_events_initialized_ = true;
 
+  // With an event watch we will always get notified, even if the event queue
+  // is full, which can happen if another subsystem does not clear its events.
+  SDL_AddEventWatch(
+      [](void* userdata, SDL_Event* event) -> int {
+        if (!userdata || !event) {
+          assert_always();
           return 0;
-        },
-        this);
+        }
 
-    if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) < 0) {
-      return;
+        const auto type = event->type;
+        if (type < SDL_JOYAXISMOTION || type >= SDL_FINGERDOWN) {
+          return 0;
+        }
+
+        // If another part of xenia uses another SDL subsystem that generates
+        // events, this may seem like a bad idea. They will however not
+        // subscribe to controller events so we get away with that.
+        const auto driver = static_cast<SDLInputDriver*>(userdata);
+        driver->HandleEvent(*event);
+
+        return 0;
+      },
+      this);
+
+  if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) < 0) {
+    SDL_QuitSubSystem(SDL_INIT_EVENTS);
+    sdl_events_initialized_ = false;
+    init_result.set_value(X_STATUS_UNSUCCESSFUL);
+    return;
+  }
+  sdl_gamecontroller_initialized_ = true;
+
+  LoadGameControllerDB();
+
+  init_result.set_value(X_STATUS_SUCCESS);
+
+  const auto interval = std::chrono::milliseconds(
+      std::max(uint32_t(1), cvars::input_pump_min_interval_ms));
+  while (!sdl_thread_should_exit_.load(std::memory_order_acquire)) {
+    SDL_PumpEvents();
+    if (cvars::log_input_latency) {
+      auto now = std::chrono::steady_clock::now();
+      if (last_pump_time_.time_since_epoch().count() != 0) {
+        auto gap_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          now - last_pump_time_)
+                          .count();
+        if (gap_ms > 150) {
+          XELOGW("SDL input: {} ms between event pumps", gap_ms);
+        }
+      }
+      last_pump_time_ = now;
     }
+    xe::threading::Sleep(interval);
+  }
 
-    sdl_gamecontroller_initialized_ = true;
-
-    LoadGameControllerDB();
-  });
-
-  return (sdl_events_initialized_ && sdl_gamecontroller_initialized_)
-             ? X_STATUS_SUCCESS
-             : X_STATUS_UNSUCCESSFUL;
+  // Tear down on the same thread that initialized SDL.
+  for (size_t i = 0; i < controllers_.size(); i++) {
+    if (controllers_.at(i).sdl) {
+      SDL_GameControllerClose(controllers_.at(i).sdl);
+      controllers_.at(i) = {};
+    }
+  }
+  SDL_QuitSubSystem(SDL_INIT_GAMECONTROLLER);
+  sdl_gamecontroller_initialized_ = false;
+  SDL_QuitSubSystem(SDL_INIT_EVENTS);
+  sdl_events_initialized_ = false;
 }
 
 void SDLInputDriver::LoadGameControllerDB() {
@@ -211,8 +238,6 @@ X_RESULT SDLInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
     return X_ERROR_BAD_ARGUMENTS;
   }
 
-  QueueControllerUpdate();
-
   auto controller = GetControllerState(user_index);
   if (!controller) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
@@ -234,8 +259,6 @@ X_RESULT SDLInputDriver::GetState(uint32_t user_index,
     return X_ERROR_BAD_ARGUMENTS;
   }
 
-  QueueControllerUpdate();
-
   auto controller = GetControllerState(user_index);
   if (!controller) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
@@ -255,8 +278,6 @@ X_RESULT SDLInputDriver::SetState(uint32_t user_index,
   if (user_index >= HID_SDL_USER_COUNT) {
     return X_ERROR_BAD_ARGUMENTS;
   }
-
-  QueueControllerUpdate();
 
   auto controller = GetControllerState(user_index);
   if (!controller) {
@@ -332,8 +353,6 @@ X_RESULT SDLInputDriver::GetKeystroke(uint32_t users, uint32_t flags,
       ui::VirtualKey::kXInputPadRThumbDownRight,
       ui::VirtualKey::kXInputPadRThumbDownLeft,
   };
-
-  QueueControllerUpdate();
 
   for (uint32_t user_index = (user_any ? 0 : users);
        user_index < (user_any ? HID_SDL_USER_COUNT : users + 1); user_index++) {
@@ -737,83 +756,6 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
   c.gamepad.thumb_ry = static_cast<int16_t>(0xFFFFu);
   c.vibration.left_motor_speed = 0xFFFFu;
   c.vibration.right_motor_speed = 0xFFFFu;
-}
-
-void SDLInputDriver::QueueControllerUpdate() {
-  const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now().time_since_epoch())
-                             .count();
-  // A guest waiting for a button press polls input as fast as it can, and
-  // every poll that finds no pump in flight queues one, so the UI thread is
-  // woken at the guest's polling rate rather than at a rate input needs. Cap
-  // it: one pump per interval is far more often than a controller reports.
-  if (cvars::input_pump_min_interval_ms > 0) {
-    int64_t since_last_ms = now_ms - pump_ran_at_ms_.load(
-                                          std::memory_order_relaxed);
-    if (since_last_ms >= 0 &&
-        since_last_ms < int64_t(cvars::input_pump_min_interval_ms)) {
-      return;
-    }
-  }
-  // To minimize consecutive event pumps do not queue before previous pump is
-  // finished.
-  bool is_queued = false;
-  if (!sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true)) {
-    // A pump is already queued. Normally it runs within a frame; if it has
-    // not run for over a second, the UI thread dropped it and the flag
-    // would block controller input for the rest of the process (observed
-    // live: a DualSense dead while the game rendered on, no hidraw reads).
-    // Reclaim the flag and queue a fresh pump; a rare double pump is
-    // harmless, a lost one is not.
-    if (now_ms - pump_queued_at_ms_.load(std::memory_order_relaxed) < 1000) {
-      return;
-    }
-    XELOGW("SDL input: queued event pump never ran; re-queueing");
-  }
-  pump_queued_at_ms_.store(now_ms, std::memory_order_relaxed);
-  {
-    auto queued_at = std::chrono::steady_clock::now();
-    bool call_queued = window()->app_context().CallInUIThread([this,
-                                                               queued_at]() {
-      auto now = std::chrono::steady_clock::now();
-      if (cvars::log_input_latency) {
-        // The pump runs on the UI thread; a stall there is invisible input
-        // loss (the guest keeps polling a state nobody updates).
-        auto queue_delay_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(now -
-                                                                  queued_at)
-                .count();
-        if (queue_delay_ms > 50) {
-          XELOGW("SDL input: event pump ran {} ms after it was queued (UI "
-                 "thread stall)",
-                 queue_delay_ms);
-        }
-        if (last_pump_time_.time_since_epoch().count() != 0) {
-          auto pump_gap_ms =
-              std::chrono::duration_cast<std::chrono::milliseconds>(
-                  now - last_pump_time_)
-                  .count();
-          if (pump_gap_ms > 150) {
-            XELOGW("SDL input: {} ms between event pumps", pump_gap_ms);
-          }
-        }
-        last_pump_time_ = now;
-      }
-      SDL_PumpEvents();
-      pump_ran_at_ms_.store(
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              std::chrono::steady_clock::now().time_since_epoch())
-              .count(),
-          std::memory_order_relaxed);
-      stats_pumps_run_.fetch_add(1, std::memory_order_relaxed);
-      sdl_pumpevents_queued_ = false;
-    });
-    if (!call_queued) {
-      // The UI thread refused the call (shutting down, or not pumping):
-      // give the flag back so the next poll can try again.
-      sdl_pumpevents_queued_ = false;
-    }
-  }
 }
 
 // Check if the analog inputs exceed their thresholds to become a button press

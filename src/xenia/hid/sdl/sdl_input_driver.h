@@ -12,10 +12,12 @@
 
 #include <array>
 #include <atomic>
+#include <future>
 #include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <optional>
+#include <thread>
 
 #include "SDL.h"
 #include "third_party/rapidcsv/src/rapidcsv.h"
@@ -82,21 +84,21 @@ class SDLInputDriver final : public InputDriver {
   ControllerState* GetControllerState(uint32_t user_index);
   bool TestSDLVersion() const;
   void UpdateXCapabilities(ControllerState& state);
-  void QueueControllerUpdate();
+
+  // Owns SDL init, the event pump and teardown. SDL_PumpEvents is bound to
+  // the thread that initialized SDL_INIT_EVENTS, which used to be the UI
+  // thread: every guest input poll queued a pump onto it, waking it at the
+  // guest's polling rate, and a pump the UI thread dropped killed controller
+  // input for the process. (has207/xenia-edge@db6efc74c)
+  void SDLEventThread(std::promise<X_STATUS> init_result);
 
   bool sdl_events_initialized_;
   bool sdl_gamecontroller_initialized_;
   int sdl_events_unflushed_;
-  std::atomic<bool> sdl_pumpevents_queued_;
-  // When the last event pump actually ran, for the queueing interval cap.
-  std::atomic<int64_t> pump_ran_at_ms_ = {0};
-  // Diagnostics: pumps that have run, for the STATS line.
-  static std::atomic<uint64_t> stats_pumps_run_;
-  // UI thread only: when the last event pump ran (--log_input_latency).
+  std::thread sdl_thread_;
+  std::atomic<bool> sdl_thread_should_exit_;
+  // SDL thread only: when the last event pump ran (--log_input_latency).
   std::chrono::steady_clock::time_point last_pump_time_{};
-  // When the pending pump was queued (steady clock, ms); lets a poll reclaim
-  // sdl_pumpevents_queued_ if the queued pump was lost by the UI thread.
-  std::atomic<int64_t> pump_queued_at_ms_{0};
   std::array<ControllerState, HID_SDL_USER_COUNT> controllers_;
   std::array<KeystrokeState, HID_SDL_USER_COUNT> keystroke_states_;
 };
