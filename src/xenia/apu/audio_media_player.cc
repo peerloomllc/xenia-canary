@@ -7,6 +7,8 @@
  ******************************************************************************
  */
 
+#include <chrono>
+
 #include "xenia/apu/audio_media_player.h"
 #include "xenia/apu/audio_driver.h"
 #include "xenia/apu/audio_system.h"
@@ -151,6 +153,30 @@ AudioMediaPlayer::AudioMediaPlayer(apu::AudioSystem* audio_system,
 
 AudioMediaPlayer::~AudioMediaPlayer() {
   Stop();
+
+  // The worker has to be gone before anything it touches is, and it touches
+  // resume_fence_, driver_ and the audio system. Emulator::~Emulator resets
+  // audio_system_ before this object, so a worker still in Play() would use a
+  // destroyed audio system. worker_running_ was previously only ever set to
+  // true and the thread was never joined.
+  //
+  // Stop() has already taken the loop out of Play(), so the worker is either
+  // parked in resume_fence_.Wait() or inside the 500 ms sleep. The fence's
+  // signal is sticky, so signalling before it parks still releases it, and
+  // the sleep bounds the other case.
+  worker_running_ = false;
+  resume_fence_.Signal();
+  if (worker_thread_) {
+    // Bounded, like the save path's waits (notes/41): a wedged worker must
+    // not hold up shutdown for ever.
+    if (xe::threading::Wait(worker_thread_.get(), false,
+                            std::chrono::seconds(3)) !=
+        xe::threading::WaitResult::kSuccess) {
+      XELOGE("AudioMediaPlayer: worker did not exit within 3s");
+    }
+    worker_thread_.reset();
+  }
+
   DeleteDriver();
 };
 
