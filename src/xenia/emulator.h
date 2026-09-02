@@ -70,6 +70,10 @@ constexpr fourcc_t kSaveStateContainerSignature = make_fourcc("XSSC");
 // content packages (DLC, saves opened through XAM) to the kernel section, so
 // their files can be reopened.
 constexpr uint32_t kSaveStateFormatVersion = 9;
+// Restoring a file older than this rebuilds the object table with no timers,
+// which silences a title whose audio mixer runs off a periodic one; the load
+// warns rather than refusing, since everything else in the file still works.
+constexpr uint32_t kSaveStateFirstVersionWithTimers = 4;
 
 // What the container header of a save-state file says, without loading it.
 struct SaveStateFileInfo {
