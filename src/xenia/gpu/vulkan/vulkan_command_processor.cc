@@ -2236,9 +2236,10 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       current_framebuffer_ == framebuffer) {
     return;
   }
-  if (current_render_pass_ != VK_NULL_HANDLE) {
-    deferred_command_buffer_.CmdVkEndRenderPass();
-  }
+  // Go through EndRenderPass rather than ending the pass here: it closes any
+  // open occlusion query segment first, and a query begun inside a pass must
+  // be ended before the pass is. (has207/xenia-edge@d649a01ca)
+  EndRenderPass();
   current_render_pass_ = render_pass;
   current_framebuffer_ = framebuffer;
   VkRenderPassBeginInfo render_pass_begin_info;
@@ -3116,7 +3117,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
                 static_cast<uint32_t>(vfetch_constant.type));
             return false;
         }
-        vfetch_addresses[vfetch_current_queued] = vfetch_constant.address;
+        // Mask to physical like the shader - the guest may use a mirror window.
+        vfetch_addresses[vfetch_current_queued] =
+            xenos::CpuToGpu(vfetch_constant.address << 2) >> 2;
         vfetch_sizes[vfetch_current_queued++] = vfetch_constant.size;
       }
     }
