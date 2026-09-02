@@ -458,10 +458,14 @@ bool MMIOHandler::ExceptionCallback(Exception* ex) {
     }
     return false;
 #else
-    memory::PageAccess cur_access;
+    memory::PageAccess cur_access = memory::PageAccess::kNoAccess;
     size_t page_length = memory::page_size();
-    memory::QueryProtect(fault_host_address, page_length, cur_access);
-    if (cur_access != memory::PageAccess::kNoAccess &&
+    // On a failed query nothing is known about the page, so fall through to
+    // the access violation callback rather than deciding on an unset value -
+    // the callback re-checks the watches under the same lock. This is what
+    // the Linux path above does unconditionally.
+    if (memory::QueryProtect(fault_host_address, page_length, cur_access) &&
+        cur_access != memory::PageAccess::kNoAccess &&
         (!is_write || cur_access != memory::PageAccess::kReadOnly)) {
       // Another thread has cleared this watch. Abort.
       XELOGD("Race condition on watch, was already cleared by another thread!");

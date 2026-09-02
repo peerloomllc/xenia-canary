@@ -211,7 +211,16 @@ bool Protect(void* base_address, size_t length, PageAccess access,
              PageAccess* out_old_access) {
   if (out_old_access) {
     size_t length_copy = length;
-    QueryProtect(base_address, length_copy, *out_old_access);
+    if (!QueryProtect(base_address, length_copy, *out_old_access)) {
+      // Callers hand this value straight back to restore the protection, so
+      // kNoAccess would strand the page. Report the permissive value and say
+      // so.
+      *out_old_access = PageAccess::kReadWrite;
+      XELOGW(
+          "Protect: could not read the current protection of {}; reporting "
+          "kReadWrite",
+          base_address);
+    }
   }
 
   uint32_t prot = ToPosixProtectFlags(access);
@@ -219,6 +228,11 @@ bool Protect(void* base_address, size_t length, PageAccess access,
 }
 
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
+  // Clear the outputs so a failed query is deterministic rather than leaving
+  // whatever the caller had. The input length is never read - it is purely an
+  // out parameter.
+  access_out = PageAccess::kNoAccess;
+  length = 0;
   // No generic POSIX solution exists. The Linux solution should work on all
   // Linux kernel based OS, including Android.
   std::ifstream memory_maps;
@@ -252,6 +266,7 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
             access_out == ToXeniaProtectFlags(next_protection)) {
           length =
               next_map_region_end - reinterpret_cast<uintptr_t>(base_address);
+          map_region_end = next_map_region_end;
           continue;
         }
         break;

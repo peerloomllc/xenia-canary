@@ -1574,7 +1574,7 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
       (host_offset_aligned &&
        (((page_count << page_size_shift_) & page_size_mask) == 0) &&
        (((start_page_number << page_size_shift_) & page_size_mask) == 0))) {
-    memory::PageAccess old_protect_access;
+    memory::PageAccess old_protect_access = memory::PageAccess::kNoAccess;
     if (!xe::memory::Protect(
             TranslateRelative(start_page_number << page_size_shift_),
             page_count << page_size_shift_, ToPageAccess(protect),
