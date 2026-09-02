@@ -1268,7 +1268,13 @@ void Emulator::Pause(bool capture_edram) {
 
     if (thread->is_running()) {
       uint32_t previous_count = 0;
-      thread->thread()->Suspend(&previous_count);
+      if (!thread->thread()->Suspend(&previous_count)) {
+        // It finished between is_running() above and the suspend. Recording
+        // it would leave a dead thread to be resumed later.
+        XELOGW("Pause: thread {:08X} '{}' could not be suspended, skipping",
+               thread->handle(), thread->name());
+        continue;
+      }
       if (previous_count != 0) {
         XELOGW("Pause: thread {:08X} '{}' was already suspended (count {})",
                thread->handle(), thread->name(), previous_count);

@@ -1093,6 +1093,14 @@ class PosixCondition<Thread> final : public PosixConditionBase {
 
     {
       std::unique_lock lock(state_mutex_);
+      if (state_ == State::kFinished) {
+        // The thread ended between the caller's check and this lock. Marking
+        // it kSuspended would resurrect a dead thread's state, and the
+        // pthread_kill below would signal a pthread_t that is gone or has
+        // been reused. Windows SuspendThread fails on an exited thread too.
+        XELOGW("PosixThread::Suspend: thread {} has already finished", tid_);
+        return false;
+      }
       if (out_previous_suspend_count) {
         *out_previous_suspend_count = suspend_count_;
       }
@@ -1526,7 +1534,10 @@ static void PerformDeferredTerminate() {
 
 void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
 #if !XE_PLATFORM_ANDROID
-  if (pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, nullptr) != 0) {
+  // Deferred, so a cancellation can only unwind at a cancellation point and
+  // never in the middle of malloc or another non-reentrant call. Nothing in
+  // the tree calls pthread_cancel today, so this only disarms it.
+  if (pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, nullptr) != 0) {
     assert_always();
   }
 #endif
