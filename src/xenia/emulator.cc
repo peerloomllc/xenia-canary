@@ -1724,6 +1724,20 @@ bool Emulator::RestoreFromFile(const std::filesystem::path& path) {
              header.flags);
       return false;
     }
+    if (header.version < kSaveStateFirstVersionWithTimers) {
+      // Format 4 added timers. Restoring an older file rebuilds the object
+      // table without the periodic timer the game had already created, and
+      // a title whose audio mixer runs off one then submits silence for
+      // ever (notes/50). The file still loads; say why the sound died.
+      XELOGW(
+          "RestoreFromFile: {} is format {}, before timers were saved "
+          "(format {}); the title's audio will stop",
+          path.string(), header.version, kSaveStateFirstVersionWithTimers);
+      AddRestoreWarning(fmt::format(
+          "saved in format {} (before format {}): no timers in this file, "
+          "so audio will stop - re-save this slot",
+          header.version, kSaveStateFirstVersionWithTimers));
+    }
     SaveStateFileInfo info;
     info.version = header.version;
     info.title_id = header.has_title_id ? header.title_id : 0;
