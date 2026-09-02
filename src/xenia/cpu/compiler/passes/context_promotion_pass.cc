@@ -22,12 +22,13 @@ DEFINE_bool(store_all_context_values, false,
             "Don't strip dead context stores to aid in debugging.", "CPU");
 
 DEFINE_bool(
-    promote_vector_context_values, false,
+    promote_vector_context_values, true,
     "Let a vector value loaded from the guest context be reused instead of "
-    "reloaded, the same as every other type. Off since a74fe21f7 (2026-01-25, "
-    "\"Disable context promotion only for vertex type\"), so it is off here "
-    "too until the reason is understood; on, it removes a large number of "
-    "vector loads from vector-heavy guest code.",
+    "reloaded, the same as every other type. a74fe21f7 (2026-01-25, \"Disable "
+    "context promotion only for vertex type\") turned this off to work around "
+    "a constant fold that read the vperm blend mask inverted; that fold is "
+    "fixed now, so this is on. Worth 30.8-31.4 -> 36.4-38.2 fps in a "
+    "CPU-bound Lost Odyssey scene.",
     "CPU");
 
 DEFINE_bool(full_optimization_even_with_debug, false,
