@@ -88,9 +88,18 @@ std::filesystem::path GetUserFolder() {
     struct passwd pw1;
     struct passwd* pw;
     char buf[4096];  // could potentionally lower this
-    getpwuid_r(getuid(), &pw1, buf, sizeof(buf), &pw);
-    assert(&pw1 == pw);  // sanity check
-    home = pw->pw_dir;
+    // getpwuid_r reports "no entry" by returning 0 with a null result, and
+    // the bare assert this used to rely on compiles out under NDEBUG, so a
+    // release build dereferenced null for a uid with no passwd entry.
+    if (getpwuid_r(getuid(), &pw1, buf, sizeof(buf), &pw) == 0 && pw) {
+      home = pw->pw_dir;
+    } else {
+      XELOGW(
+          "GetUserFolder: no HOME and no passwd entry for uid {}; using the "
+          "working directory",
+          getuid());
+      return std::filesystem::current_path() / ".local" / "share";
+    }
   }
 
   return std::filesystem::path(home) / ".local" / "share";
