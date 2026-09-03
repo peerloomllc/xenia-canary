@@ -1616,6 +1616,26 @@ const char* HotkeyActionLabel(EmulatorWindow::HotkeyAction action) {
       return "?";
   }
 }
+
+// The cvar each hotkey action is stored in, for the help icon on its row.
+const char* HotkeyActionCvar(EmulatorWindow::HotkeyAction action) {
+  switch (action) {
+    case EmulatorWindow::HotkeyAction::kPauseResume:
+      return "pause_hotkey";
+    case EmulatorWindow::HotkeyAction::kMute:
+      return "mute_hotkey";
+    case EmulatorWindow::HotkeyAction::kSaveState:
+      return "save_state_hotkey";
+    case EmulatorWindow::HotkeyAction::kLoadState:
+      return "load_state_hotkey";
+    case EmulatorWindow::HotkeyAction::kNextSlot:
+      return "next_slot_hotkey";
+    case EmulatorWindow::HotkeyAction::kPrevSlot:
+      return "prev_slot_hotkey";
+    default:
+      return "";
+  }
+}
 }  // namespace
 
 bool EmulatorWindow::SetActionHotkey(HotkeyAction action,
@@ -5612,6 +5632,18 @@ GtkWidget* AddCheck(GtkWidget* grid, int& row, const char* label,
   return check_row;
 }
 
+// A check button whose callback the caller wrote itself, laid out like
+// AddCheck's rows: the button, then the help icon for its cvar.
+GtkWidget* AttachCheckWithHelp(GtkWidget* grid, int& row, GtkWidget* check,
+                               const char* name) {
+  GtkWidget* check_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+  gtk_box_pack_start(GTK_BOX(check_row), check, FALSE, FALSE, 0);
+  gtk_box_pack_start(GTK_BOX(check_row), HelpIcon(name), FALSE, FALSE, 0);
+  gtk_widget_set_halign(check_row, GTK_ALIGN_START);
+  gtk_grid_attach(GTK_GRID(grid), check_row, 0, row++, 2, 1);
+  return check_row;
+}
+
 // Combo over (value, label) pairs; on_change gets the chosen value.
 GtkWidget* AddCombo(GtkWidget* grid, int& row, const char* label,
                     const char* name,
@@ -6347,7 +6379,7 @@ void EmulatorWindow::ToggleSettingsWindow() {
           ToggleFpsOverlay();
         }
       });
-      gtk_grid_attach(GTK_GRID(grid), fps, 0, row++, 2, 1);
+      AttachCheckWithHelp(grid, row, fps, "show_fps");
     }
     {
       // The frame rate limit's meaning depends on this, so its label is
@@ -6506,7 +6538,7 @@ void EmulatorWindow::ToggleSettingsWindow() {
               gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(w)));
           ApplyDisplayConfigForCvars();
         });
-        gtk_grid_attach(GTK_GRID(grid), dither, 0, row++, 2, 1);
+        AttachCheckWithHelp(grid, row, dither, "postprocess_dither");
       }
       struct ColorScale {
         const char* label;
@@ -6787,8 +6819,10 @@ void EmulatorWindow::ToggleSettingsWindow() {
     }
     for (int a = 0; a < int(HotkeyAction::kCount); ++a) {
       HotkeyAction action = HotkeyAction(a);
-      gtk_grid_attach(GTK_GRID(grid), LeftLabel(HotkeyActionLabel(action)), 0,
-                      row, 1, 1);
+      gtk_grid_attach(
+          GTK_GRID(grid),
+          LabelWithHelp(HotkeyActionLabel(action), HotkeyActionCvar(action)), 0,
+          row, 1, 1);
       GtkWidget* current = LeftLabel("");
       remember("hotkey:" + std::to_string(a), current);
       gtk_grid_attach(GTK_GRID(grid), current, 1, row, 1, 1);
