@@ -10,6 +10,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <fstream>
 #include <cstdio>
 #include <ranges>
 #include <thread>
@@ -70,6 +71,7 @@
 #include "xenia/ui/window.h"
 #include "xenia/ui/windowed_app_context.h"
 #include "xenia/vfs/device.h"
+#include "xenia/kernel/smc.h"
 #include "xenia/vfs/devices/disc_image_device.h"
 #include "xenia/vfs/devices/disc_zarchive_device.h"
 #include "xenia/vfs/devices/host_path_device.h"
@@ -135,6 +137,20 @@ DEFINE_int32(pause_experiment_pause_seconds, 0,
 DEFINE_int32(pause_experiment_resume_seconds, 0,
              "Experiment: N seconds after launch, call Emulator::Resume().",
              "General");
+DEFINE_int32(disc_swap_experiment_seconds, 0,
+             "Experiment: N seconds after launch, swap the disc the way "
+             "XamSwapDisc does, without waiting for the title to ask. Uses "
+             "the playlist when one was launched, otherwise "
+             "disc_swap_experiment_path.",
+             "General");
+DEFINE_int32(disc_swap_experiment_disc, 2,
+             "Experiment: which disc number disc_swap_experiment_seconds "
+             "asks for.",
+             "General");
+DEFINE_path(disc_swap_experiment_path, "",
+            "Experiment: the disc image to swap to when there is no "
+            "playlist.",
+            "General");
 DEFINE_double(time_scalar, 1.0,
               "Scalar used to speed or slow time (1x, 2x, 1/2x, etc).",
               "General");
@@ -628,6 +644,55 @@ Emulator::FileSignatureType Emulator::GetFileSignature(
 X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
   X_STATUS mount_result = X_STATUS_SUCCESS;
 
+  // An .m3u is a plain list of the title's discs, one per line, so a
+  // multi-disc title can be opened once and swap discs by itself. Blank
+  // lines and # comments are skipped; relative entries resolve against the
+  // playlist's own folder.
+  if (path.extension() == ".m3u" || path.extension() == ".M3U") {
+    disc_playlist_.clear();
+    std::ifstream list(path);
+    if (!list) {
+      XELOGE("Unable to read the playlist {}", path.string());
+      return X_STATUS_NO_SUCH_FILE;
+    }
+    std::string line;
+    while (std::getline(list, line)) {
+      while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) {
+        line.pop_back();
+      }
+      size_t first = line.find_first_not_of(" \t");
+      if (first == std::string::npos) {
+        continue;
+      }
+      line = line.substr(first);
+      if (line[0] == '#') {
+        continue;
+      }
+      std::filesystem::path entry = xe::to_path(line);
+      if (entry.is_relative()) {
+        entry = path.parent_path() / entry;
+      }
+      std::error_code ec;
+      if (!std::filesystem::exists(entry, ec)) {
+        XELOGW("Playlist entry not found, skipping: {}", entry.string());
+        continue;
+      }
+      disc_playlist_.push_back(entry);
+    }
+    if (disc_playlist_.empty()) {
+      XELOGE("The playlist {} lists no readable discs", path.string());
+      return X_STATUS_NO_SUCH_FILE;
+    }
+    XELOGI("Playlist {}: {} disc(s), starting with {}", path.string(),
+           disc_playlist_.size(), disc_playlist_.front().filename().string());
+    // The entries are not opened here on purpose. Mounting each one to read
+    // its header during launch, while the emulator is still being set up,
+    // made startup shader translation abort with a corrupted heap in 3 of 5
+    // runs; the same build launching a single image never did. Each entry is
+    // read when a swap actually asks for it instead.
+    return LaunchPath(disc_playlist_.front());
+  }
+
   switch (GetFileSignature(path)) {
     case FileSignatureType::XEX0:
     case FileSignatureType::XEXQ:
@@ -647,6 +712,7 @@ X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
     } break;
     case FileSignatureType::XISO: {
       mount_result = MountPath(path, "\\Device\\Cdrom0");
+      disc_mount_path_ = "\\Device\\Cdrom0";
       return mount_result ? mount_result : LaunchDiscImage(path);
     } break;
     case FileSignatureType::XBE: {
@@ -655,6 +721,7 @@ X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
     } break;
     case FileSignatureType::ZAR: {
       mount_result = MountPath(path, "\\Device\\Cdrom0");
+      disc_mount_path_ = "\\Device\\Cdrom0";
       return mount_result ? mount_result : LaunchDiscArchive(path);
     } break;
     case FileSignatureType::EXE:
@@ -2011,6 +2078,172 @@ std::string Emulator::SaveStateMismatch(const SaveStateFileInfo& info) const {
   return "";
 }
 
+bool Emulator::ReadDiscInfo(const std::filesystem::path& path,
+                            DiscInfo* out) {
+  if (!out) {
+    return false;
+  }
+  *out = DiscInfo();
+  std::vector<uint8_t> header;
+  std::unique_ptr<vfs::Device> device;
+  switch (GetFileSignature(path)) {
+    case FileSignatureType::XEX0:
+    case FileSignatureType::XEXQ:
+    case FileSignatureType::XEXH:
+    case FileSignatureType::XEX25:
+    case FileSignatureType::XEX1:
+    case FileSignatureType::XEX2: {
+      auto* f = xe::filesystem::OpenFile(path, "rb");
+      if (!f) {
+        return false;
+      }
+      header.resize(64 * 1024);
+      size_t n = fread(header.data(), 1, header.size(), f);
+      fclose(f);
+      header.resize(n);
+    } break;
+    case FileSignatureType::XISO:
+      device = std::make_unique<vfs::DiscImageDevice>("\\Device\\DiscScan",
+                                                      path);
+      break;
+    case FileSignatureType::ZAR:
+      device = std::make_unique<vfs::DiscZarchiveDevice>(
+          "\\Device\\DiscScan", path);
+      break;
+    default:
+      return false;
+  }
+  if (device) {
+    if (!device->Initialize()) {
+      return false;
+    }
+    auto* entry = device->ResolvePath("default.xex");
+    if (!entry) {
+      return false;
+    }
+    vfs::File* file = nullptr;
+    if (entry->Open(vfs::FileAccess::kFileReadData, &file) !=
+            X_STATUS_SUCCESS ||
+        !file) {
+      return false;
+    }
+    header.resize(std::min<size_t>(entry->size(), 64 * 1024));
+    size_t n = 0;
+    file->ReadSync(std::span<uint8_t>(header.data(), header.size()), 0, &n);
+    file->Destroy();
+    header.resize(n);
+  }
+  if (header.size() < sizeof(xex2_header) ||
+      xe::load_and_swap<uint32_t>(header.data()) != 0x58455832) {  // 'XEX2'
+    return false;
+  }
+  auto* xex = reinterpret_cast<const xex2_header*>(header.data());
+  uint32_t count = xex->header_count;
+  for (uint32_t i = 0; i < count; ++i) {
+    size_t at = offsetof(xex2_header, headers) + i * sizeof(xex2_opt_header);
+    if (at + sizeof(xex2_opt_header) > header.size()) {
+      break;
+    }
+    auto* opt = reinterpret_cast<const xex2_opt_header*>(header.data() + at);
+    if (opt->key == XEX_HEADER_EXECUTION_INFO) {
+      uint32_t offset = opt->offset;
+      if (offset + sizeof(xex2_opt_execution_info) <= header.size()) {
+        auto* info = reinterpret_cast<const xex2_opt_execution_info*>(
+            header.data() + offset);
+        out->title_id = info->title_id;
+        out->media_id = info->media_id;
+        out->disc_number = info->disc_number;
+        out->disc_count = info->disc_count;
+      }
+    }
+  }
+  return out->title_id != 0;
+}
+
+std::filesystem::path Emulator::PlaylistDisc(uint8_t n) {
+  for (const auto& entry : disc_playlist_) {
+    DiscInfo info;
+    if (ReadDiscInfo(entry, &info) && info.disc_number == n) {
+      return entry;
+    }
+  }
+  return std::filesystem::path();
+}
+
+bool Emulator::SwapDisc(const std::filesystem::path& path,
+                        uint8_t requested_disc, std::string* out_reason) {
+  auto reason = [out_reason](std::string text) {
+    XELOGW("SwapDisc refused: {}", text);
+    if (out_reason) {
+      *out_reason = std::move(text);
+    }
+    return false;
+  };
+
+  DiscInfo info;
+  if (!ReadDiscInfo(path, &info)) {
+    return reason("that file is not a disc image this title can use");
+  }
+  // The running title's own ids, so a disc from another game is refused.
+  if (title_id_.has_value() && info.title_id != title_id_.value()) {
+    return reason(fmt::format("that disc is for title {:08X}, not {:08X}",
+                              info.title_id, title_id_.value()));
+  }
+  // Not the media id: it identifies the physical disc, not the release, so
+  // every disc of a title has its own. Lost Odyssey's discs 1 and 2 are
+  // 368DE6DD and 1888BE4E. Title id and disc number are what must match.
+  if (requested_disc && info.disc_number != requested_disc) {
+    return reason(fmt::format("that is disc {}, the title asked for disc {}",
+                              info.disc_number, requested_disc));
+  }
+
+  // Open the tray around the change: a title that watches the tray rather
+  // than calling XamSwapDisc (Blue Dragon polls XamLoaderGetDvdTrayState)
+  // sees the disc leave and a new one arrive.
+  auto* smc = kernel_state_ ? kernel_state_->smc() : nullptr;
+  if (smc) {
+    smc->SetTrayState(X_DVD_TRAY_STATE::OPEN);
+    XELOGI("Disc swap: DVD tray reported open");
+  }
+
+  // Drop the outgoing disc rather than leaving it registered behind the new
+  // one, where anything resolving the device by name still reads it.
+  // The device itself stays alive until the title exits: a file handle the
+  // guest still holds on the old disc points into its entries and its memory
+  // map, and a read through it after the device was destroyed crashed the
+  // process (Lost Odyssey streaming from the title screen when a timed swap
+  // fired).
+  const std::string previous_mount = disc_mount_path_;
+  if (!previous_mount.empty()) {
+    std::unique_ptr<vfs::Device> outgoing =
+        file_system_->DetachDevice(previous_mount);
+    if (outgoing) {
+      ejected_discs_.push_back(std::move(outgoing));
+    }
+    XELOGI("Disc swap: unmounted the outgoing disc at {}", previous_mount);
+  }
+
+  const std::string mount_path =
+      previous_mount.empty() ? "\\Device\\Cdrom0" : previous_mount;
+  X_STATUS result = MountPath(path, mount_path);
+  if (result != X_STATUS_SUCCESS) {
+    if (smc) {
+      smc->SetTrayState(X_DVD_TRAY_STATE::CLOSED);
+    }
+    return reason("that disc image could not be mounted");
+  }
+  disc_mount_path_ = mount_path;
+  disc_number_ = info.disc_number;
+
+  if (smc) {
+    smc->SetTrayState(X_DVD_TRAY_STATE::CLOSED);
+    XELOGI("Disc swap: DVD tray reported closed");
+  }
+  XELOGI("Disc swapped to {} (disc {} of {}) at {}", path.string(),
+         info.disc_number, info.disc_count, mount_path);
+  return true;
+}
+
 const std::filesystem::path Emulator::GetNewDiscPath(
     std::string window_message) {
   std::filesystem::path path = "";
@@ -2552,6 +2785,34 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
                    std::chrono::steady_clock::now() - t0)
                    .count());
       }
+    }).detach();
+  }
+
+  if (cvars::disc_swap_experiment_seconds > 0) {
+    std::thread([this]() {
+      xe::threading::set_name("Disc Swap Experiment");
+      std::this_thread::sleep_for(
+          std::chrono::seconds(cvars::disc_swap_experiment_seconds));
+      const uint8_t wanted =
+          static_cast<uint8_t>(cvars::disc_swap_experiment_disc);
+      std::filesystem::path path = PlaylistDisc(wanted);
+      if (path.empty()) {
+        path = cvars::disc_swap_experiment_path;
+      }
+      if (path.empty()) {
+        XELOGE("DISC SWAP EXPERIMENT: no playlist and no path given");
+        return;
+      }
+      XELOGI("DISC SWAP EXPERIMENT: asking for disc {} from {}", wanted,
+             path.string());
+      std::string refusal;
+      auto t0 = std::chrono::steady_clock::now();
+      const bool ok = SwapDisc(path, wanted, &refusal);
+      XELOGI("DISC SWAP EXPERIMENT: {} in {} ms{}", ok ? "ok" : "refused",
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - t0)
+                 .count(),
+             ok ? "" : (" - " + refusal));
     }).detach();
   }
 

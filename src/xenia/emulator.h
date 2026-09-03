@@ -162,6 +162,8 @@ class Emulator {
 
   // Disc of a multi-disc title, from the XEX execution info (0 if unknown).
   uint8_t disc_number() const { return disc_number_; }
+  // Where the running title's disc is mounted, for a later swap.
+  const std::string& disc_mount_path() const { return disc_mount_path_; }
   uint8_t disc_count() const { return disc_count_; }
   uint32_t media_id() const { return media_id_; }
   bool is_multi_disc() const { return disc_count_ > 1; }
@@ -382,6 +384,34 @@ class Emulator {
   // The game can request another title to be loaded.
   const std::filesystem::path GetNewDiscPath(std::string window_message = "");
 
+  // Title id, discs and media id from a disc image or XEX without launching
+  // it. The same header read the game library scan uses.
+  struct DiscInfo {
+    uint32_t title_id = 0;
+    uint32_t media_id = 0;
+    uint8_t disc_number = 0;
+    uint8_t disc_count = 0;
+  };
+  bool ReadDiscInfo(const std::filesystem::path& path, DiscInfo* out);
+
+  // Swaps the running title's disc for the image at path: checks that it is
+  // the disc that was asked for, cycles the DVD tray around the change so a
+  // title watching the tray notices, unregisters the outgoing disc and mounts
+  // the new one. Returns false and leaves the current disc in place if the
+  // image is not the requested disc of the running title; out_reason then
+  // says why, for the notification.
+  bool SwapDisc(const std::filesystem::path& path, uint8_t requested_disc,
+                std::string* out_reason = nullptr);
+
+  // Discs listed by an .m3u launched instead of an image, in file order, and
+  // the mount point the running title's disc is registered at. Empty when the
+  // title was launched from a single image.
+  const std::vector<std::filesystem::path>& disc_playlist() const {
+    return disc_playlist_;
+  }
+  // The playlist entry whose disc number is n, or an empty path.
+  std::filesystem::path PlaylistDisc(uint8_t n);
+
   void WaitUntilExit();
 
  public:
@@ -418,6 +448,14 @@ class Emulator {
   std::string title_version_;
   uint8_t disc_number_ = 0;
   uint8_t disc_count_ = 0;
+  // Mount point of the running title's disc, so a swap can unregister it
+  // instead of leaving it registered behind the new one.
+  std::string disc_mount_path_;
+  // Discs swapped out during this title, kept alive for the handles the
+  // guest may still hold on them. Freed with the emulator.
+  std::vector<std::unique_ptr<vfs::Device>> ejected_discs_;
+  // Discs from an .m3u, in file order.
+  std::vector<std::filesystem::path> disc_playlist_;
   uint32_t media_id_ = 0;
 
   ui::Window* display_window_ = nullptr;

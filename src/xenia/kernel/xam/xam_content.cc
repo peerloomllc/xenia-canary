@@ -732,22 +732,35 @@ dword_result_t XamSwapDisc_entry(
     return X_ERROR_SUCCESS;
   }
 
-  auto filesystem = kernel_state()->file_system();
-  auto mount_path = "\\Device\\LauncherData";
+  auto* emulator = kernel_state()->emulator();
+  const uint8_t wanted = static_cast<uint8_t>(uint32_t(disc_number));
 
-  if (filesystem->ResolvePath(mount_path) != NULL) {
-    filesystem->UnregisterDevice(mount_path);
+  // A playlist knows which file is which disc, so the title swaps without
+  // asking. Without one, ask for the file, using the title's own message.
+  std::filesystem::path new_disc_path = emulator->PlaylistDisc(wanted);
+  if (new_disc_path.empty()) {
+    std::u16string text_message = xe::load_and_swap<std::u16string>(
+        kernel_state()->memory()->TranslateVirtual(
+            error_message->stringTextPtr));
+    new_disc_path = emulator->GetNewDiscPath(xe::to_utf8(text_message));
+    XELOGI("GetNewDiscPath returned path {}.", new_disc_path.string().c_str());
+  } else {
+    XELOGI("Playlist supplies disc {}: {}", wanted, new_disc_path.string());
   }
 
-  std::u16string text_message = xe::load_and_swap<std::u16string>(
-      kernel_state()->memory()->TranslateVirtual(error_message->stringTextPtr));
+  if (new_disc_path.empty()) {
+    // Nothing chosen. Leave the current disc in place and tell the title the
+    // request did not complete, rather than signalling a swap that never
+    // happened.
+    return X_ERROR_CANCELLED;
+  }
 
-  const std::filesystem::path new_disc_path =
-      kernel_state()->emulator()->GetNewDiscPath(xe::to_utf8(text_message));
-  XELOGI("GetNewDiscPath returned path {}.", new_disc_path.string().c_str());
+  std::string refusal;
+  if (!emulator->SwapDisc(new_disc_path, wanted, &refusal)) {
+    XELOGE("XamSwapDisc: {}", refusal);
+    return X_ERROR_INVALID_PARAMETER;
+  }
 
-  // TODO(Gliniak): Implement checking if inserted file is requested one
-  kernel_state()->emulator()->MountPath(new_disc_path, mount_path);
   completion_event();
 
   return X_ERROR_SUCCESS;
