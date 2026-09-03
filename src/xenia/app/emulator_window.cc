@@ -2070,6 +2070,32 @@ xe::ui::ImmediateTexture* EmulatorWindow::SlotThumbnailTexture(int slot) {
   return texture;
 }
 
+void EmulatorWindow::DeleteSaveStateSlot(int slot) {
+  auto path = SaveStateSlotPath(slot);
+  std::error_code ec;
+  if (!std::filesystem::exists(path, ec)) {
+    return;
+  }
+  auto png = path;
+  png.replace_extension(".png");
+  bool removed = std::filesystem::remove(path, ec);
+  std::string text;
+  if (!removed) {
+    text = fmt::format("Could not delete slot {}: {}", slot, ec.message());
+    XELOGE("Save state slot {} could not be deleted: {}", slot, ec.message());
+  } else {
+    // The thumbnail is optional; a slot written before thumbnails has none.
+    std::error_code png_ec;
+    std::filesystem::remove(png, png_ec);
+    text = fmt::format("Slot {} deleted", slot);
+    XELOGI("Save state slot {} deleted ({})", slot, path.string());
+  }
+  // Drop the cached texture so the row stops showing a picture of a file
+  // that is gone.
+  slot_thumbnails_.erase(slot);
+  new xe::ui::HostNotificationWindow(imgui_drawer(), "Save state", text, 0);
+}
+
 void EmulatorWindow::PickSaveStateDir() {
   auto picker = xe::ui::FilePicker::Create();
   picker->set_mode(ui::FilePicker::Mode::kOpen);
@@ -3157,6 +3183,38 @@ void EmulatorWindow::SaveStatesDialog::OnDraw(ImGuiIO& io) {
         w.LoadState();
       }
       ImGui::EndDisabled();
+      // Delete needs a file to delete, but not a running title: a slot can
+      // be cleared out from the dialog with nothing loaded.
+      std::error_code slot_ec;
+      bool has_file =
+          title_open && std::filesystem::exists(w.SaveStateSlotPath(slot),
+                                                slot_ec);
+      ImGui::SameLine();
+      ImGui::BeginDisabled(busy || !has_file);
+      if (ImGui::Button("Delete")) {
+        ImGui::OpenPopup("Delete this save state?");
+      }
+      ImGui::EndDisabled();
+      if (ImGui::BeginPopupModal("Delete this save state?", nullptr,
+                                 ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("%s", w.SaveStateSlotSummary(slot).c_str());
+        ImGui::TextUnformatted("This cannot be undone.");
+        ImGui::Separator();
+        if (ImGui::Button("Delete")) {
+          // Deferred, not CallInUIThread: that one runs inline when it is
+          // already on the UI thread, which this is. The delete drops the
+          // slot's thumbnail texture, and the frame being built still has it
+          // in its draw list, so freeing it here loses the device.
+          w.app_context().CallInUIThreadDeferred(
+              [&w, slot]() { w.DeleteSaveStateSlot(slot); });
+          ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+          ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+      }
       ImGui::PopID();
     }
     ImGui::EndTable();
