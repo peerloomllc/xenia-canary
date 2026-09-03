@@ -304,7 +304,12 @@ void ExceptionHandler::Install(Handler fn, void* data) {
 
     std::memset(&signal_handler, 0, sizeof(signal_handler));
     signal_handler.sa_sigaction = ExceptionHandlerCallback;
-    signal_handler.sa_flags = SA_SIGINFO;
+    // SA_NODEFER: the handler faults on guest memory it protects itself, and
+    // the kernel blocks the signal while the handler runs, so a nested fault
+    // is undeliverable and the process is killed. Re-entry is safe: the
+    // handler only touches the context it is given, and the global critical
+    // region is recursive.
+    signal_handler.sa_flags = SA_SIGINFO | SA_NODEFER;
 
     if (sigaction(SIGILL, &signal_handler, &original_sigill_handler_) != 0) {
       assert_always("Failed to install new SIGILL handler");
