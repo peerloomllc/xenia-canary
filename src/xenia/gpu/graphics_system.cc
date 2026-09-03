@@ -39,8 +39,22 @@ DEFINE_bool(
     "runtime spikes and freezes when playing the game not for the first time.",
     "GPU.Debug");
 
+DEFINE_bool(
+    vblank_deadline_pacing, true,
+    "Pace the vblank heartbeat on a deadline and make up beats lost to a late "
+    "wake-up, instead of sleeping a fixed period from wherever the thread "
+    "happens to wake (Linux only; Windows already tests a deadline). The "
+    "sound card drains audio at its own fixed rate, so every beat the guest "
+    "does not get is picture time lost against the sound for good, which "
+    "shows up as lip sync drifting in cutscenes when another process loads "
+    "the machine. Also runs the pacing thread at normal priority rather than "
+    "the lowest in the process. Set to false for the old behaviour.",
+    "GPU");
+
 namespace xe {
 namespace gpu {
+
+std::atomic<uint64_t> GraphicsSystem::stats_vblank_count_{0};
 
 // Nvidia Optimus/AMD PowerXpress support.
 // These exports force the process to trigger the discrete GPU in multi-GPU
@@ -129,6 +143,15 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
                                                     normalized_framerate_limit))
                     : 1.0;
             uint64_t last_frame_time = Clock::QueryGuestTickCount();
+            // Deadline the POSIX branch paces to, and the most lateness it
+            // will try to make up (a second: enough to cover another process
+            // hogging the CPU through a cutscene, short of fast-forwarding
+            // the guest after a real freeze).
+            using steady_time_point = std::chrono::steady_clock::time_point;
+            steady_time_point next_vblank_deadline{};
+            constexpr auto kMaxVblankCatchUp = std::chrono::seconds(1);
+            (void)next_vblank_deadline;
+            (void)kMaxVblankCatchUp;
     // Sleep for 90% of the vblank duration on Windows, spin for 10%
     // Linux uses full sleep duration due to scheduler quantum issues
 #if XE_PLATFORM_WIN32
@@ -185,7 +208,6 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
               }
 #endif
 #if XE_PLATFORM_LINUX
-              // Linux: Use simplified timing logic to avoid oversleeping
               MarkVblank();
 
               if (cvars::vsync || normalized_framerate_limit > 0) {
@@ -202,7 +224,35 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
                                                  1.0 / 16.0, 16.0);
                 sleep_duration_ns =
                     static_cast<uint64_t>(sleep_duration_ns / scalar);
-                threading::NanoSleep(sleep_duration_ns);
+                if (!cvars::vblank_deadline_pacing) {
+                  // Sleeping a fixed period from wherever the thread woke
+                  // makes the real period that period plus the interrupt
+                  // dispatch plus the scheduler's wake-up latency, and none
+                  // of it is ever made up.
+                  threading::NanoSleep(sleep_duration_ns);
+                } else {
+                  const auto period = std::chrono::nanoseconds(
+                      std::max<uint64_t>(1, sleep_duration_ns));
+                  auto now = std::chrono::steady_clock::now();
+                  if (next_vblank_deadline == steady_time_point()) {
+                    next_vblank_deadline = now;
+                  }
+                  next_vblank_deadline += period;
+                  if (next_vblank_deadline > now) {
+                    threading::NanoSleep(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            next_vblank_deadline - now)
+                            .count());
+                  } else if (now - next_vblank_deadline > kMaxVblankCatchUp) {
+                    // Further behind than catching up could hide. Give the
+                    // missed beats up and start again from here rather than
+                    // fast-forwarding the guest through a long freeze.
+                    next_vblank_deadline = now + period;
+                  }
+                  // Otherwise fall straight through without sleeping, which
+                  // delivers the missed beats back to back until the guest
+                  // has had as many as real time says it should.
+                }
               } else {
                 xe::threading::Sleep(std::chrono::milliseconds(1));
               }
@@ -215,8 +265,19 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
   frame_limiter_worker_thread_->set_can_debugger_suspend(true);
   frame_limiter_worker_thread_->set_name("GPU Frame limiter");
   frame_limiter_worker_thread_->Create();
+  // The Windows branch spins for part of each period, which is what the
+  // lowest priority was for. The POSIX branch only sleeps, so the priority
+  // buys nothing there and costs wake-up latency: at nice 15 it was the
+  // weakest thread in the process, and any other busy program delayed the
+  // guest's vblanks.
+#if XE_PLATFORM_WIN32
   frame_limiter_worker_thread_->thread()->set_priority(
       threading::ThreadPriority::kLowest);
+#else
+  frame_limiter_worker_thread_->thread()->set_priority(
+      cvars::vblank_deadline_pacing ? threading::ThreadPriority::kNormal
+                                    : threading::ThreadPriority::kLowest);
+#endif
   if (cvars::trace_gpu_stream) {
     BeginTracing();
   }
@@ -346,6 +407,8 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
 
 void GraphicsSystem::MarkVblank() {
   SCOPE_profile_cpu_f("gpu");
+
+  stats_vblank_count_.fetch_add(1, std::memory_order_relaxed);
 
   // Increment vblank counter (so the game sees us making progress).
   command_processor_->increment_counter();

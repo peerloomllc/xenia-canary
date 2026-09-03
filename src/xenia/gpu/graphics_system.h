@@ -40,6 +40,11 @@ class GraphicsSystem {
  public:
   virtual ~GraphicsSystem();
 
+  // Vblank interrupts dispatched to the guest, cumulative, for
+  // --stats_log_seconds. The guest paces its animation off these, so this
+  // rate falling below the display's is picture time lost against the sound.
+  static std::atomic<uint64_t> stats_vblank_count_;
+
   virtual std::string name() const = 0;
 
   Memory* memory() const { return memory_; }

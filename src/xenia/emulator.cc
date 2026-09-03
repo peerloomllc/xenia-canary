@@ -2819,8 +2819,8 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
     std::thread([this]() {
       xe::threading::set_name("Stats Log");
       const int period = cvars::stats_log_seconds;
-      uint64_t swaps = 0, audio = 0, silent = 0, xma = 0, cbs = 0,
-               starved = 0;
+      uint64_t swaps = 0, audio = 0, silent = 0, xma = 0, cbs = 0, starved = 0,
+               vblanks = 0;
       uint64_t draws = 0, passes = 0, rtxfers = 0, resolves = 0,
                resolve_px = 0;
       uint64_t ui_calls = 0, ui_calls_queued = 0;
@@ -2854,22 +2854,28 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
         uint64_t gr = gpu::CommandProcessor::stats_gpu_resolve_ns_.load();
         uint64_t sca = gpu::CommandProcessor::stats_scissor_area_sum_.load();
         uint64_t fi = gpu::CommandProcessor::stats_gpu_fragment_invocations_.load();
+        uint64_t vb = gpu::GraphicsSystem::stats_vblank_count_.load();
         uint64_t uic = ui::WindowedAppContext::stats_ui_calls_executed_.load();
         uint64_t uiq = ui::WindowedAppContext::stats_ui_calls_queued_.load();
         double t = std::chrono::duration<double>(
                        std::chrono::steady_clock::now() - t0)
                        .count();
         XELOGI(
-            "STATS t={:.0f}s guest={:.1f}s swaps +{} ({:.1f}/s) audio_frames "
+            "STATS t={:.0f}s guest={:.1f}s vblanks +{} ({:.1f}/s) swaps +{} "
+            "({:.1f}/s) audio_frames "
             "+{} ({:.1f}/s, {} silent) xma_packets +{} sdl_callbacks +{} "
-            "starved +{} draws +{} passes +{} rt_transfers +{} (boundable +{} pushed +{}) resolves +{} ({:.1f} MPix) gpu_ms +{:.0f} (xfer {:.0f}, resolve {:.0f}) scissor_kpx/draw {:.0f} frag +{:.0f}M ui_calls +{} (queued +{}, backlog {}){}",
+            "starved +{} draws +{} passes +{} rt_transfers +{} (boundable +{} "
+            "pushed +{}) resolves +{} ({:.1f} MPix) gpu_ms +{:.0f} (xfer "
+            "{:.0f}, resolve {:.0f}) scissor_kpx/draw {:.0f} frag +{:.0f}M "
+            "ui_calls +{} (queued +{}, backlog {}){}",
             t,
-            double(Clock::QueryGuestTickCount()) / Clock::guest_tick_frequency(),
-            s - swaps, double(s - swaps) / period, a - audio,
-            double(a - audio) / period, q - silent, x - xma, c - cbs,
-            st - starved, d - draws, rp - passes, tx - rtxfers,
-            txb - rtxfer_bound, txp - rtxfer_pushed, rv - resolves,
-            double(rvp - resolve_px) / 1e6,
+            double(Clock::QueryGuestTickCount()) /
+                Clock::guest_tick_frequency(),
+            vb - vblanks, double(vb - vblanks) / period, s - swaps,
+            double(s - swaps) / period, a - audio, double(a - audio) / period,
+            q - silent, x - xma, c - cbs, st - starved, d - draws, rp - passes,
+            tx - rtxfers, txb - rtxfer_bound, txp - rtxfer_pushed,
+            rv - resolves, double(rvp - resolve_px) / 1e6,
             double(gt - gpu_total_ns) / 1e6, double(gx - gpu_xfer_ns) / 1e6,
             double(gr - gpu_resolve_ns) / 1e6,
             (d - draws) ? double(sca - scissor_area) / (d - draws) / 1e3 : 0.0,
@@ -2890,6 +2896,7 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
         rtxfer_pushed = txp;
         resolves = rv;
         resolve_px = rvp;
+        vblanks = vb;
         swaps = s;
         audio = a;
         silent = q;
