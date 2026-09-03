@@ -178,7 +178,9 @@ void ContentListDialog::OnEntryDraw(ImGuiIO& io, const XContentType type,
     if (entry.is_package) {
       if (ImGui::MenuItem("Extract", nullptr, nullptr, true)) {
         const auto path = entry.path;
-        emulator_window_.window()->app_context().CallInUIThread(
+        // Deferred: CallInUIThread runs inline when already on the UI
+        // thread, and this is inside the dialog's draw.
+        emulator_window_.window()->app_context().CallInUIThreadDeferred(
             [emulator_window = &emulator_window_, path]() {
               emulator_window->ExtractContent(path);
             });

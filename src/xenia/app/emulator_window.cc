@@ -2329,7 +2329,9 @@ void EmulatorWindow::GameLibraryDialog::OnDraw(ImGuiIO& io) {
                                 ? "(none)"
                                 : cvars::games_dir.c_str());
   if (ImGui::Button("Change folder...")) {
-    w.app_context().CallInUIThread([&w]() { w.PickGamesDir(); });
+    // Deferred: the picker runs its own event loop, and CallInUIThread runs
+    // inline when it is already on the UI thread, which a draw is.
+    w.app_context().CallInUIThreadDeferred([&w]() { w.PickGamesDir(); });
   }
   ImGui::SameLine();
   ImGui::BeginDisabled(cvars::games_dir.empty());
@@ -2365,8 +2367,10 @@ void EmulatorWindow::GameLibraryDialog::OnDraw(ImGuiIO& io) {
       ImGui::TableSetColumnIndex(3);
       if (ImGui::Button("Launch")) {
         auto path = entry.path;
-        // RunTitle tears the current title down; not from inside a frame.
-        w.app_context().CallInUIThread([&w, path]() { w.RunTitle(path); });
+        // RunTitle tears the current title down, so it must not run from
+        // inside a frame. CallInUIThread would run it inline here.
+        w.app_context().CallInUIThreadDeferred(
+            [&w, path]() { w.RunTitle(path); });
       }
       ImGui::PopID();
     }
@@ -2718,7 +2722,9 @@ void EmulatorWindow::ContentFolderDialog::OnDraw(ImGuiIO& io) {
   ImGui::BeginDisabled(busy);
   if (ImGui::Button("Change folder...")) {
     // The picker runs its own event loop; not from inside a frame.
-    w.app_context().CallInUIThread([&w]() { w.PickContentRoot(); });
+    // CallInUIThread would run it inline here, since a draw is on the UI
+    // thread.
+    w.app_context().CallInUIThreadDeferred([&w]() { w.PickContentRoot(); });
   }
   ImGui::SameLine();
   ImGui::BeginDisabled(cvars::content_root.empty());
@@ -3121,7 +3127,9 @@ void EmulatorWindow::SaveStatesDialog::OnDraw(ImGuiIO& io) {
   ImGui::BeginDisabled(busy);
   if (ImGui::Button("Change folder...")) {
     // The picker runs its own event loop; not from inside a frame.
-    w.app_context().CallInUIThread([&w]() { w.PickSaveStateDir(); });
+    // CallInUIThread would run it inline here, since a draw is on the UI
+    // thread.
+    w.app_context().CallInUIThreadDeferred([&w]() { w.PickSaveStateDir(); });
   }
   ImGui::SameLine();
   ImGui::BeginDisabled(cvars::save_state_dir.empty());
@@ -7521,7 +7529,9 @@ void EmulatorWindow::BuildDashboard() {
         gtk_tree_model_get(model, &iter, kColIndex, &index, -1);
         if (index >= 0 && index < int(w->library_titles_.size())) {
           auto title_path = w->library_titles_[index].path;
-          w->app_context().CallInUIThread(
+          // Deferred: RunTitle hides the dashboard, and this is running
+          // inside the tree view's own signal handler.
+          w->app_context().CallInUIThreadDeferred(
               [w, title_path]() { w->RunTitle(title_path); });
         }
       }),
@@ -7574,7 +7584,7 @@ void EmulatorWindow::BuildDashboard() {
                              }
                              if (rating == -2) {
                                auto p = w->library_titles_[i].path;
-                               w->app_context().CallInUIThread(
+                               w->app_context().CallInUIThreadDeferred(
                                    [w, p]() { w->RunTitle(p); });
                                return;
                              }
@@ -7761,7 +7771,9 @@ void EmulatorWindow::LaunchLibraryIndex(int index) {
     return;
   }
   auto path = library_titles_[index].path;
-  app_context().CallInUIThread([this, path]() { RunTitle(path); });
+  // Deferred: RunTitle hides the dashboard, and the callers are its own
+  // widget callbacks.
+  app_context().CallInUIThreadDeferred([this, path]() { RunTitle(path); });
 }
 
 void EmulatorWindow::ShowDashboard(bool show) {
