@@ -2546,14 +2546,44 @@ struct AND_I32 : Sequence<AND_I32, I<OPCODE_AND, I32Op, I32Op, I32Op>> {
     EmitAndXX<AND_I32, Reg32>(e, i);
   }
 };
+// btr/bts is 5 bytes where movabs + and/or is 10; nothing consumes the flags.
+static bool TryEmitSingleBitMask(X64Emitter& e, const I64Op& dest,
+                                 const I64Op& src, uint64_t constant,
+                                 bool set) {
+  const uint64_t bit = set ? constant : ~constant;
+  if (!bit || (bit & (bit - 1))) {
+    return false;
+  }
+  if (static_cast<int64_t>(constant) ==
+      static_cast<int64_t>(static_cast<int32_t>(constant))) {
+    return false;
+  }
+  if (dest != src.reg()) {
+    e.mov(dest, src);
+  }
+  if (set) {
+    e.bts(dest, xe::tzcnt(bit));
+  } else {
+    e.btr(dest, xe::tzcnt(bit));
+  }
+  return true;
+}
 struct AND_I64 : Sequence<AND_I64, I<OPCODE_AND, I64Op, I64Op, I64Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
     if (i.src2.is_constant && i.src2.constant() == 0xFFFFFFFF) {
       // special case for rlwinm codegen
       e.mov(((Reg64)i.dest).cvt32(), ((Reg64)i.src1).cvt32());
-    } else {
-      EmitAndXX<AND_I64, Reg64>(e, i);
+      return;
     }
+    if (i.src2.is_constant && !i.src1.is_constant &&
+        TryEmitSingleBitMask(e, i.dest, i.src1, i.src2.constant(), false)) {
+      return;
+    }
+    if (i.src1.is_constant && !i.src2.is_constant &&
+        TryEmitSingleBitMask(e, i.dest, i.src2, i.src1.constant(), false)) {
+      return;
+    }
+    EmitAndXX<AND_I64, Reg64>(e, i);
   }
 };
 struct AND_V128 : Sequence<AND_V128, I<OPCODE_AND, V128Op, V128Op, V128Op>> {
@@ -2701,6 +2731,14 @@ struct OR_I32 : Sequence<OR_I32, I<OPCODE_OR, I32Op, I32Op, I32Op>> {
 };
 struct OR_I64 : Sequence<OR_I64, I<OPCODE_OR, I64Op, I64Op, I64Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
+    if (i.src2.is_constant && !i.src1.is_constant &&
+        TryEmitSingleBitMask(e, i.dest, i.src1, i.src2.constant(), true)) {
+      return;
+    }
+    if (i.src1.is_constant && !i.src2.is_constant &&
+        TryEmitSingleBitMask(e, i.dest, i.src2, i.src1.constant(), true)) {
+      return;
+    }
     EmitOrXX<OR_I64, Reg64>(e, i);
   }
 };
