@@ -52,6 +52,20 @@ bool VirtualFileSystem::UnregisterDevice(const std::string_view path) {
   return false;
 }
 
+std::unique_ptr<Device> VirtualFileSystem::DetachDevice(
+    const std::string_view path) {
+  auto global_lock = global_critical_region_.Acquire();
+  for (auto it = devices_.begin(); it != devices_.end(); ++it) {
+    if ((*it)->mount_path() == path) {
+      XELOGD("Detached device: {}", (*it)->mount_path());
+      std::unique_ptr<Device> device = std::move(*it);
+      devices_.erase(it);
+      return device;
+    }
+  }
+  return nullptr;
+}
+
 bool VirtualFileSystem::RegisterSymbolicLink(const std::string_view path,
                                              const std::string_view target) {
   auto global_lock = global_critical_region_.Acquire();

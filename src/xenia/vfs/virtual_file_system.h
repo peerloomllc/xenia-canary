@@ -32,6 +32,9 @@ class VirtualFileSystem {
 
   Device* RegisterDevice(std::unique_ptr<Device> device);
   bool UnregisterDevice(const std::string_view path);
+  // Removes the device from the file system without destroying it, so that
+  // open handles the guest still holds on it keep pointing at live entries.
+  std::unique_ptr<Device> DetachDevice(const std::string_view path);
 
   bool RegisterSymbolicLink(const std::string_view path,
                             const std::string_view target);

@@ -451,6 +451,9 @@ class Emulator {
   // Mount point of the running title's disc, so a swap can unregister it
   // instead of leaving it registered behind the new one.
   std::string disc_mount_path_;
+  // Discs swapped out during this title, kept alive for the handles the
+  // guest may still hold on them. Freed with the emulator.
+  std::vector<std::unique_ptr<vfs::Device>> ejected_discs_;
   // Discs from an .m3u, in file order.
   std::vector<std::filesystem::path> disc_playlist_;
   uint32_t media_id_ = 0;

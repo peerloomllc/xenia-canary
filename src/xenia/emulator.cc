@@ -2208,9 +2208,18 @@ bool Emulator::SwapDisc(const std::filesystem::path& path,
 
   // Drop the outgoing disc rather than leaving it registered behind the new
   // one, where anything resolving the device by name still reads it.
+  // The device itself stays alive until the title exits: a file handle the
+  // guest still holds on the old disc points into its entries and its memory
+  // map, and a read through it after the device was destroyed crashed the
+  // process (Lost Odyssey streaming from the title screen when a timed swap
+  // fired).
   const std::string previous_mount = disc_mount_path_;
   if (!previous_mount.empty()) {
-    file_system_->UnregisterDevice(previous_mount);
+    std::unique_ptr<vfs::Device> outgoing =
+        file_system_->DetachDevice(previous_mount);
+    if (outgoing) {
+      ejected_discs_.push_back(std::move(outgoing));
+    }
     XELOGI("Disc swap: unmounted the outgoing disc at {}", previous_mount);
   }
 
