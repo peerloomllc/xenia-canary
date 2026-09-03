@@ -685,11 +685,10 @@ X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
     }
     XELOGI("Playlist {}: {} disc(s), starting with {}", path.string(),
            disc_playlist_.size(), disc_playlist_.front().filename().string());
-    // The entries are not opened here on purpose. Mounting each one to read
-    // its header during launch, while the emulator is still being set up,
-    // made startup shader translation abort with a corrupted heap in 3 of 5
-    // runs; the same build launching a single image never did. Each entry is
-    // read when a swap actually asks for it instead.
+    // The entries are not opened here: each one is read when a swap actually
+    // asks for it. (Reading them all at launch once looked like it caused a
+    // startup abort; that was an unlocked table in the Vulkan pipeline cache,
+    // fixed since, and the lazy read is simply cheaper.)
     return LaunchPath(disc_playlist_.front());
   }
 

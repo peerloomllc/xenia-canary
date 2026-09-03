@@ -551,6 +551,17 @@ class EmulatorWindow {
   void OnDashboardTitleLaunched();
   void AddPlayTime();
   LibraryTitle* LibraryEntryFor(const std::filesystem::path& path);
+  // The library entry a launch should be credited to. A playlist launch
+  // maps to the disc file currently mounted (or the first disc), so the
+  // .m3u itself never becomes a library entry.
+  LibraryTitle* LibraryEntryForLaunch(const std::filesystem::path& path);
+  // Indices of every library entry that belongs to the same multi-disc
+  // title as entry `index` (same title id and folder), including itself,
+  // in disc order. A single-disc title yields just itself.
+  std::vector<size_t> LibraryDiscGroup(size_t index) const;
+  // The playlist a library launch of a multi-disc title goes through,
+  // written under the storage root; empty for a single-disc title.
+  std::filesystem::path WriteLibraryPlaylist(size_t index);
 
  public:
   bool DashboardRowVisible(void* model, void* iter);  // GTK filter callback
