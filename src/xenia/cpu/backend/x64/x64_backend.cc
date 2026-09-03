@@ -423,7 +423,12 @@ bool X64Backend::Initialize(Processor* processor) {
   }
 
 #if XE_X64_PROFILER_AVAILABLE == 1
-  if (cvars::instrument_call_times || cvars::dump_guest_code_map) {
+  // Only the call-time instrumentation needs this: it makes the emitter
+  // write timing counters into every compiled function. --dump_guest_code_map
+  // just names functions in a perf map from RecordGuestCodeForProfiler, which
+  // does not go through the profiler data at all, and turning the
+  // instrumentation on with it left a title frozen after a save state restore.
+  if (cvars::instrument_call_times) {
     backend_profiler_data = &profiler_data_;
     xe::threading::Thread::CreationParameters slimparams;
 
