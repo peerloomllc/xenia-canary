@@ -491,6 +491,9 @@ class EmulatorWindow {
   void PickSaveStateDir();  // folder picker; call from the UI loop
   void SetSaveStateDir(const std::filesystem::path& dir);
   static size_t CountSaveStateFiles(const std::filesystem::path& dir);
+  // Deletes a slot's .sav and its .png thumbnail. Reports what happened in a
+  // notification; a slot with no file is left alone.
+  void DeleteSaveStateSlot(int slot);
   void MoveSaveStates(const std::filesystem::path& from,
                       const std::filesystem::path& to);
   // Folder in use before the last change, while it still holds files.
