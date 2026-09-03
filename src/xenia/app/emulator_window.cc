@@ -7175,7 +7175,13 @@ bool EmulatorWindow::ReadTitleInfo(LibraryTitle& title) {
 void EmulatorWindow::ScanLibrary() {
   std::filesystem::path root = cvars::games_dir;
   std::error_code ec;
-  if (root.empty() || !std::filesystem::is_directory(root, ec)) {
+  if (root.empty()) {
+    XELOGW("Library: no games folder is set, nothing to scan");
+    return;
+  }
+  if (!std::filesystem::is_directory(root, ec)) {
+    XELOGW("Library: the games folder {} is not a readable directory",
+           root.string());
     return;
   }
   size_t added = 0, unreadable = 0;
@@ -7497,6 +7503,28 @@ void EmulatorWindow::BuildDashboard() {
   g_signal_connect(rescan, "clicked",
                    G_CALLBACK(+[](GtkWidget*, gpointer data) {
                      auto* w = static_cast<EmulatorWindow*>(data);
+                     // Say why rather than doing nothing: with no folder set,
+                     // or one that has gone away, a scan has nothing to walk
+                     // and the button looked broken.
+                     std::error_code ec;
+                     if (cvars::games_dir.empty()) {
+                       xe::ShowSimpleMessageBox(
+                           xe::SimpleMessageBoxType::Warning,
+                           "No games folder is set, so there is nothing to "
+                           "scan.\n\nUse \"Games folder...\" to choose the "
+                           "folder holding your .iso, .xex or .zar files.");
+                       return;
+                     }
+                     if (!std::filesystem::is_directory(
+                             std::filesystem::path(cvars::games_dir), ec)) {
+                       xe::ShowSimpleMessageBox(
+                           xe::SimpleMessageBoxType::Warning,
+                           "The games folder is set to\n\n  " +
+                               cvars::games_dir +
+                               "\n\nwhich is not a folder that can be read. "
+                               "Use \"Games folder...\" to pick another.");
+                       return;
+                     }
                      w->ScanLibrary();
                      w->RefreshDashboard();
                    }),
