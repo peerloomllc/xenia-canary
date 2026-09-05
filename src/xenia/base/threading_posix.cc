@@ -170,9 +170,8 @@ void MaybeYield() {
 
 void SyncMemory() { __sync_synchronize(); }
 
-void Sleep(std::chrono::microseconds duration) {
+static void SleepFor(timespec rqtp) {
   BlockingWaitMark blocked;
-  timespec rqtp = DurationToTimeSpec(duration);
   timespec rmtp = {};
   auto p_rqtp = &rqtp;
   auto p_rmtp = &rmtp;
@@ -185,7 +184,19 @@ void Sleep(std::chrono::microseconds duration) {
   } while (ret == -1 && errno == EINTR);
 }
 
-void NanoSleep(int64_t duration) { Sleep(std::chrono::nanoseconds(duration)); }
+void Sleep(std::chrono::microseconds duration) {
+  SleepFor(DurationToTimeSpec(duration));
+}
+
+void NanoSleep(int64_t duration) {
+  // Not Sleep(nanoseconds(duration)): the conversion to microseconds truncates,
+  // so anything under 1000 ns became nanosleep(0) and did not sleep at all.
+  if (duration <= 0) {
+    return;
+  }
+  SleepFor({static_cast<time_t>(duration / 1000000000LL),
+            static_cast<long>(duration % 1000000000LL)});
+}
 
 void NanoSleepPrecise(int64_t ns) {
 #if XE_PLATFORM_MAC
@@ -385,6 +396,8 @@ class PosixConditionBase {
     }
     if (executed) {
       post_execution();
+      lock.unlock();
+      post_execution_unlocked();
       return WaitResult::kSuccess;
     }
     return WaitResult::kTimeout;
@@ -498,6 +511,14 @@ class PosixConditionBase {
         } else {
           handles[first_signaled]->post_execution();
         }
+        locks.clear();
+        if (wait_all) {
+          for (size_t i = 0; i < handles.size(); ++i) {
+            handles[i]->post_execution_unlocked();
+          }
+        } else {
+          handles[first_signaled]->post_execution_unlocked();
+        }
         return std::make_pair(WaitResult::kSuccess, first_signaled);
       }
 
@@ -530,6 +551,9 @@ class PosixConditionBase {
  protected:
   [[nodiscard]] inline virtual bool signaled() const = 0;
   inline virtual void post_execution() = 0;
+  // Runs after mutex_ has been released. Anything that can block on the
+  // signalling thread belongs here, not in post_execution().
+  inline virtual void post_execution_unlocked() {}
   std::condition_variable* cond_;
   std::mutex mutex_;
   std::atomic<bool> abandoned_{false};
@@ -947,8 +971,11 @@ class PosixCondition<Thread> final : public PosixConditionBase {
     uint64_t result = 0;
     auto cpu_count = std::min(CPU_SETSIZE, 64);
     for (auto i = 0u; i < cpu_count; i++) {
-      auto set = CPU_ISSET(i, &cpu_set);
-      result |= set << i;
+      // int shifts here were undefined from bit 31 up, so every CPU from 32
+      // on was read out of the wrong bit.
+      if (CPU_ISSET(i, &cpu_set)) {
+        result |= uint64_t(1) << i;
+      }
     }
     return result;
   }
@@ -958,7 +985,7 @@ class PosixCondition<Thread> final : public PosixConditionBase {
     cpu_set_t cpu_set;
     CPU_ZERO(&cpu_set);
     for (auto i = 0u; i < 64; i++) {
-      if (mask & (1 << i)) {
+      if (mask & (uint64_t(1) << i)) {
         CPU_SET(i, &cpu_set);
       }
     }
@@ -1052,8 +1079,8 @@ class PosixCondition<Thread> final : public PosixConditionBase {
     WaitStarted();
     std::unique_lock lock(state_mutex_);
     XELOGI("PosixThread::Resume tid={} count={} state={} by={} from={}", tid_,
-           suspend_count_, static_cast<int>(state_), current_thread_system_id(),
-           __builtin_return_address(0));
+           suspend_count_.load(), static_cast<int>(state_),
+           current_thread_system_id(), __builtin_return_address(0));
     // Check if thread has any suspend count (Windows allows resume even if
     // running)
     if (suspend_count_ == 0) {
@@ -1084,8 +1111,8 @@ class PosixCondition<Thread> final : public PosixConditionBase {
     }
     WaitStarted();
     XELOGI("PosixThread::Suspend tid={} count={} state={} by={} from={}", tid_,
-           suspend_count_, static_cast<int>(state_), current_thread_system_id(),
-           __builtin_return_address(0));
+           suspend_count_.load(), static_cast<int>(state_),
+           current_thread_system_id(), __builtin_return_address(0));
 
     // Check if we're trying to suspend ourselves
     bool is_current_thread = pthread_self() == thread_;
@@ -1136,12 +1163,13 @@ class PosixCondition<Thread> final : public PosixConditionBase {
       std::unique_lock lock(state_mutex_);
       if (state_ == State::kFinished) {
         if (is_current_thread) {
-          // This is really bad. Some thread must have called Terminate() on us
-          // just before we decided to terminate ourselves
-          assert_always();
-          for (;;) {
-            // Wait for pthread_cancel() to actually happen.
-          }
+          // Another thread's Terminate() raced ours and already marked us
+          // finished. It signals us to unwind, but that signal is not
+          // guaranteed to arrive, and the old code spun here for ever
+          // waiting for it. Leave under our own power instead.
+          XELOGW("PosixThread::Terminate: tid={} was already finished", tid_);
+          lock.unlock();
+          pthread_exit(reinterpret_cast<void*>(exit_code));
         }
         return;
       }
@@ -1170,9 +1198,7 @@ class PosixCondition<Thread> final : public PosixConditionBase {
     // The thread abandons its frames asynchronously and then runs the finish
     // block in ThreadStartRoutine, which touches this object. Wait for it to
     // be gone before the caller can release us.
-    if (!joined_.exchange(true)) {
-      pthread_join(thread_, nullptr);
-    }
+    JoinOnce();
   }
 
   void WaitStarted() const {
@@ -1187,10 +1213,20 @@ class PosixCondition<Thread> final : public PosixConditionBase {
   /// without risking deadlock or heap corruption from non-reentrant
   /// mutex/condvar operations.
   void WaitSuspended() {
-    int ret;
-    do {
-      ret = sem_wait(&suspend_sem_);
-    } while (ret == -1 && errno == EINTR);
+    // The suspend signal does not queue, and a Resume() that lands before the
+    // signal is delivered leaves its post behind. Re-check the count rather
+    // than trusting one token, or that stale post releases the next suspend
+    // immediately.
+    while (suspend_count_.load(std::memory_order_acquire) > 0) {
+      int ret;
+      do {
+        ret = sem_wait(&suspend_sem_);
+      } while (ret == -1 && errno == EINTR);
+      if (ret == -1) {
+        // The semaphore is gone (the thread has been joined). Do not spin.
+        break;
+      }
+    }
   }
 
   void* native_handle() const override {
@@ -1200,11 +1236,21 @@ class PosixCondition<Thread> final : public PosixConditionBase {
  private:
   static void* ThreadStartRoutine(void* parameter);
   bool signaled() const override { return signaled_; }
-  void post_execution() override {
-    if (thread_ && !joined_.exchange(true)) {
+  void post_execution() override {}
+
+  // Terminate() publishes signaled_ while the thread is still inside its
+  // start routine, so a waiter can get here first. The tail of
+  // ThreadStartRoutine takes mutex_ to publish the exit code, and
+  // post_execution() runs with mutex_ held, so joining there deadlocked the
+  // pair. Join once, with no lock held.
+  void post_execution_unlocked() override { JoinOnce(); }
+
+  void JoinOnce() {
+    bool expected = false;
+    if (thread_ && joined_.compare_exchange_strong(expected, true)) {
       pthread_join(thread_, nullptr);
+      sem_destroy(&suspend_sem_);
     }
-    sem_destroy(&suspend_sem_);
   }
   pthread_t thread_;
   sigjmp_buf exit_jump_;
@@ -1215,7 +1261,8 @@ class PosixCondition<Thread> final : public PosixConditionBase {
   bool signaled_;
   int exit_code_;
   State state_;             // Protected by state_mutex_
-  uint32_t suspend_count_;  // Protected by state_mutex_
+  // Written under state_mutex_, but read from the suspend signal handler.
+  std::atomic<uint32_t> suspend_count_;
   sem_t suspend_sem_;       // Async-signal-safe suspend/resume semaphore
   mutable std::mutex state_mutex_;
   mutable std::mutex callback_mutex_;

@@ -8,6 +8,9 @@
 */
 
 #include <array>
+#include <atomic>
+#include <future>
+#include <thread>
 
 #include "xenia/base/threading.h"
 
@@ -1063,6 +1066,43 @@ TEST_CASE("Test Suspending Thread", "[thread]") {
   REQUIRE(suspend_count == 1);
   result = threading::Wait(thread.get(), false, 50ms);
   REQUIRE(result == threading::WaitResult::kSuccess);
+}
+
+TEST_CASE("Terminate a thread another thread is waiting on", "[thread]") {
+  // Terminate() publishes the handle's signal while the target is still
+  // inside its start routine. A waiter woken by that signal holds the
+  // handle's lock, and the tail of the target's start routine wants the same
+  // lock to publish its exit code: joining the target from under that lock
+  // deadlocks the pair. The join has to happen with no lock held.
+  //
+  // Run the whole scenario off the test thread so a regression fails here
+  // instead of hanging the suite.
+  auto finished = std::make_shared<std::promise<void>>();
+  auto done = finished->get_future();
+
+  std::thread runner([finished] {
+    Thread::CreationParameters params = {};
+    for (int i = 0; i < 100; ++i) {
+      threading::Fence started;
+      auto thread = threading::Thread::Create(params, [&started] {
+        started.Signal();
+        Sleep(2ms);
+      });
+      started.Wait();
+
+      std::thread waiter(
+          [&thread] { threading::Wait(thread.get(), false, 5000ms); });
+      thread->Terminate(0);
+      waiter.join();
+    }
+    finished->set_value();
+  });
+
+  if (done.wait_for(std::chrono::seconds(30)) != std::future_status::ready) {
+    runner.detach();
+    FAIL("Terminate deadlocked against a waiter on the same thread");
+  }
+  runner.join();
 }
 
 TEST_CASE("Test Thread QueueUserCallback", "[thread]") {
