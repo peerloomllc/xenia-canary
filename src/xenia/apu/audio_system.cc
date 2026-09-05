@@ -174,15 +174,31 @@ void AudioSystem::WorkerThreadMain() {
         xe::threading::Wait(client_semaphores_[client_index].get(), false,
                             std::chrono::milliseconds(0)) ==
             xe::threading::WaitResult::kSuccess) {
+      // Per-client lock first, global lock second, and the global one is
+      // released before the callback runs. The callback is guest code and
+      // takes the global lock itself, so anything holding the global lock
+      // must never wait for this one; UnregisterClient drops it first.
       std::lock_guard<std::mutex> guard(clients_[client_index].lock);
 
-      if (clients_[client_index].driver == nullptr) {
+      uint32_t callback = 0;
+      uint32_t callback_arg = 0;
+      {
+        auto global_lock = global_critical_region_.Acquire();
+        // Re-read under the lock: the slot can have been unregistered, and
+        // wrapped_callback_arg freed, while this thread was pacing above.
+        if (clients_[client_index].in_use &&
+            clients_[client_index].driver != nullptr) {
+          callback = clients_[client_index].callback;
+          callback_arg = clients_[client_index].wrapped_callback_arg;
+        }
+      }
+      if (!callback) {
         continue;
       }
 
       SCOPE_profile_cpu_i("apu", "xe::apu::AudioSystem->client_callback");
-      uint64_t args[] = {client_callback_arg};
-      processor_->Execute(worker_thread_->thread_state(), client_callback, args,
+      uint64_t args[] = {callback_arg};
+      processor_->Execute(worker_thread_->thread_state(), callback, args,
                           xe::countof(args));
     }
   }
@@ -318,18 +334,38 @@ void AudioSystem::SubmitFrame(size_t index, float* samples) {
 void AudioSystem::UnregisterClient(size_t index) {
   SCOPE_profile_cpu_f("apu");
 
-  auto global_lock = global_critical_region_.Acquire();
   assert_true(index < kMaximumClientCount);
 
-  std::lock_guard<std::mutex> guard(clients_[index].lock);
+  // Clear the slot under the global lock, then release it before waiting on
+  // the worker. Taking the two in this order used to invert the worker's:
+  // the worker holds the per-client lock and then runs guest code, which
+  // takes the global lock, so a caller holding the global lock and waiting
+  // for the per-client one deadlocked the pair. Title teardown runs this
+  // path, so Reset Game and Close Game reach it.
+  AudioDriver* driver = nullptr;
+  uint32_t wrapped_callback_arg = 0;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    driver = clients_[index].driver;
+    wrapped_callback_arg = clients_[index].wrapped_callback_arg;
+    clients_[index].driver = nullptr;
+    clients_[index].callback = 0;
+    clients_[index].callback_arg = 0;
+    clients_[index].wrapped_callback_arg = 0;
+    clients_[index].in_use = false;
+  }
 
-  DestroyDriver(clients_[index].driver);
-  memory()->SystemHeapFree(clients_[index].wrapped_callback_arg);
-  clients_[index].driver = nullptr;
-  clients_[index].callback = 0;
-  clients_[index].callback_arg = 0;
-  clients_[index].wrapped_callback_arg = 0;
-  clients_[index].in_use = false;
+  // Wait for a callback that is already running. The slot is cleared, so a
+  // worker that takes this lock after us re-reads it and runs nothing, which
+  // is what makes the free below safe.
+  {
+    std::lock_guard<std::mutex> guard(clients_[index].lock);
+  }
+
+  DestroyDriver(driver);
+  if (wrapped_callback_arg) {
+    memory()->SystemHeapFree(wrapped_callback_arg);
+  }
 
   // Drain the semaphore of its count.
   auto client_semaphore = client_semaphores_[index].get();
