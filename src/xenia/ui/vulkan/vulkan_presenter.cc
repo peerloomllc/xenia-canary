@@ -1752,7 +1752,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
         // Check if all the intermediate effects are supported by the
         // implementation.
         for (size_t i = 0; i + 1 < guest_output_flow.effect_count; ++i) {
-          if (guest_output_flow.effects[i] == GuestOutputPaintEffect::kDlss) {
+          if (guest_output_flow.effects[i] == GuestOutputPaintEffect::kDlaa) {
             // Executed through NGX, no paint pipeline involved.
             continue;
           }
@@ -1817,7 +1817,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
 
           GuestOutputPaintEffect effect = guest_output_flow.effects[i];
 
-          if (effect == GuestOutputPaintEffect::kDlss) {
+          if (effect == GuestOutputPaintEffect::kDlaa) {
             // DLSS runs through NGX outside a render pass, reading the guest
             // output image (in SHADER_READ_ONLY_OPTIMAL) and writing this
             // pass's intermediate image (in GENERAL).

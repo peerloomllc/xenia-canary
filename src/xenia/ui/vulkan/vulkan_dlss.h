@@ -19,10 +19,12 @@ namespace xe {
 namespace ui {
 namespace vulkan {
 
-// NVIDIA DLSS super resolution through NGX, used by the presenter to upscale
-// the guest output. The emulator has no motion vectors or jitter for the
-// guest frame, so the evaluation feeds zero motion vectors and a flat depth
-// buffer: DLSS then acts as a high-quality spatial and temporal upscaler.
+// NVIDIA DLAA through NGX, used by the presenter to anti-alias the guest
+// output at its own resolution. The emulator has no motion vectors or jitter
+// for the guest frame, so the evaluation feeds zero motion vectors and a
+// flat depth buffer; that rules out the detail-reconstructing super
+// resolution modes (measured to add nothing over bilinear here), while
+// anti-aliasing an already-rendered frame still works.
 class VulkanDlss {
  public:
   // Returns nullptr when the SDK is not compiled in, the device lacks the NGX

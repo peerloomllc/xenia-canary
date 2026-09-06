@@ -842,21 +842,19 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
   uint32_t output_width_clamped = std::min(output_width, max_rt_width);
   uint32_t output_height_clamped = std::min(output_height, max_rt_height);
 
-  if (config.GetEffect() == GuestOutputPaintConfig::Effect::kDlss &&
-      SupportsDlssGuestOutputPaintEffect() &&
-      output_width_clamped >= properties.frontbuffer_width &&
-      output_height_clamped >= properties.frontbuffer_height &&
-      output_width_clamped <= properties.frontbuffer_width * uint32_t(3) &&
-      output_height_clamped <= properties.frontbuffer_height * uint32_t(3)) {
-    // NVIDIA DLSS super resolution (DLAA when not scaling). DLSS supports
-    // upscaling factors of up to 3x3 and cannot downscale; outside that
-    // range, the bilinear fallback below is used. The DLSS pass writes to a
-    // storage image, never to the swapchain, so a bilinear pass (1:1 in the
-    // common case) always follows.
+  if (config.GetEffect() == GuestOutputPaintConfig::Effect::kDlaa &&
+      SupportsDlaaGuestOutputPaintEffect()) {
+    // NVIDIA DLAA: neural anti-aliasing of the guest output at its own
+    // resolution. The emulator has no motion vectors or jitter to offer, so
+    // the super resolution modes of DLSS have nothing to reconstruct detail
+    // from and are not exposed; anti-aliasing a frame the guest has fully
+    // rendered still works. The DLAA pass writes to a storage image, never
+    // to the swapchain, so a bilinear pass (1:1 when the window matches)
+    // always follows.
     assert_true(flow.effect_count + 2 <= flow.effects.size());
-    flow.effect_output_sizes[flow.effect_count] =
-        std::make_pair(output_width_clamped, output_height_clamped);
-    flow.effects[flow.effect_count++] = GuestOutputPaintEffect::kDlss;
+    flow.effect_output_sizes[flow.effect_count] = std::make_pair(
+        properties.frontbuffer_width, properties.frontbuffer_height);
+    flow.effects[flow.effect_count++] = GuestOutputPaintEffect::kDlaa;
     flow.effect_output_sizes[flow.effect_count] =
         std::make_pair(output_width, output_height);
     flow.effects[flow.effect_count++] = GuestOutputPaintEffect::kBilinear;

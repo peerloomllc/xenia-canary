@@ -462,7 +462,7 @@ class VulkanPresenter final : public Presenter {
   [[nodiscard]] VkPipeline CreateGuestOutputPaintPipeline(
       GuestOutputPaintEffect effect, VkRenderPass render_pass);
 
-  bool SupportsDlssGuestOutputPaintEffect() const override {
+  bool SupportsDlaaGuestOutputPaintEffect() const override {
     return dlss_ != nullptr && !dlss_failed_;
   }
 
