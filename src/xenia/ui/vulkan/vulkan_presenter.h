@@ -23,6 +23,7 @@
 #include "xenia/ui/surface.h"
 #include "xenia/ui/vulkan/ui_samplers.h"
 #include "xenia/ui/vulkan/vulkan_device.h"
+#include "xenia/ui/vulkan/vulkan_dlss.h"
 #include "xenia/ui/vulkan/vulkan_gpu_completion_timeline.h"
 #include "xenia/ui/vulkan/vulkan_instance.h"
 
@@ -461,8 +462,18 @@ class VulkanPresenter final : public Presenter {
   [[nodiscard]] VkPipeline CreateGuestOutputPaintPipeline(
       GuestOutputPaintEffect effect, VkRenderPass render_pass);
 
+  bool SupportsDlssGuestOutputPaintEffect() const override {
+    return dlss_ != nullptr && !dlss_failed_;
+  }
+
   VulkanDevice* vulkan_device_;
   const UISamplers* ui_samplers_;
+
+  // Non-null when the device, the driver and the guest output image format
+  // support DLSS. dlss_failed_ latches a runtime feature creation or
+  // evaluation failure, permanently falling back to bilinear.
+  std::unique_ptr<VulkanDlss> dlss_;
+  bool dlss_failed_ = false;
 
   // Static objects for guest output presentation, used only when painting the
   // main target (can be destroyed only after awaiting main target usage

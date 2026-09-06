@@ -227,7 +227,7 @@ DEFINE_string(
     postprocess_scaling_and_sharpening, "",
     "Post-processing effect to use for resampling and/or sharpening of the "
     "final display output.\n"
-    "Use: [bilinear, cas, fsr]\n"
+    "Use: [bilinear, cas, fsr, dlss]\n"
     " bilinear (or any value not listed here):\n"
     "  Original image at 1:1, simple bilinear stretching for resampling.\n"
     " cas:\n"
@@ -238,7 +238,13 @@ DEFINE_string(
     "  Use AMD FidelityFX Super Resolution 1.0 (FSR) for highest-quality "
     "upscaling, or AMD FidelityFX Contrast Adaptive Sharpening for sharpening "
     "while not scaling or downsampling.\n"
-    "  For scaling by factors of more than 2x2, multiple FSR passes are done.",
+    "  For scaling by factors of more than 2x2, multiple FSR passes are done."
+    "\n"
+    " dlss:\n"
+    "  Use NVIDIA DLSS for upscaling by factors of up to 3x3, or DLAA "
+    "anti-aliasing when not scaling.\n"
+    "  Needs the Vulkan backend, an NVIDIA RTX GPU and the DLSS runtime "
+    "library next to the executable; bilinear is used otherwise.",
     "Display");
 DEFINE_double(
     postprocess_ffx_cas_additional_sharpness,
@@ -598,6 +604,9 @@ void EmulatorWindow::DisplayConfigDialog::OnDraw(ImGuiIO& io) {
       ImGui::RadioButton(
           "AMD FidelityFX Super Resolution 1.0 (FSR)", &new_effect_index,
           int(ui::Presenter::GuestOutputPaintConfig::Effect::kFsr));
+      ImGui::RadioButton(
+          "NVIDIA DLSS Super Resolution", &new_effect_index,
+          int(ui::Presenter::GuestOutputPaintConfig::Effect::kDlss));
       new_presenter_config.SetEffect(
           ui::Presenter::GuestOutputPaintConfig::Effect(new_effect_index));
 
@@ -628,6 +637,17 @@ void EmulatorWindow::DisplayConfigDialog::OnDraw(ImGuiIO& io) {
               "done.\n"
               "If not upscaling, Contrast Adaptive Sharpening (CAS) is used "
               "instead.";
+          break;
+        case ui::Presenter::GuestOutputPaintConfig::Effect::kDlss:
+          effect_description =
+              "Neural-network upscaling for factors of up to 3x3, or DLAA "
+              "anti-aliasing when not scaling.\n"
+              "Needs the Vulkan backend, an NVIDIA RTX GPU and the DLSS "
+              "runtime library next to the executable.\n"
+              "Simple bilinear stretching is used where DLSS is not "
+              "available.";
+          break;
+        default:
           break;
       }
       if (effect_description) {
@@ -1403,6 +1423,8 @@ const char* EmulatorWindow::GetCvarValueForGuestOutputPaintEffect(
       return "cas";
     case ui::Presenter::GuestOutputPaintConfig::Effect::kFsr:
       return "fsr";
+    case ui::Presenter::GuestOutputPaintConfig::Effect::kDlss:
+      return "dlss";
     default:
       return "";
   }
@@ -1418,6 +1440,10 @@ EmulatorWindow::GetGuestOutputPaintEffectForCvarValue(
   if (cvar_value == GetCvarValueForGuestOutputPaintEffect(
                         ui::Presenter::GuestOutputPaintConfig::Effect::kFsr)) {
     return ui::Presenter::GuestOutputPaintConfig::Effect::kFsr;
+  }
+  if (cvar_value == GetCvarValueForGuestOutputPaintEffect(
+                        ui::Presenter::GuestOutputPaintConfig::Effect::kDlss)) {
+    return ui::Presenter::GuestOutputPaintConfig::Effect::kDlss;
   }
   return ui::Presenter::GuestOutputPaintConfig::Effect::kBilinear;
 }

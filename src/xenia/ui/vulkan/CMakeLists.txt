@@ -7,6 +7,10 @@ target_include_directories(xenia-ui-vulkan PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/glslang
 )
 target_link_libraries(xenia-ui-vulkan PUBLIC xenia-base xenia-ui)
+if(XE_HAS_NVIDIA_DLSS)
+  target_link_libraries(xenia-ui-vulkan PUBLIC nvsdk_ngx)
+  target_compile_definitions(xenia-ui-vulkan PRIVATE XE_VULKAN_HAS_DLSS=1)
+endif()
 xe_target_defaults(xenia-ui-vulkan)
 
 if(XENIA_BUILD_MISC)

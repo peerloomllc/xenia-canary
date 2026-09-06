@@ -842,6 +842,26 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
   uint32_t output_width_clamped = std::min(output_width, max_rt_width);
   uint32_t output_height_clamped = std::min(output_height, max_rt_height);
 
+  if (config.GetEffect() == GuestOutputPaintConfig::Effect::kDlss &&
+      SupportsDlssGuestOutputPaintEffect() &&
+      output_width_clamped >= properties.frontbuffer_width &&
+      output_height_clamped >= properties.frontbuffer_height &&
+      output_width_clamped <= properties.frontbuffer_width * uint32_t(3) &&
+      output_height_clamped <= properties.frontbuffer_height * uint32_t(3)) {
+    // NVIDIA DLSS super resolution (DLAA when not scaling). DLSS supports
+    // upscaling factors of up to 3x3 and cannot downscale; outside that
+    // range, the bilinear fallback below is used. The DLSS pass writes to a
+    // storage image, never to the swapchain, so a bilinear pass (1:1 in the
+    // common case) always follows.
+    assert_true(flow.effect_count + 2 <= flow.effects.size());
+    flow.effect_output_sizes[flow.effect_count] =
+        std::make_pair(output_width_clamped, output_height_clamped);
+    flow.effects[flow.effect_count++] = GuestOutputPaintEffect::kDlss;
+    flow.effect_output_sizes[flow.effect_count] =
+        std::make_pair(output_width, output_height);
+    flow.effects[flow.effect_count++] = GuestOutputPaintEffect::kBilinear;
+  }
+
   if (config.GetEffect() == GuestOutputPaintConfig::Effect::kCas ||
       config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr) {
     // FidelityFX Super Resolution and Contrast Adaptive Sharpening only work

@@ -1352,6 +1352,21 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
   image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                             VK_IMAGE_USAGE_SAMPLED_BIT |
                             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  {
+    // Storage usage so DLSS can write intermediate images, and transfer
+    // destination usage for the clear on its failure path.
+    VkFormatProperties format_properties;
+    vulkan_device_->vulkan_instance()
+        ->functions()
+        .vkGetPhysicalDeviceFormatProperties(vulkan_device_->physical_device(),
+                                             kGuestOutputFormat,
+                                             &format_properties);
+    if (format_properties.optimalTilingFeatures &
+        VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
+      image_create_info.usage |=
+          VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    }
+  }
   image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   image_create_info.queueFamilyIndexCount = 0;
   image_create_info.pQueueFamilyIndices = nullptr;
@@ -1737,6 +1752,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
         // Check if all the intermediate effects are supported by the
         // implementation.
         for (size_t i = 0; i + 1 < guest_output_flow.effect_count; ++i) {
+          if (guest_output_flow.effects[i] == GuestOutputPaintEffect::kDlss) {
+            // Executed through NGX, no paint pipeline involved.
+            continue;
+          }
           if (paint_context_
                   .guest_output_paint_pipelines[size_t(
                       guest_output_flow.effects[i])]
@@ -1796,6 +1815,104 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
         for (size_t i = 0; i < guest_output_flow.effect_count; ++i) {
           bool is_final_effect = i + 1 >= guest_output_flow.effect_count;
 
+          GuestOutputPaintEffect effect = guest_output_flow.effects[i];
+
+          if (effect == GuestOutputPaintEffect::kDlss) {
+            // DLSS runs through NGX outside a render pass, reading the guest
+            // output image (in SHADER_READ_ONLY_OPTIMAL) and writing this
+            // pass's intermediate image (in GENERAL).
+            assert_false(is_final_effect);
+            assert_true(i == 0);
+            const std::pair<uint32_t, uint32_t>& dlss_output_size =
+                guest_output_flow.effect_output_sizes[i];
+            GuestOutputImage* dlss_output_image =
+                paint_context_.guest_output_intermediate_images[i].get();
+            const GuestOutputImage* dlss_input_image =
+                paint_context_
+                    .guest_output_image_paint_refs
+                        [guest_output_image_paint_ref_index]
+                    .second.get();
+            VkImageMemoryBarrier dlss_barrier;
+            dlss_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            dlss_barrier.pNext = nullptr;
+            dlss_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            dlss_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            dlss_barrier.image = dlss_output_image->image();
+            dlss_barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1,
+                                             0, 1};
+            bool dlss_done = false;
+            if (dlss_ && !dlss_failed_ && dlss_input_image) {
+              // The previous content is discarded; the execution dependency
+              // covers reads of it by earlier submissions on this queue.
+              dlss_barrier.srcAccessMask = 0;
+              dlss_barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+              dlss_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+              dlss_barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+              dfn.vkCmdPipelineBarrier(
+                  draw_command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
+                  nullptr, 1, &dlss_barrier);
+              uint32_t dlss_input_width, dlss_input_height;
+              guest_output_flow.GetEffectInputSize(i, dlss_input_width,
+                                                   dlss_input_height);
+              if (dlss_->EnsureFeature(draw_command_buffer, dlss_input_width,
+                                       dlss_input_height,
+                                       dlss_output_size.first,
+                                       dlss_output_size.second) &&
+                  dlss_->Evaluate(draw_command_buffer,
+                                  dlss_input_image->image(),
+                                  dlss_input_image->view(),
+                                  dlss_output_image->image(),
+                                  dlss_output_image->view(),
+                                  kGuestOutputFormat, false)) {
+                dlss_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                dlss_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                dlss_barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                dlss_barrier.newLayout =
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                dfn.vkCmdPipelineBarrier(
+                    draw_command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
+                    nullptr, 1, &dlss_barrier);
+                dlss_done = true;
+              } else {
+                XELOGE(
+                    "VulkanPresenter: DLSS failed, falling back to bilinear "
+                    "scaling");
+                dlss_failed_ = true;
+              }
+            }
+            if (!dlss_done) {
+              // Clear the intermediate image so the next pass reads black for
+              // this frame; the flow is rebuilt without DLSS on the next
+              // paint as dlss_failed_ is now set.
+              dlss_barrier.srcAccessMask = 0;
+              dlss_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+              dlss_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+              dlss_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+              dfn.vkCmdPipelineBarrier(
+                  draw_command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                  &dlss_barrier);
+              VkClearColorValue dlss_clear_color = {};
+              VkImageSubresourceRange dlss_clear_range = {
+                  VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+              dfn.vkCmdClearColorImage(
+                  draw_command_buffer, dlss_output_image->image(),
+                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &dlss_clear_color, 1,
+                  &dlss_clear_range);
+              dlss_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+              dlss_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+              dlss_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+              dlss_barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+              dfn.vkCmdPipelineBarrier(
+                  draw_command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
+                  nullptr, 1, &dlss_barrier);
+            }
+            continue;
+          }
+
           int32_t effect_rect_x, effect_rect_y;
           std::pair<uint32_t, uint32_t> effect_rect_size =
               guest_output_flow.effect_output_sizes[i];
@@ -1844,8 +1961,6 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
           dfn.vkCmdSetViewport(draw_command_buffer, 0, 1,
                                &guest_output_viewport);
           dfn.vkCmdSetScissor(draw_command_buffer, 0, 1, &guest_output_scissor);
-
-          GuestOutputPaintEffect effect = guest_output_flow.effects[i];
 
           const PaintContext::GuestOutputPaintPipeline& effect_pipeline =
               paint_context_.guest_output_paint_pipelines[size_t(effect)];
@@ -2152,6 +2267,19 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
 bool VulkanPresenter::InitializeSurfaceIndependent() {
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
+
+  // DLSS writes the guest output format through a storage image; without
+  // that, don't offer DLSS at all.
+  VkFormatProperties guest_output_format_properties;
+  vulkan_device_->vulkan_instance()
+      ->functions()
+      .vkGetPhysicalDeviceFormatProperties(vulkan_device_->physical_device(),
+                                           kGuestOutputFormat,
+                                           &guest_output_format_properties);
+  if (guest_output_format_properties.optimalTilingFeatures &
+      VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
+    dlss_ = VulkanDlss::TryCreate(vulkan_device_);
+  }
 
   VkDescriptorSetLayoutBinding guest_output_image_sampler_bindings[2];
   guest_output_image_sampler_bindings[0].binding = 0;

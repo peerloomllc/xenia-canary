@@ -201,6 +201,9 @@ class Presenter {
       // AMD FidelityFX Super Resolution upsampling, Contrast Adaptive
       // Sharpening otherwise.
       kFsr,
+      // NVIDIA DLSS super resolution upsampling (DLAA at 1:1) where the
+      // backend, the GPU and the driver support it; bilinear otherwise.
+      kDlss,
     };
 
     // This value is used as a lerp factor.
@@ -435,6 +438,7 @@ class Presenter {
     kFsrEasu,
     kFsrRcas,
     kFsrRcasDither,
+    kDlss,
 
     kCount,
   };
@@ -461,6 +465,8 @@ class Presenter {
       GuestOutputPaintEffect effect) {
     switch (effect) {
       case GuestOutputPaintEffect::kFsrEasu:
+      // DLSS writes to a storage image, never to the swapchain.
+      case GuestOutputPaintEffect::kDlss:
         return false;
       default:
         return true;
@@ -714,6 +720,9 @@ class Presenter {
   // possible to leave the consumer critical section earlier. Also, the guest
   // output paint configuration is passed explicitly too so calling this
   // function multiple times is safer.
+  // Whether the backend can execute the GuestOutputPaintEffect::kDlss pass.
+  virtual bool SupportsDlssGuestOutputPaintEffect() const { return false; }
+
   GuestOutputPaintFlow GetGuestOutputPaintFlow(
       const GuestOutputProperties& properties, uint32_t host_rt_width,
       uint32_t host_rt_height, uint32_t max_rt_width, uint32_t max_rt_height,

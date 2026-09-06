@@ -7,6 +7,12 @@ else()
 endif()
 
 set_target_properties(xenia-app PROPERTIES OUTPUT_NAME "xenia_canary")
+if(XE_HAS_NVIDIA_DLSS AND XE_NVIDIA_DLSS_SNIPPET)
+  # The NGX loader searches for the DLSS runtime next to the executable.
+  add_custom_command(TARGET xenia-app POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      ${XE_NVIDIA_DLSS_SNIPPET} $<TARGET_FILE_DIR:xenia-app>)
+endif()
 
 # Main source
 target_sources(xenia-app PRIVATE

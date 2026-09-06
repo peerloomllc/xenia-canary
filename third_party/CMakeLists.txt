@@ -206,6 +206,24 @@ target_include_directories(soundtouch PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/soundto
 target_compile_definitions(soundtouch PUBLIC SOUNDTOUCH_FLOAT_SAMPLES)
 set_target_properties(soundtouch PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# nvidia-dlss (NGX SDK: DLSS super resolution for the Vulkan presenter)
+# ==============================================================================
+# Linux x86_64 only: the SDK's static loader plus the runtime snippet that is
+# copied next to the executable. Everything degrades gracefully at runtime on
+# GPUs and drivers without DLSS, so this is on whenever the submodule exists.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND XE_TARGET_X86_64 AND
+   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/nvidia-dlss/lib/Linux_x86_64/libnvsdk_ngx.a")
+  add_library(nvsdk_ngx STATIC IMPORTED GLOBAL)
+  set_target_properties(nvsdk_ngx PROPERTIES
+    IMPORTED_LOCATION ${CMAKE_CURRENT_SOURCE_DIR}/nvidia-dlss/lib/Linux_x86_64/libnvsdk_ngx.a
+    INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/nvidia-dlss/include)
+  set(XE_HAS_NVIDIA_DLSS ON CACHE INTERNAL "NVIDIA DLSS SDK available")
+  file(GLOB _dlss_snippet ${CMAKE_CURRENT_SOURCE_DIR}/nvidia-dlss/lib/Linux_x86_64/rel/libnvidia-ngx-dlss.so.*)
+  set(XE_NVIDIA_DLSS_SNIPPET ${_dlss_snippet} CACHE INTERNAL "DLSS runtime library to ship")
+else()
+  set(XE_HAS_NVIDIA_DLSS OFF CACHE INTERNAL "NVIDIA DLSS SDK available")
+endif()
+
 # snappy
 # ==============================================================================
 # Generate snappy-stubs-public.h if missing
