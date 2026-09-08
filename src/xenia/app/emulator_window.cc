@@ -2956,6 +2956,100 @@ void EmulatorWindow::ToggleGpuOptionsDialog() {
   }
 }
 
+void EmulatorWindow::ToggleReShadeOverlay() {
+  if (!reshade_overlay_dialog_) {
+    reshade_overlay_dialog_ =
+        std::make_unique<ReShadeOverlayDialog>(imgui_drawer_.get(), *this);
+  } else {
+    if (reshade_overlay_dialog_->IsClosing()) {
+      reshade_overlay_dialog_.release();
+    } else {
+      reshade_overlay_dialog_.reset();
+    }
+  }
+}
+
+void EmulatorWindow::ReShadeOverlayDialog::OnDraw(ImGuiIO& io) {
+  ui::Presenter* presenter = nullptr;
+  gpu::GraphicsSystem* graphics_system =
+      emulator_window_.emulator_->graphics_system();
+  if (graphics_system) {
+    presenter = graphics_system->presenter();
+  }
+
+  ImGui::SetNextWindowPos(ImVec2(20.0f, 20.0f), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(360.0f, 420.0f), ImGuiCond_FirstUseEver);
+  bool open = true;
+  if (!ImGui::Begin("ReShade", &open, ImGuiWindowFlags_NoSavedSettings)) {
+    ImGui::End();
+    if (!open) {
+      Close();
+    }
+    return;
+  }
+
+  if (!presenter || !presenter->IsReShadeEffectLoaded()) {
+    ImGui::TextWrapped(
+        "No ReShade effect loaded. Launch with --reshade_effect=<path to "
+        ".fx> to load one.");
+    ImGui::End();
+    if (!open) {
+      Close();
+    }
+    return;
+  }
+
+  const std::string effect_name =
+      presenter->GetReShadeEffectNameFromUIThread();
+  bool enabled = presenter->IsReShadeEffectEnabledFromUIThread();
+  if (ImGui::Checkbox("Enabled", &enabled)) {
+    presenter->SetReShadeEffectEnabledFromUIThread(enabled);
+  }
+  ImGui::SameLine();
+  ImGui::TextDisabled("(Home to toggle this window)");
+  ImGui::Separator();
+  ImGui::Text("Effect: %s", effect_name.c_str());
+  ImGui::Spacing();
+
+  std::vector<ui::Presenter::ReShadeUniformControl> controls =
+      presenter->GetReShadeControlsFromUIThread();
+  if (controls.empty()) {
+    ImGui::TextDisabled("This effect exposes no adjustable settings.");
+  }
+  for (auto& control : controls) {
+    const std::string id = "##rs_" + control.name;
+    bool changed = false;
+    if (control.ui_type == "color" && control.components >= 3) {
+      changed = ImGui::ColorEdit3((control.label + id).c_str(), control.value,
+                                  ImGuiColorEditFlags_NoInputs);
+    } else if (control.ui_type == "bool" || control.components == 0) {
+      bool b = control.value[0] != 0.0f;
+      if (ImGui::Checkbox((control.label + id).c_str(), &b)) {
+        control.value[0] = b ? 1.0f : 0.0f;
+        changed = true;
+      }
+    } else if (control.components == 1) {
+      changed = ImGui::SliderFloat((control.label + id).c_str(),
+                                   &control.value[0], control.min_value,
+                                   control.max_value, "%.3f");
+    } else {
+      changed = ImGui::SliderScalarN((control.label + id).c_str(),
+                                     ImGuiDataType_Float, control.value,
+                                     control.components, &control.min_value,
+                                     &control.max_value, "%.3f");
+    }
+    if (changed) {
+      presenter->SetReShadeControlFromUIThread(control.name, control.value,
+                                               control.components);
+    }
+  }
+
+  ImGui::End();
+  if (!open) {
+    Close();
+  }
+}
+
 void EmulatorWindow::GpuOptionsDialog::OnDraw(ImGuiIO& io) {
   ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver);
   ImGui::SetNextWindowBgAlpha(0.9f);
@@ -3672,6 +3766,9 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
 
     case ui::VirtualKey::kF6: {
       ToggleDisplayConfigDialog();
+    } break;
+    case ui::VirtualKey::kHome: {
+      ToggleReShadeOverlay();
     } break;
     case ui::VirtualKey::kF11: {
       ToggleFullscreen();

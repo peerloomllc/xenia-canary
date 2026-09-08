@@ -274,6 +274,23 @@ class EmulatorWindow {
   };
   void ToggleGpuOptionsDialog();
   std::unique_ptr<GpuOptionsDialog> gpu_options_dialog_;
+
+  // Standalone ReShade overlay (its own window + Home hotkey, like ReShade in
+  // other games), driven by the presenter's ReShade control API.
+  class ReShadeOverlayDialog final : public ui::ImGuiDialog {
+   public:
+    ReShadeOverlayDialog(ui::ImGuiDrawer* imgui_drawer,
+                         EmulatorWindow& emulator_window)
+        : ui::ImGuiDialog(imgui_drawer), emulator_window_(emulator_window) {}
+
+   protected:
+    void OnDraw(ImGuiIO& io) override;
+
+   private:
+    EmulatorWindow& emulator_window_;
+  };
+  void ToggleReShadeOverlay();
+  std::unique_ptr<ReShadeOverlayDialog> reshade_overlay_dialog_;
   // Display > Dialog size: cvar ui_scale, applied to the ImGui drawer.
   void SetUIScale(float scale);
 #if XE_PLATFORM_LINUX

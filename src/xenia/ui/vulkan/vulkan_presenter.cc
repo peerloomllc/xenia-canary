@@ -1868,6 +1868,23 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
           }
           if (reshade_output_image_) {
             reshade_output_last_submission_ = current_paint_submission_index;
+            {
+              std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+              if (reshade_controls_dirty_ && reshade_effect_->uniform_mapped) {
+                for (size_t ci = 0;
+                     ci < reshade_controls_.size() &&
+                     ci < reshade_effect_->uniforms.size();
+                     ++ci) {
+                  const auto& u = reshade_effect_->uniforms[ci];
+                  std::memcpy(
+                      static_cast<uint8_t*>(reshade_effect_->uniform_mapped) +
+                          u.offset,
+                      reshade_controls_[ci].value,
+                      std::min<size_t>(u.size, sizeof(float) * 4));
+                }
+                reshade_controls_dirty_ = false;
+              }
+            }
             VkExtent2D rs_extent{rs_width, rs_height};
             if (reshade_->Render(draw_command_buffer, *reshade_effect_,
                                  guest_output_image->view(),
@@ -2363,6 +2380,24 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
       if (reshade_->CreateRuntime(*reshade_effect_, kGuestOutputFormat,
                                   sampler)) {
         reshade_effect_->enabled = true;
+        std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+        reshade_controls_.clear();
+        for (const auto& u : reshade_effect_->uniforms) {
+          ReShadeUniformControl control;
+          control.name = u.name;
+          control.label = u.ui_label;
+          control.ui_type = u.ui_type;
+          control.min_value = u.ui_min;
+          control.max_value = u.ui_max;
+          control.components =
+              std::max(1, std::min(4, int(u.size / sizeof(float))));
+          if (!u.default_value.empty()) {
+            std::memcpy(control.value, u.default_value.data(),
+                        std::min(u.default_value.size(),
+                                 sizeof(control.value)));
+          }
+          reshade_controls_.push_back(control);
+        }
       } else {
         reshade_effect_.reset();
       }
@@ -2810,6 +2845,43 @@ VkPipeline VulkanPresenter::CreateGuestOutputPaintPipeline(
   }
   return pipeline;
 }
+
+
+std::string VulkanPresenter::GetReShadeEffectNameFromUIThread() const {
+  return reshade_effect_ ? reshade_effect_->name : std::string();
+}
+
+bool VulkanPresenter::IsReShadeEffectEnabledFromUIThread() const {
+  return reshade_effect_ && reshade_effect_->enabled && !reshade_failed_;
+}
+
+void VulkanPresenter::SetReShadeEffectEnabledFromUIThread(bool enabled) {
+  if (reshade_effect_) {
+    reshade_effect_->enabled = enabled;
+  }
+}
+
+std::vector<Presenter::ReShadeUniformControl>
+VulkanPresenter::GetReShadeControlsFromUIThread() {
+  std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+  return reshade_controls_;
+}
+
+void VulkanPresenter::SetReShadeControlFromUIThread(const std::string& name,
+                                                    const float* values,
+                                                    int components) {
+  std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+  for (auto& control : reshade_controls_) {
+    if (control.name == name) {
+      for (int i = 0; i < components && i < 4; ++i) {
+        control.value[i] = values[i];
+      }
+      reshade_controls_dirty_ = true;
+      break;
+    }
+  }
+}
+
 
 }  // namespace vulkan
 }  // namespace ui

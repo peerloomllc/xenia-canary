@@ -16,6 +16,8 @@
 #include <cstdint>
 #include <memory>
 #include <utility>
+#include <mutex>
+#include <string>
 #include <vector>
 
 #include "xenia/base/assert.h"
@@ -472,6 +474,17 @@ class VulkanPresenter final : public Presenter {
     return dlss_ != nullptr && !dlss_failed_;
   }
 
+  bool IsReShadeEffectLoaded() const override {
+    return reshade_effect_ != nullptr;
+  }
+  std::string GetReShadeEffectNameFromUIThread() const override;
+  bool IsReShadeEffectEnabledFromUIThread() const override;
+  void SetReShadeEffectEnabledFromUIThread(bool enabled) override;
+  std::vector<ReShadeUniformControl> GetReShadeControlsFromUIThread() override;
+  void SetReShadeControlFromUIThread(const std::string& name,
+                                     const float* values,
+                                     int components) override;
+
   VulkanDevice* vulkan_device_;
   const UISamplers* ui_samplers_;
 
@@ -488,6 +501,12 @@ class VulkanPresenter final : public Presenter {
   std::unique_ptr<GuestOutputImage> reshade_output_image_;
   uint64_t reshade_output_last_submission_ = 0;
   bool reshade_failed_ = false;
+  // UI-facing control values, guarded so the UI thread can edit while the
+  // paint thread applies them to the uniform buffer. Parallel to
+  // reshade_effect_->uniforms.
+  std::mutex reshade_control_mutex_;
+  std::vector<ReShadeUniformControl> reshade_controls_;
+  bool reshade_controls_dirty_ = false;
 
   // Static objects for guest output presentation, used only when painting the
   // main target (can be destroyed only after awaiting main target usage

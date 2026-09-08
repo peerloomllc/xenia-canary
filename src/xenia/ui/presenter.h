@@ -362,6 +362,29 @@ class Presenter {
       uint32_t frontbuffer_width, uint32_t frontbuffer_height,
       uint32_t display_aspect_ratio_x, uint32_t display_aspect_ratio_y,
       std::function<bool(GuestOutputRefreshContext& context)> refresher);
+
+  // ---- Native ReShade post-process controls (see vulkan_reshade). ----
+  // A UI-facing view of one effect uniform: label, kind, range, current
+  // value(s). `components` is 1..4 floats.
+  struct ReShadeUniformControl {
+    std::string name;
+    std::string label;
+    std::string ui_type;  // "slider"/"drag", "color", "bool", ...
+    float min_value = 0.0f;
+    float max_value = 1.0f;
+    int components = 1;
+    float value[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  };
+  virtual bool IsReShadeEffectLoaded() const { return false; }
+  virtual std::string GetReShadeEffectNameFromUIThread() const { return {}; }
+  virtual bool IsReShadeEffectEnabledFromUIThread() const { return false; }
+  virtual void SetReShadeEffectEnabledFromUIThread(bool enabled) {}
+  virtual std::vector<ReShadeUniformControl> GetReShadeControlsFromUIThread() {
+    return {};
+  }
+  virtual void SetReShadeControlFromUIThread(const std::string& name,
+                                             const float* values,
+                                             int components) {}
   // The implementation must be callable from any thread, including from
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.
