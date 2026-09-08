@@ -704,6 +704,17 @@ class RenderTargetCache {
   // EDRAM memory are committed with a memory barrier.
   void PixelShaderInterlockFullEdramBarrierPlaced();
 
+  // Accessors for derived caches (e.g. the ReShade depth feed) to inspect the
+  // cached render targets without exposing the private storage.
+  RenderTarget* GetLastUpdateDepthRenderTarget() const {
+    return last_update_used_render_targets_[0];
+  }
+  const std::unordered_map<RenderTargetKey, RenderTarget*,
+                           RenderTargetKey::Hasher>&
+  GetRenderTargetsMap() const {
+    return render_targets_;
+  }
+
  private:
   const RegisterFile& register_file_;
   uint32_t draw_resolution_scale_x_;

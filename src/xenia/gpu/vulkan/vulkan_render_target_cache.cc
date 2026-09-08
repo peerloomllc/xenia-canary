@@ -1937,6 +1937,59 @@ VkFormat VulkanRenderTargetCache::GetDepthVulkanFormat(
   return VK_FORMAT_D32_SFLOAT_S8_UINT;
 }
 
+bool VulkanRenderTargetCache::GetReShadeSceneDepth(
+    ReShadeSceneDepth& out) const {
+  if (GetPath() != Path::kHostRenderTargets) {
+    return false;
+  }
+  // Prefer the depth render target the last Update() bound; fall back to the
+  // largest single-sampled depth target in the cache (the last frame pass is
+  // often a UI pass with no depth, so the "current" one is frequently stale).
+  const VulkanRenderTarget* best = nullptr;
+  uint64_t best_area = 0;
+  auto consider = [&](const RenderTarget* rt) {
+    if (!rt) {
+      return;
+    }
+    RenderTargetKey key = rt->key();
+    if (key.IsEmpty() || !key.is_depth) {
+      return;
+    }
+    // MSAA depth cannot be blitted or resolved cheaply - skip it.
+    if (key.msaa_samples != xenos::MsaaSamples::k1X) {
+      return;
+    }
+    uint32_t width = key.GetWidth() * GetKeyScaleX(key);
+    uint32_t height =
+        GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples) *
+        GetKeyScaleY(key);
+    uint64_t area = uint64_t(width) * height;
+    if (area > best_area) {
+      best_area = area;
+      best = static_cast<const VulkanRenderTarget*>(rt);
+    }
+  };
+  consider(GetLastUpdateDepthRenderTarget());
+  for (const auto& pair : GetRenderTargetsMap()) {
+    consider(pair.second);
+  }
+  if (!best || best->image() == VK_NULL_HANDLE ||
+      best->current_layout() == VK_IMAGE_LAYOUT_UNDEFINED) {
+    return false;
+  }
+  RenderTargetKey key = best->key();
+  out.image = best->image();
+  out.width = key.GetWidth() * GetKeyScaleX(key);
+  out.height =
+      GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples) *
+      GetKeyScaleY(key);
+  out.format = GetDepthVulkanFormat(key.GetDepthFormat());
+  out.layout = best->current_layout();
+  out.stage_mask = best->current_stage_mask();
+  out.access_mask = best->current_access_mask();
+  return true;
+}
+
 VkFormat VulkanRenderTargetCache::GetColorVulkanFormat(
     xenos::ColorRenderTargetFormat format) const {
   switch (format) {
@@ -2073,9 +2126,11 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
         VkSampleCountFlagBits(uint32_t(1) << uint32_t(key.msaa_samples));
   }
   image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-  // Transfer destination for save state EDRAM snapshot uploads.
-  image_create_info.usage =
-      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  // Transfer destination for save state EDRAM snapshot uploads, transfer
+  // source for the ReShade depth feed's blit out of the scene depth buffer.
+  image_create_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT |
+                            VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
   image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   image_create_info.queueFamilyIndexCount = 0;
   image_create_info.pQueueFamilyIndices = nullptr;

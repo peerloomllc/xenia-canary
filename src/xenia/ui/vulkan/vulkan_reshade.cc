@@ -165,6 +165,13 @@ std::unique_ptr<VulkanReShade::Effect> VulkanReShade::CompileEffect(
   pp.add_macro_definition("BUFFER_RCP_WIDTH", "(1.0 / BUFFER_WIDTH)");
   pp.add_macro_definition("BUFFER_RCP_HEIGHT", "(1.0 / BUFFER_HEIGHT)");
   pp.add_macro_definition("BUFFER_COLOR_BIT_DEPTH", "8");
+  // Guest depth-buffer convention, fed to ReShade.fxh's GetLinearizedDepth.
+  // Xbox 360 titles commonly use reversed depth (1 = near).
+  pp.add_macro_definition("RESHADE_DEPTH_INPUT_IS_REVERSED",
+                          depth_reversed_ ? "1" : "0");
+  pp.add_macro_definition("RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN",
+                          depth_upside_down_ ? "1" : "0");
+  pp.add_macro_definition("RESHADE_DEPTH_INPUT_IS_LOGARITHMIC", "0");
   // Legacy intrinsic names older packs (SweetFX's CAS and SMAA) still use;
   // the compiler merged them into tex2D/tex2Dlod overloads taking the
   // offset as a trailing argument. Injected as real #define lines so the
@@ -1106,7 +1113,8 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
 
 bool VulkanReShade::Render(VkCommandBuffer command_buffer, Effect& effect,
                            VkImageView input_view, VkImage output_image,
-                           VkImageView output_view, VkExtent2D extent) {
+                           VkImageView output_view, VkExtent2D extent,
+                           VkImageView depth_view) {
   if (!effect.runtime_ready) {
     return false;
   }
@@ -1177,7 +1185,15 @@ bool VulkanReShade::Render(VkCommandBuffer command_buffer, Effect& effect,
           const std::string& tex_name = pass.sampler_texture_names[i];
           for (const Texture& texture : effect.textures) {
             if (texture.name == tex_name) {
-              if (!texture.is_backbuffer && texture.view != VK_NULL_HANDLE) {
+              if (texture.is_depth) {
+                // The guest depth buffer, if the presenter fed one this
+                // frame; otherwise fall back to the color input so the
+                // shader still runs (reads color as depth, harmless).
+                if (depth_view != VK_NULL_HANDLE) {
+                  slot_view = depth_view;
+                }
+              } else if (!texture.is_backbuffer &&
+                         texture.view != VK_NULL_HANDLE) {
                 slot_view = texture.view;
               }
               break;

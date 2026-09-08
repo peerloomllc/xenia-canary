@@ -2034,6 +2034,78 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
 
+        // ReShade depth feed (experimental, --reshade_depth): blit the guest
+        // scene depth into a presenter-owned image so depth-based effects can
+        // read it. Same submission as the color image, so it rides the same
+        // presenter synchronization.
+        {
+          auto* reshade_presenter =
+              static_cast<ui::vulkan::VulkanPresenter*>(
+                  graphics_system_->presenter());
+          bool depth_fed = false;
+          if (reshade_presenter && reshade_presenter->WantsReShadeDepth()) {
+            VulkanRenderTargetCache::ReShadeSceneDepth scene_depth;
+            if (render_target_cache_->GetReShadeSceneDepth(scene_depth)) {
+              VkImage depth_dst = reshade_presenter->AcquireReShadeDepthImage(
+                  frontbuffer_width_scaled, frontbuffer_height_scaled,
+                  scene_depth.format);
+              if (depth_dst != VK_NULL_HANDLE) {
+                VkImageSubresourceRange depth_range = {};
+                // Combined depth/stencil formats: barriers must cover both
+                // aspects (VUID-VkImageMemoryBarrier-image-03320).
+                depth_range.aspectMask =
+                    VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+                depth_range.levelCount = 1;
+                depth_range.layerCount = 1;
+                // Source depth RT -> TRANSFER_SRC.
+                PushImageMemoryBarrier(
+                    scene_depth.image, depth_range, scene_depth.stage_mask,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, scene_depth.access_mask,
+                    VK_ACCESS_TRANSFER_READ_BIT, scene_depth.layout,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                // Destination presenter image -> TRANSFER_DST (discard old).
+                PushImageMemoryBarrier(
+                    depth_dst, depth_range, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                SubmitBarriers(true);
+                VkImageBlit blit = {};
+                blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+                blit.srcSubresource.layerCount = 1;
+                blit.srcOffsets[1] = {int32_t(scene_depth.width),
+                                      int32_t(scene_depth.height), 1};
+                blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+                blit.dstSubresource.layerCount = 1;
+                blit.dstOffsets[1] = {int32_t(frontbuffer_width_scaled),
+                                      int32_t(frontbuffer_height_scaled), 1};
+                deferred_command_buffer_.CmdVkBlitImage(
+                    scene_depth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    depth_dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                    VK_FILTER_NEAREST);
+                // Destination -> SHADER_READ for sampling by ReShade.
+                PushImageMemoryBarrier(
+                    depth_dst, depth_range, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                // Restore the depth RT to its prior layout/usage.
+                PushImageMemoryBarrier(
+                    scene_depth.image, depth_range,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, scene_depth.stage_mask,
+                    VK_ACCESS_TRANSFER_READ_BIT, scene_depth.access_mask,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, scene_depth.layout);
+                SubmitBarriers(true);
+                depth_fed = true;
+              }
+            }
+          }
+          if (reshade_presenter) {
+            reshade_presenter->SetReShadeDepthValid(depth_fed);
+          }
+        }
+
         // Need to submit all the commands before giving the image back to the
         // presenter so it can submit its own commands for displaying it to the
         // queue, and also need to submit the release barrier.

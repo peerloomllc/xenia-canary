@@ -169,7 +169,8 @@ class VulkanReShade {
   // output and the chain image, the last one landing on the output.
   bool Render(VkCommandBuffer command_buffer, Effect& effect,
               VkImageView input_view, VkImage output_image,
-              VkImageView output_view, VkExtent2D extent);
+              VkImageView output_view, VkExtent2D extent,
+              VkImageView depth_view = VK_NULL_HANDLE);
 
   void DestroyRuntime(Effect& effect);
 
@@ -178,8 +179,18 @@ class VulkanReShade {
   // frame on the paint thread before Render.
   void UpdateSystemUniforms(Effect& effect);
 
+  // Sets the guest depth-buffer convention applied to the ReShade depth
+  // macros when compiling an effect (RESHADE_DEPTH_INPUT_IS_REVERSED /
+  // _UPSIDE_DOWN). Call before CompileEffect.
+  void SetDepthConvention(bool reversed, bool upside_down) {
+    depth_reversed_ = reversed;
+    depth_upside_down_ = upside_down;
+  }
+
  private:
   const VulkanDevice* device_;
+  bool depth_reversed_ = true;
+  bool depth_upside_down_ = false;
   VkSampler runtime_sampler_ = VK_NULL_HANDLE;
   // Timing for the built-in uniforms.
   bool timing_started_ = false;

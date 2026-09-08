@@ -202,6 +202,24 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       xenos::ColorRenderTargetFormat format,
       bool* is_integer_out = nullptr) const;
 
+  // ReShade depth feed: describes the scene depth render target chosen for
+  // the feed (its image, current layout/usage and extent/format) so the
+  // command processor can blit its depth out without touching the private
+  // render target type.
+  struct ReShadeSceneDepth {
+    VkImage image = VK_NULL_HANDLE;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkPipelineStageFlags stage_mask = 0;
+    VkAccessFlags access_mask = 0;
+  };
+  // Picks the most likely "scene" depth render target (largest single-sampled
+  // depth RT) on the host render target path. Returns false if none is
+  // suitable (wrong path, MSAA only, empty cache, undefined layout).
+  bool GetReShadeSceneDepth(ReShadeSceneDepth& out) const;
+
  protected:
   bool IsGammaFormatHostStorageSeparate() const override;
 

@@ -69,6 +69,24 @@ DEFINE_string(
     "Empty falls back to the folder of --reshade_effect.",
     "Vulkan");
 DEFINE_bool(
+    reshade_depth, false,
+    "Feed the guest scene depth buffer to ReShade effects so depth-based "
+    "shaders (DisplayDepth, ambient occlusion, depth of field) work "
+    "(experimental). Off by default; only the host render target path is "
+    "supported.",
+    "GPU");
+DEFINE_bool(
+    reshade_depth_reversed, true,
+    "The guest depth buffer is reversed (1 = near). Xbox 360 titles commonly "
+    "use reversed depth; toggle if a depth shader looks inverted "
+    "(RESHADE_DEPTH_INPUT_IS_REVERSED).",
+    "GPU");
+DEFINE_bool(
+    reshade_depth_upside_down, false,
+    "Flip the guest depth buffer vertically for ReShade "
+    "(RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN).",
+    "GPU");
+DEFINE_bool(
     vulkan_semaphore_reuse_workaround, false,
     "Wait for presentation queue idle before each frame to prevent semaphore "
     "reuse. May fix rendering issues but causes significant performance loss.",
@@ -182,6 +200,24 @@ VulkanPresenter::~VulkanPresenter() {
   reshade_output_image_.reset();
   reshade_scratch_[0].reset();
   reshade_scratch_[1].reset();
+  {
+    const ui::vulkan::VulkanDevice::Functions& dfn_reshade =
+        vulkan_device_->functions();
+    const VkDevice device_reshade = vulkan_device_->device();
+    if (reshade_depth_view_ != VK_NULL_HANDLE) {
+      dfn_reshade.vkDestroyImageView(device_reshade, reshade_depth_view_,
+                                     nullptr);
+      reshade_depth_view_ = VK_NULL_HANDLE;
+    }
+    if (reshade_depth_image_ != VK_NULL_HANDLE) {
+      dfn_reshade.vkDestroyImage(device_reshade, reshade_depth_image_, nullptr);
+      reshade_depth_image_ = VK_NULL_HANDLE;
+    }
+    if (reshade_depth_memory_ != VK_NULL_HANDLE) {
+      dfn_reshade.vkFreeMemory(device_reshade, reshade_depth_memory_, nullptr);
+      reshade_depth_memory_ = VK_NULL_HANDLE;
+    }
+  }
 
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
@@ -308,6 +344,96 @@ bool VulkanPresenter::CaptureReShadeOutput(RawImage& image_out) {
                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                       VK_ACCESS_SHADER_READ_BIT,
                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, image_out);
+}
+
+bool VulkanPresenter::WantsReShadeDepth() const {
+  if (!cvars::reshade_depth || !reshade_) {
+    return false;
+  }
+  // Only worth feeding depth when a loaded effect actually samples it.
+  for (const ReShadeStackEntry& entry : reshade_stack_) {
+    if (!entry.effect) {
+      continue;
+    }
+    for (const VulkanReShade::Texture& texture :
+         entry.effect->textures) {
+      if (texture.is_depth) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+VkImage VulkanPresenter::AcquireReShadeDepthImage(uint32_t width,
+                                                  uint32_t height,
+                                                  VkFormat format) {
+  if (!width || !height || format == VK_FORMAT_UNDEFINED) {
+    return VK_NULL_HANDLE;
+  }
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  if (reshade_depth_image_ != VK_NULL_HANDLE &&
+      (reshade_depth_extent_.width != width ||
+       reshade_depth_extent_.height != height ||
+       reshade_depth_format_ != format)) {
+    // Size/format changed - wait for the refresher to finish with the old
+    // image (same timeline the color guest output image uses), then destroy.
+    guest_output_image_refresher_completion_timeline_.AwaitAllSubmissions();
+    if (reshade_depth_view_ != VK_NULL_HANDLE) {
+      dfn.vkDestroyImageView(device, reshade_depth_view_, nullptr);
+      reshade_depth_view_ = VK_NULL_HANDLE;
+    }
+    dfn.vkDestroyImage(device, reshade_depth_image_, nullptr);
+    reshade_depth_image_ = VK_NULL_HANDLE;
+    if (reshade_depth_memory_ != VK_NULL_HANDLE) {
+      dfn.vkFreeMemory(device, reshade_depth_memory_, nullptr);
+      reshade_depth_memory_ = VK_NULL_HANDLE;
+    }
+  }
+  if (reshade_depth_image_ == VK_NULL_HANDLE) {
+    VkImageCreateInfo image_create_info = {};
+    image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    image_create_info.imageType = VK_IMAGE_TYPE_2D;
+    image_create_info.format = format;
+    image_create_info.extent = {width, height, 1};
+    image_create_info.mipLevels = 1;
+    image_create_info.arrayLayers = 1;
+    image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_create_info.usage =
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+            vulkan_device_, image_create_info,
+            ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+            reshade_depth_image_, reshade_depth_memory_)) {
+      reshade_depth_image_ = VK_NULL_HANDLE;
+      reshade_depth_memory_ = VK_NULL_HANDLE;
+      return VK_NULL_HANDLE;
+    }
+    VkImageViewCreateInfo view_create_info = {};
+    view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_create_info.image = reshade_depth_image_;
+    view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_create_info.format = format;
+    view_create_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    view_create_info.subresourceRange.levelCount = 1;
+    view_create_info.subresourceRange.layerCount = 1;
+    if (dfn.vkCreateImageView(device, &view_create_info, nullptr,
+                              &reshade_depth_view_) != VK_SUCCESS) {
+      dfn.vkDestroyImage(device, reshade_depth_image_, nullptr);
+      dfn.vkFreeMemory(device, reshade_depth_memory_, nullptr);
+      reshade_depth_image_ = VK_NULL_HANDLE;
+      reshade_depth_memory_ = VK_NULL_HANDLE;
+      reshade_depth_view_ = VK_NULL_HANDLE;
+      return VK_NULL_HANDLE;
+    }
+    reshade_depth_extent_ = {width, height};
+    reshade_depth_format_ = format;
+  }
+  return reshade_depth_image_;
 }
 
 bool VulkanPresenter::CaptureImage(VkImage image, VkExtent2D image_extent,
@@ -1965,6 +2091,31 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
                 }
               }
               VkExtent2D rs_extent{rs_width, rs_height};
+              // Acquire the ReShade depth image for sampling. The command
+              // processor filled it in a separate submission, so transition it
+              // into SHADER_READ within this paint command buffer (from
+              // UNDEFINED, since cross-queue layout is not tracked here - the
+              // content the CP wrote is preserved on the tested drivers).
+              if (reshade_depth_valid_ && reshade_depth_image_ != VK_NULL_HANDLE) {
+                VkImageMemoryBarrier depth_acquire = {};
+                depth_acquire.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                depth_acquire.srcAccessMask = 0;
+                depth_acquire.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                depth_acquire.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                depth_acquire.newLayout =
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                depth_acquire.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                depth_acquire.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                depth_acquire.image = reshade_depth_image_;
+                depth_acquire.subresourceRange.aspectMask =
+                    VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+                depth_acquire.subresourceRange.levelCount = 1;
+                depth_acquire.subresourceRange.layerCount = 1;
+                dfn.vkCmdPipelineBarrier(
+                    draw_command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
+                    nullptr, 1, &depth_acquire);
+              }
               VkImageView input_view = guest_output_image->view();
               int rendered = 0;
               bool ok = true;
@@ -1978,9 +2129,14 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
                     last ? reshade_output_image_.get()
                          : reshade_scratch_[rendered % 2].get();
                 reshade_->UpdateSystemUniforms(*entry.effect);
+                VkImageView depth_view =
+                    (reshade_depth_valid_ &&
+                     reshade_depth_view_ != VK_NULL_HANDLE)
+                        ? reshade_depth_view_
+                        : VK_NULL_HANDLE;
                 if (!reshade_->Render(draw_command_buffer, *entry.effect,
                                       input_view, out->image(), out->view(),
-                                      rs_extent)) {
+                                      rs_extent, depth_view)) {
                   ok = false;
                   break;
                 }
@@ -2473,6 +2629,8 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
   // runtime); a shader named on the command line is queued as the first
   // request, applied on the first paint where the guest size is known.
   reshade_ = std::make_unique<VulkanReShade>(vulkan_device_);
+  reshade_->SetDepthConvention(cvars::reshade_depth_reversed,
+                               cvars::reshade_depth_upside_down);
   if (!cvars::reshade_effect.empty()) {
     std::lock_guard<std::mutex> lock(reshade_control_mutex_);
     ReShadeDesiredEffect desired;

@@ -154,6 +154,20 @@ class VulkanPresenter final : public Presenter {
   }
   VkCommandBuffer AcquireUISetupCommandBufferFromUIThread();
 
+  // ReShade depth feed handoff, called from the guest output refresher (CP
+  // thread). Whether the depth feed is wanted (--reshade_depth on and a
+  // ReShade effect is loaded).
+  bool WantsReShadeDepth() const;
+  // (Re)creates the depth image at the given size/format on the refresher
+  // timeline if needed and returns it so the CP can blit the scene depth into
+  // it (VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL expected on entry, leave it in
+  // VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL). Returns VK_NULL_HANDLE on
+  // failure.
+  VkImage AcquireReShadeDepthImage(uint32_t width, uint32_t height,
+                                   VkFormat format);
+  // Marks whether the depth image holds valid scene depth for this frame.
+  void SetReShadeDepthValid(bool valid) { reshade_depth_valid_ = valid; }
+
  protected:
   SurfacePaintConnectResult ConnectOrReconnectPaintingToSurfaceFromUIThread(
       Surface& new_surface, uint32_t new_surface_width,
@@ -519,6 +533,17 @@ class VulkanPresenter final : public Presenter {
   std::unique_ptr<GuestOutputImage> reshade_scratch_[2];
   uint64_t reshade_output_last_submission_ = 0;
   bool reshade_failed_ = false;
+  // ReShade depth feed (experimental, --reshade_depth). The command
+  // processor blits the guest scene depth into this image during the guest
+  // output refresh (same submission as the color image); a ReShade effect's
+  // DEPTH sampler binds it. Written on the CP thread, sampled on the paint
+  // thread - opt-in, so the one-frame staleness risk is acceptable.
+  VkImage reshade_depth_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory reshade_depth_memory_ = VK_NULL_HANDLE;
+  VkImageView reshade_depth_view_ = VK_NULL_HANDLE;
+  VkFormat reshade_depth_format_ = VK_FORMAT_UNDEFINED;
+  VkExtent2D reshade_depth_extent_ = {0, 0};
+  bool reshade_depth_valid_ = false;
   std::mutex reshade_control_mutex_;
   // UI-desired stack: the UI thread edits this, the paint thread reconciles
   // reshade_stack_ to match (compile new, drop removed, reorder, apply
