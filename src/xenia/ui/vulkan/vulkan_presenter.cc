@@ -2092,16 +2092,19 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
               }
               VkExtent2D rs_extent{rs_width, rs_height};
               // Acquire the ReShade depth image for sampling. The command
-              // processor filled it in a separate submission, so transition it
-              // into SHADER_READ within this paint command buffer (from
-              // UNDEFINED, since cross-queue layout is not tracked here - the
-              // content the CP wrote is preserved on the tested drivers).
+              // processor blitted the scene depth into it in a prior
+              // submission on the same queue and left it in
+              // SHADER_READ_ONLY_OPTIMAL; keep that as oldLayout so the
+              // written content is preserved (UNDEFINED would discard it).
+              // This barrier makes the CP's write visible to the fragment
+              // shader in this submission.
               if (reshade_depth_valid_ && reshade_depth_image_ != VK_NULL_HANDLE) {
                 VkImageMemoryBarrier depth_acquire = {};
                 depth_acquire.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-                depth_acquire.srcAccessMask = 0;
+                depth_acquire.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
                 depth_acquire.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-                depth_acquire.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                depth_acquire.oldLayout =
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
                 depth_acquire.newLayout =
                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
                 depth_acquire.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -2112,7 +2115,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
                 depth_acquire.subresourceRange.levelCount = 1;
                 depth_acquire.subresourceRange.layerCount = 1;
                 dfn.vkCmdPipelineBarrier(
-                    draw_command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    draw_command_buffer, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
                     nullptr, 1, &depth_acquire);
               }
