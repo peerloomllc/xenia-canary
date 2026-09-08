@@ -14,6 +14,9 @@
 #include <filesystem>
 
 #include "xenia/base/logging.h"
+#include "xenia/ui/vulkan/vulkan_util.h"
+
+#include "third_party/stb/stb_image.h"
 
 #include "effect_codegen.hpp"
 #include "effect_parser.hpp"
@@ -25,15 +28,19 @@ namespace vulkan {
 
 namespace {
 
-// Finds a named string/float annotation on a uniform, if present.
-const reshadefx::annotation* FindAnnotation(const reshadefx::uniform& u,
-                                            const char* name) {
-  for (const auto& a : u.annotations) {
+// Finds a named annotation in a list, if present.
+const reshadefx::annotation* FindAnnotationIn(
+    const std::vector<reshadefx::annotation>& annotations, const char* name) {
+  for (const auto& a : annotations) {
     if (a.name == name) {
       return &a;
     }
   }
   return nullptr;
+}
+const reshadefx::annotation* FindAnnotation(const reshadefx::uniform& u,
+                                            const char* name) {
+  return FindAnnotationIn(u.annotations, name);
 }
 
 std::vector<uint32_t> ToWords(const std::string& bytes) {
@@ -89,6 +96,9 @@ std::unique_ptr<VulkanReShade::Effect> VulkanReShade::CompileEffect(
     uniform.name = u.name;
     uniform.offset = u.offset;
     uniform.size = u.size;
+    if (const auto* a = FindAnnotation(u, "source")) {
+      uniform.source = a->value.string_data;
+    }
     uniform.default_value.assign(
         reinterpret_cast<const uint8_t*>(u.initializer_value.as_float),
         reinterpret_cast<const uint8_t*>(u.initializer_value.as_float) +
@@ -109,6 +119,40 @@ std::unique_ptr<VulkanReShade::Effect> VulkanReShade::CompileEffect(
       uniform.ui_max = a->value.as_float[0];
     }
     effect->uniforms.push_back(std::move(uniform));
+  }
+
+  // Textures the effect references. Backbuffer/depth are provided by the
+  // presenter (the guest output); file textures are loaded in CreateRuntime.
+  const std::filesystem::path shader_dir = fs_path.parent_path();
+  for (const auto& tex : module.textures) {
+    Texture texture;
+    texture.name = tex.unique_name;
+    texture.is_backbuffer =
+        tex.semantic == "COLOR" || tex.semantic == "SV_TARGET";
+    texture.is_depth = tex.semantic == "DEPTH";
+    if (const auto* a = FindAnnotationIn(tex.annotations, "source")) {
+      const std::string& src = a->value.string_data;
+      if (!src.empty()) {
+        // Resolve against the shader dir and the usual texture locations
+        // (ReShade shaders name a bare file and rely on a texture path).
+        const std::filesystem::path candidates[] = {
+            shader_dir / src,
+            shader_dir / "Textures" / src,
+            shader_dir.parent_path() / "Textures" / src,
+        };
+        std::error_code ec;
+        for (const auto& candidate : candidates) {
+          if (std::filesystem::exists(candidate, ec)) {
+            texture.source_file = candidate.string();
+            break;
+          }
+        }
+        if (texture.source_file.empty()) {
+          texture.source_file = (shader_dir / src).string();  // report attempt
+        }
+      }
+    }
+    effect->textures.push_back(std::move(texture));
   }
 
   // Assemble per-entry-point SPIR-V once, keyed by entry point name.
@@ -139,6 +183,13 @@ std::unique_ptr<VulkanReShade::Effect> VulkanReShade::CompileEffect(
       p.vs_spirv = spirv_for(pass.vs_entry_point);
       p.ps_spirv = spirv_for(pass.ps_entry_point);
       p.sampler_count = uint32_t(pass.sampler_bindings.size());
+      for (const auto& sb : pass.sampler_bindings) {
+        std::string texture_name;
+        if (sb.index < module.samplers.size()) {
+          texture_name = module.samplers[sb.index].texture_name;
+        }
+        p.sampler_texture_names.push_back(texture_name);
+      }
       if (p.vs_spirv.empty() || p.ps_spirv.empty()) {
         XELOGE("VulkanReShade: '{}' pass '{}' missing SPIR-V, skipping effect",
                effect->name, p.name);
@@ -219,6 +270,20 @@ void VulkanReShade::DestroyRuntime(Effect& effect) {
   if (effect.render_pass != VK_NULL_HANDLE) {
     dfn.vkDestroyRenderPass(device, effect.render_pass, nullptr);
     effect.render_pass = VK_NULL_HANDLE;
+  }
+  for (Texture& texture : effect.textures) {
+    if (texture.view != VK_NULL_HANDLE) {
+      dfn.vkDestroyImageView(device, texture.view, nullptr);
+      texture.view = VK_NULL_HANDLE;
+    }
+    if (texture.image != VK_NULL_HANDLE) {
+      dfn.vkDestroyImage(device, texture.image, nullptr);
+      texture.image = VK_NULL_HANDLE;
+    }
+    if (texture.memory != VK_NULL_HANDLE) {
+      dfn.vkFreeMemory(device, texture.memory, nullptr);
+      texture.memory = VK_NULL_HANDLE;
+    }
   }
   effect.runtime_ready = false;
 }
@@ -468,6 +533,128 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
     // input image, which varies per frame).
   }
 
+  // Load file-sourced textures (e.g. LUTs) and upload them via a one-shot
+  // transfer. Backbuffer/depth textures are provided by the presenter.
+  for (Texture& texture : effect.textures) {
+    if (texture.source_file.empty()) {
+      continue;
+    }
+    int tw = 0, th = 0, tc = 0;
+    stbi_uc* pixels = stbi_load(texture.source_file.c_str(), &tw, &th, &tc, 4);
+    if (!pixels) {
+      XELOGW("VulkanReShade: could not load texture '{}'",
+             texture.source_file);
+      continue;
+    }
+    const VkDeviceSize data_size = VkDeviceSize(tw) * th * 4;
+    VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ici.extent = {uint32_t(tw), uint32_t(th), 1};
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!util::CreateDedicatedAllocationImage(
+            device_, ici, util::MemoryPurpose::kDeviceLocal, texture.image,
+            texture.memory)) {
+      stbi_image_free(pixels);
+      continue;
+    }
+    VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = texture.image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = VK_FORMAT_R8G8B8A8_UNORM;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (dfn.vkCreateImageView(device, &vci, nullptr, &texture.view) !=
+        VK_SUCCESS) {
+      stbi_image_free(pixels);
+      continue;
+    }
+    // Staging buffer.
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+    void* staging_mapped = nullptr;
+    if (util::CreateDedicatedAllocationBuffer(
+            device_, data_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            util::MemoryPurpose::kUpload, staging, staging_memory) &&
+        dfn.vkMapMemory(device, staging_memory, 0, VK_WHOLE_SIZE, 0,
+                        &staging_mapped) == VK_SUCCESS) {
+      std::memcpy(staging_mapped, pixels, size_t(data_size));
+      dfn.vkUnmapMemory(device, staging_memory);
+      // One-shot upload command buffer.
+      VkCommandPoolCreateInfo cpci = {
+          VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+      cpci.queueFamilyIndex = device_->queue_family_graphics_compute();
+      VkCommandPool upload_pool = VK_NULL_HANDLE;
+      dfn.vkCreateCommandPool(device, &cpci, nullptr, &upload_pool);
+      VkCommandBufferAllocateInfo cbai = {
+          VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+      cbai.commandPool = upload_pool;
+      cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+      cbai.commandBufferCount = 1;
+      VkCommandBuffer cb = VK_NULL_HANDLE;
+      dfn.vkAllocateCommandBuffers(device, &cbai, &cb);
+      VkCommandBufferBeginInfo bi = {
+          VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+      bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+      dfn.vkBeginCommandBuffer(cb, &bi);
+      VkImageMemoryBarrier to_dst = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+      to_dst.srcAccessMask = 0;
+      to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+      to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+      to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      to_dst.image = texture.image;
+      to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      dfn.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                               nullptr, 1, &to_dst);
+      VkBufferImageCopy copy = {};
+      copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      copy.imageExtent = {uint32_t(tw), uint32_t(th), 1};
+      dfn.vkCmdCopyBufferToImage(cb, staging, texture.image,
+                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                                 &copy);
+      VkImageMemoryBarrier to_read = to_dst;
+      to_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+      to_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+      to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      dfn.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                               nullptr, 0, nullptr, 1, &to_read);
+      dfn.vkEndCommandBuffer(cb);
+      VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+      VkFence fence = VK_NULL_HANDLE;
+      dfn.vkCreateFence(device, &fci, nullptr, &fence);
+      VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+      si.commandBufferCount = 1;
+      si.pCommandBuffers = &cb;
+      {
+        auto q = device_->AcquireQueue(
+            device_->queue_family_graphics_compute(), 0);
+        dfn.vkQueueSubmit(q.queue(), 1, &si, fence);
+      }
+      dfn.vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+      dfn.vkDestroyFence(device, fence, nullptr);
+      dfn.vkDestroyCommandPool(device, upload_pool, nullptr);
+      XELOGI("VulkanReShade: loaded texture '{}' ({}x{})", texture.name, tw,
+             th);
+    }
+    if (staging != VK_NULL_HANDLE) {
+      dfn.vkDestroyBuffer(device, staging, nullptr);
+    }
+    if (staging_memory != VK_NULL_HANDLE) {
+      dfn.vkFreeMemory(device, staging_memory, nullptr);
+    }
+    stbi_image_free(pixels);
+  }
+
   effect.runtime_ready = true;
   XELOGI("VulkanReShade: runtime built for '{}' ({} pass(es), {} sampler(s))",
          effect.name, effect.passes.size(), max_samplers);
@@ -525,8 +712,23 @@ bool VulkanReShade::Render(VkCommandBuffer command_buffer, Effect& effect,
       std::vector<VkDescriptorImageInfo> image_infos(pass.sampler_count);
       std::vector<VkWriteDescriptorSet> writes(pass.sampler_count);
       for (uint32_t i = 0; i < pass.sampler_count; ++i) {
+        // Resolve the slot's texture: the backbuffer (guest output) binds the
+        // presenter's input; a loaded file texture binds its own image;
+        // anything else falls back to the input.
+        VkImageView slot_view = input_view;
+        if (i < pass.sampler_texture_names.size()) {
+          const std::string& tex_name = pass.sampler_texture_names[i];
+          for (const Texture& texture : effect.textures) {
+            if (texture.name == tex_name) {
+              if (!texture.is_backbuffer && texture.view != VK_NULL_HANDLE) {
+                slot_view = texture.view;
+              }
+              break;
+            }
+          }
+        }
         image_infos[i].sampler = runtime_sampler_;
-        image_infos[i].imageView = input_view;
+        image_infos[i].imageView = slot_view;
         image_infos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         writes[i].dstSet = sampler_set;
@@ -550,6 +752,39 @@ bool VulkanReShade::Render(VkCommandBuffer command_buffer, Effect& effect,
   dfn.vkCmdEndRenderPass(command_buffer);
   (void)framebuffer;  // Kept on the effect, destroyed on the next Render.
   return true;
+}
+
+void VulkanReShade::UpdateSystemUniforms(Effect& effect) {
+  if (!effect.uniform_mapped) {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (!timing_started_) {
+    start_time_ = now;
+    last_frame_time_ = now;
+    timing_started_ = true;
+  }
+  const float timer_ms =
+      std::chrono::duration<float, std::milli>(now - start_time_).count();
+  const float frame_ms =
+      std::chrono::duration<float, std::milli>(now - last_frame_time_).count();
+  last_frame_time_ = now;
+  ++frame_count_;
+  auto* base = static_cast<uint8_t*>(effect.uniform_mapped);
+  for (const Uniform& u : effect.uniforms) {
+    if (u.source.empty()) {
+      continue;
+    }
+    if (u.source == "timer") {
+      std::memcpy(base + u.offset, &timer_ms, sizeof(float));
+    } else if (u.source == "frametime") {
+      std::memcpy(base + u.offset, &frame_ms, sizeof(float));
+    } else if (u.source == "framecount") {
+      const int32_t fc = int32_t(frame_count_);
+      std::memcpy(base + u.offset, &fc, sizeof(int32_t));
+    }
+    // Other sources (date, pingpong, mouse, key) are left at defaults for now.
+  }
 }
 
 }  // namespace vulkan

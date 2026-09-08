@@ -1898,6 +1898,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
                 reshade_controls_dirty_ = false;
               }
             }
+            reshade_->UpdateSystemUniforms(*reshade_effect_);
             VkExtent2D rs_extent{rs_width, rs_height};
             if (reshade_->Render(draw_command_buffer, *reshade_effect_,
                                  guest_output_image->view(),
@@ -2915,6 +2916,9 @@ void VulkanPresenter::ApplyPendingReShadeRequest(uint32_t width,
   effect->enabled = true;
   std::vector<ReShadeUniformControl> controls;
   for (const auto& u : effect->uniforms) {
+    if (!u.source.empty()) {
+      continue;  // Built-in (timer/frametime/...) - filled by the runtime.
+    }
     ReShadeUniformControl control;
     control.name = u.name;
     control.label = u.ui_label;

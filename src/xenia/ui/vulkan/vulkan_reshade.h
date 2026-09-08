@@ -10,6 +10,7 @@
 #ifndef XENIA_UI_VULKAN_VULKAN_RESHADE_H_
 #define XENIA_UI_VULKAN_VULKAN_RESHADE_H_
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -43,6 +44,10 @@ class VulkanReShade {
     float ui_min = 0.0f;
     float ui_max = 1.0f;
     std::vector<uint8_t> default_value;
+    // ReShade "source" annotation (e.g. "timer", "frametime", "framecount");
+    // empty for a normal user-adjustable uniform. Special uniforms are filled
+    // by the runtime each frame and are hidden from the settings UI.
+    std::string source;
   };
 
   struct Pass {
@@ -51,9 +56,10 @@ class VulkanReShade {
     std::string ps_entry_point;
     std::vector<uint32_t> vs_spirv;
     std::vector<uint32_t> ps_spirv;
-    // Number of combined image samplers this pass's pixel shader references
-    // (all bound to the effect input for now - only BackBuffer is supported).
+    // Number of combined image samplers this pass's pixel shader references.
     uint32_t sampler_count = 0;
+    // The texture (unique) name each sampler slot references, in slot order.
+    std::vector<std::string> sampler_texture_names;
     // Vulkan runtime objects (created by CreateRuntime).
     VkShaderModule vs_module = VK_NULL_HANDLE;
     VkShaderModule ps_module = VK_NULL_HANDLE;
@@ -62,12 +68,25 @@ class VulkanReShade {
     VkDescriptorSet sampler_descriptor_set = VK_NULL_HANDLE;
   };
 
+  // An effect-owned image resource. Backbuffer/depth are external (the
+  // presenter's guest output); file textures are loaded from disk.
+  struct Texture {
+    std::string name;         // unique name the samplers reference
+    std::string source_file;  // absolute path if loaded from a file
+    bool is_backbuffer = false;
+    bool is_depth = false;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+  };
+
   struct Effect {
     std::string name;
     std::string path;
     bool enabled = false;
     std::vector<Uniform> uniforms;
     std::vector<Pass> passes;
+    std::vector<Texture> textures;
     uint32_t uniform_size = 0;
 
     // Vulkan runtime objects shared by the passes (created by CreateRuntime).
@@ -110,9 +129,19 @@ class VulkanReShade {
 
   void DestroyRuntime(Effect& effect);
 
+  // Writes the effect's built-in (source-annotated) uniforms - timer,
+  // frametime, framecount - into the mapped uniform buffer. Call once per
+  // frame on the paint thread before Render.
+  void UpdateSystemUniforms(Effect& effect);
+
  private:
   const VulkanDevice* device_;
   VkSampler runtime_sampler_ = VK_NULL_HANDLE;
+  // Timing for the built-in uniforms.
+  bool timing_started_ = false;
+  std::chrono::steady_clock::time_point start_time_;
+  std::chrono::steady_clock::time_point last_frame_time_;
+  uint32_t frame_count_ = 0;
 };
 
 }  // namespace vulkan
