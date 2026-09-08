@@ -16,6 +16,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/platform.h"
+#include "xenia/ui/vulkan/vulkan_reshade.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
 
 #if XE_PLATFORM_ANDROID
@@ -47,6 +48,11 @@ DEFINE_bool(
     "(3rd priority), which causes waiting for host display vertical sync, but "
     "may present with tearing if frames don't meet the host display refresh "
     "rate.",
+    "Vulkan");
+DEFINE_string(
+    reshade_effect, "",
+    "Path to a ReShade .fx shader to load in the native post-process runtime "
+    "(experimental, work in progress). Empty to disable.",
     "Vulkan");
 DEFINE_bool(
     vulkan_semaphore_reuse_workaround, false,
@@ -2279,6 +2285,19 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
   if (guest_output_format_properties.optimalTilingFeatures &
       VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
     dlss_ = VulkanDlss::TryCreate(vulkan_device_);
+  }
+
+  if (!cvars::reshade_effect.empty()) {
+    // Work in progress (notes/72): compile the effect and log its reflected
+    // module. The runtime that executes the passes is not wired up yet.
+    VulkanReShade reshade(vulkan_device_);
+    auto effect = reshade.CompileEffect(cvars::reshade_effect, 2560, 1440);
+    if (effect) {
+      for (const auto& u : effect->uniforms) {
+        XELOGI("VulkanReShade:   control '{}' (type '{}', {}..{})",
+               u.ui_label, u.ui_type, u.ui_min, u.ui_max);
+      }
+    }
   }
 
   VkDescriptorSetLayoutBinding guest_output_image_sampler_bindings[2];
