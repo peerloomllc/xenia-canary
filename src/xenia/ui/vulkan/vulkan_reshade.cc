@@ -165,6 +165,14 @@ std::unique_ptr<VulkanReShade::Effect> VulkanReShade::CompileEffect(
   pp.add_macro_definition("BUFFER_RCP_WIDTH", "(1.0 / BUFFER_WIDTH)");
   pp.add_macro_definition("BUFFER_RCP_HEIGHT", "(1.0 / BUFFER_HEIGHT)");
   pp.add_macro_definition("BUFFER_COLOR_BIT_DEPTH", "8");
+  // Legacy intrinsic names older packs (SweetFX's CAS and SMAA) still use;
+  // the compiler merged them into tex2D/tex2Dlod overloads taking the
+  // offset as a trailing argument. Injected as real #define lines so the
+  // preprocessor builds the parameter substitution itself.
+  pp.append_string(
+      "#define tex2Doffset(s, c, o) tex2D(s, c, o)\n"
+      "#define tex2Dlodoffset(s, c, o) tex2Dlod(s, c, o)\n",
+      "xenia_reshade_compat.h");
 
   std::filesystem::path fs_path(path);
   pp.add_include_path(fs_path.parent_path());
@@ -248,10 +256,18 @@ std::unique_ptr<VulkanReShade::Effect> VulkanReShade::CompileEffect(
       if (!src.empty()) {
         // Resolve against the shader dir and the usual texture locations
         // (ReShade shaders name a bare file and rely on a texture path).
+        // Packs keep textures next to the shaders, in a Textures folder
+        // beside them, or (ReShade's repository layout) in
+        // <root>/Textures[/<pack>] parallel to <root>/Shaders[/<pack>].
+        const std::filesystem::path pack_name = shader_dir.filename();
         const std::filesystem::path candidates[] = {
             shader_dir / src,
             shader_dir / "Textures" / src,
             shader_dir.parent_path() / "Textures" / src,
+            shader_dir.parent_path() / "Textures" / pack_name / src,
+            shader_dir.parent_path().parent_path() / "Textures" / src,
+            shader_dir.parent_path().parent_path() / "Textures" / pack_name /
+                src,
         };
         std::error_code ec;
         for (const auto& candidate : candidates) {
