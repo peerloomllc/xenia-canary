@@ -744,10 +744,30 @@ bool GTKWindow::HandleMouse(GdkEvent* event,
       auto scroll_event = reinterpret_cast<const GdkEventScroll*>(event);
       x = scroll_event->x;
       y = scroll_event->y;
-      scroll_x = scroll_event->delta_x * MouseEvent::kScrollPerDetent;
-      // In GDK, positive is towards the bottom of the screen, not forward from
-      // the user.
-      scroll_y = -scroll_event->delta_y * MouseEvent::kScrollPerDetent;
+      // Wheels send discrete GDK_SCROLL_UP/DOWN/LEFT/RIGHT events whose
+      // delta_x/delta_y are 0; only GDK_SCROLL_SMOOTH fills the deltas. Read
+      // whichever this event carries so a plain wheel mouse scrolls too.
+      // In GDK, positive is towards the bottom of the screen, not forward
+      // from the user, so scroll_y is negated to match ImGui/up-is-positive.
+      switch (scroll_event->direction) {
+        case GDK_SCROLL_UP:
+          scroll_y = MouseEvent::kScrollPerDetent;
+          break;
+        case GDK_SCROLL_DOWN:
+          scroll_y = -MouseEvent::kScrollPerDetent;
+          break;
+        case GDK_SCROLL_LEFT:
+          scroll_x = -MouseEvent::kScrollPerDetent;
+          break;
+        case GDK_SCROLL_RIGHT:
+          scroll_x = MouseEvent::kScrollPerDetent;
+          break;
+        case GDK_SCROLL_SMOOTH:
+        default:
+          scroll_x = scroll_event->delta_x * MouseEvent::kScrollPerDetent;
+          scroll_y = -scroll_event->delta_y * MouseEvent::kScrollPerDetent;
+          break;
+      }
     } break;
     default:
       return false;
