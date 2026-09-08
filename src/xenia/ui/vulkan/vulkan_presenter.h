@@ -484,6 +484,9 @@ class VulkanPresenter final : public Presenter {
   void SetReShadeControlFromUIThread(const std::string& name,
                                      const float* values,
                                      int components) override;
+  std::string GetReShadeShaderDirFromUIThread() const override;
+  std::string GetReShadeCurrentPathFromUIThread() const override;
+  void SetReShadeEffectPathFromUIThread(const std::string& path) override;
 
   VulkanDevice* vulkan_device_;
   const UISamplers* ui_samplers_;
@@ -507,6 +510,13 @@ class VulkanPresenter final : public Presenter {
   std::mutex reshade_control_mutex_;
   std::vector<ReShadeUniformControl> reshade_controls_;
   bool reshade_controls_dirty_ = false;
+  // Shader browser request state (guarded by reshade_control_mutex_).
+  std::string reshade_current_path_;
+  std::string reshade_requested_path_;
+  bool reshade_request_pending_ = false;
+  // Loads/unloads the requested ReShade shader; call only from the paint
+  // thread (creates/destroys GPU objects, awaits in-flight submissions).
+  void ApplyPendingReShadeRequest(uint32_t width, uint32_t height);
 
   // Static objects for guest output presentation, used only when painting the
   // main target (can be destroyed only after awaiting main target usage

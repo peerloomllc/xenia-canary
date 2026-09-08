@@ -10,6 +10,7 @@
 #include "xenia/ui/vulkan/vulkan_presenter.h"
 
 #include <cstdint>
+#include <filesystem>
 
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
@@ -53,6 +54,11 @@ DEFINE_string(
     reshade_effect, "",
     "Path to a ReShade .fx shader to load in the native post-process runtime "
     "(experimental, work in progress). Empty to disable.",
+    "Vulkan");
+DEFINE_string(
+    reshade_shader_dir, "",
+    "Directory the ReShade overlay's shader browser lists .fx files from. "
+    "Empty falls back to the folder of --reshade_effect.",
     "Vulkan");
 DEFINE_bool(
     vulkan_semaphore_reuse_workaround, false,
@@ -1829,6 +1835,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
         // into a dedicated image, which the first paint effect then samples
         // instead of the raw guest output (experimental, notes/72).
         bool reshade_source = false;
+        {
+          const uint32_t rs_load_w =
+              guest_output_flow.properties.frontbuffer_width;
+          const uint32_t rs_load_h =
+              guest_output_flow.properties.frontbuffer_height;
+          ApplyPendingReShadeRequest(rs_load_w, rs_load_h);
+        }
         if (reshade_ && reshade_effect_ && reshade_effect_->enabled &&
             !reshade_failed_) {
           const uint32_t rs_width =
@@ -2370,38 +2383,14 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
     dlss_ = VulkanDlss::TryCreate(vulkan_device_);
   }
 
+  // The ReShade runtime is always available (the browser can load shaders at
+  // runtime); a shader named on the command line is queued as the first
+  // request, applied on the first paint where the guest size is known.
+  reshade_ = std::make_unique<VulkanReShade>(vulkan_device_);
   if (!cvars::reshade_effect.empty()) {
-    reshade_ = std::make_unique<VulkanReShade>(vulkan_device_);
-    reshade_effect_ =
-        reshade_->CompileEffect(cvars::reshade_effect, 1280, 720);
-    if (reshade_effect_) {
-      const VkSampler sampler =
-          ui_samplers_->samplers()[UISamplers::kSamplerIndexLinearClampToEdge];
-      if (reshade_->CreateRuntime(*reshade_effect_, kGuestOutputFormat,
-                                  sampler)) {
-        reshade_effect_->enabled = true;
-        std::lock_guard<std::mutex> lock(reshade_control_mutex_);
-        reshade_controls_.clear();
-        for (const auto& u : reshade_effect_->uniforms) {
-          ReShadeUniformControl control;
-          control.name = u.name;
-          control.label = u.ui_label;
-          control.ui_type = u.ui_type;
-          control.min_value = u.ui_min;
-          control.max_value = u.ui_max;
-          control.components =
-              std::max(1, std::min(4, int(u.size / sizeof(float))));
-          if (!u.default_value.empty()) {
-            std::memcpy(control.value, u.default_value.data(),
-                        std::min(u.default_value.size(),
-                                 sizeof(control.value)));
-          }
-          reshade_controls_.push_back(control);
-        }
-      } else {
-        reshade_effect_.reset();
-      }
-    }
+    std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+    reshade_requested_path_ = cvars::reshade_effect;
+    reshade_request_pending_ = true;
   }
 
   VkDescriptorSetLayoutBinding guest_output_image_sampler_bindings[2];
@@ -2880,6 +2869,95 @@ void VulkanPresenter::SetReShadeControlFromUIThread(const std::string& name,
       break;
     }
   }
+}
+
+
+
+void VulkanPresenter::ApplyPendingReShadeRequest(uint32_t width,
+                                                 uint32_t height) {
+  std::string path;
+  {
+    std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+    if (!reshade_request_pending_) {
+      return;
+    }
+    reshade_request_pending_ = false;
+    path = reshade_requested_path_;
+  }
+  if (!reshade_) {
+    return;
+  }
+  // Tear down any current effect once the GPU is done with it.
+  if (reshade_effect_) {
+    paint_context_.completion_timeline.AwaitSubmissionAndUpdateCompleted(
+        reshade_output_last_submission_);
+    reshade_->DestroyRuntime(*reshade_effect_);
+    reshade_effect_.reset();
+  }
+  reshade_failed_ = false;
+  {
+    std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+    reshade_controls_.clear();
+    reshade_current_path_.clear();
+  }
+  if (path.empty()) {
+    return;
+  }
+  auto effect = reshade_->CompileEffect(path, width, height);
+  if (!effect) {
+    return;
+  }
+  const VkSampler sampler =
+      ui_samplers_->samplers()[UISamplers::kSamplerIndexLinearClampToEdge];
+  if (!reshade_->CreateRuntime(*effect, kGuestOutputFormat, sampler)) {
+    return;
+  }
+  effect->enabled = true;
+  std::vector<ReShadeUniformControl> controls;
+  for (const auto& u : effect->uniforms) {
+    ReShadeUniformControl control;
+    control.name = u.name;
+    control.label = u.ui_label;
+    control.ui_type = u.ui_type;
+    control.min_value = u.ui_min;
+    control.max_value = u.ui_max;
+    control.components = std::max(1, std::min(4, int(u.size / sizeof(float))));
+    if (!u.default_value.empty()) {
+      std::memcpy(control.value, u.default_value.data(),
+                  std::min(u.default_value.size(), sizeof(control.value)));
+    }
+    controls.push_back(control);
+  }
+  reshade_effect_ = std::move(effect);
+  {
+    std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+    reshade_controls_ = std::move(controls);
+    reshade_current_path_ = path;
+  }
+}
+
+std::string VulkanPresenter::GetReShadeShaderDirFromUIThread() const {
+  if (!cvars::reshade_shader_dir.empty()) {
+    return cvars::reshade_shader_dir;
+  }
+  // Fall back to the folder of the command-line shader, if any.
+  if (!cvars::reshade_effect.empty()) {
+    return std::filesystem::path(cvars::reshade_effect).parent_path().string();
+  }
+  return {};
+}
+
+std::string VulkanPresenter::GetReShadeCurrentPathFromUIThread() const {
+  std::lock_guard<std::mutex> lock(
+      const_cast<std::mutex&>(reshade_control_mutex_));
+  return reshade_current_path_;
+}
+
+void VulkanPresenter::SetReShadeEffectPathFromUIThread(
+    const std::string& path) {
+  std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+  reshade_requested_path_ = path;
+  reshade_request_pending_ = true;
 }
 
 

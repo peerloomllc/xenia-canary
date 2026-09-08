@@ -28,6 +28,8 @@
 #include <fstream>
 #include <cmath>
 #include <algorithm>
+#include <filesystem>
+#include <system_error>
 #include <array>
 #include <chrono>
 
@@ -2988,10 +2990,54 @@ void EmulatorWindow::ReShadeOverlayDialog::OnDraw(ImGuiIO& io) {
     return;
   }
 
-  if (!presenter || !presenter->IsReShadeEffectLoaded()) {
-    ImGui::TextWrapped(
-        "No ReShade effect loaded. Launch with --reshade_effect=<path to "
-        ".fx> to load one.");
+  if (!presenter) {
+    ImGui::TextUnformatted("No presenter.");
+    ImGui::End();
+    if (!open) {
+      Close();
+    }
+    return;
+  }
+
+  ImGui::TextDisabled("Home toggles this window");
+  ImGui::Separator();
+
+  // Shader browser: list the .fx files in the shader directory; click to load.
+  const std::string shader_dir = presenter->GetReShadeShaderDirFromUIThread();
+  const std::string current_path =
+      presenter->GetReShadeCurrentPathFromUIThread();
+  ImGui::Text("Shaders (%s)",
+              shader_dir.empty() ? "no folder set" : shader_dir.c_str());
+  if (ImGui::BeginListBox("##rs_shaders", ImVec2(-FLT_MIN, 140.0f))) {
+    bool none_selected = current_path.empty();
+    if (ImGui::Selectable("(none)", none_selected)) {
+      presenter->SetReShadeEffectPathFromUIThread("");
+    }
+    if (!shader_dir.empty()) {
+      std::error_code ec;
+      std::vector<std::filesystem::path> fx_files;
+      for (std::filesystem::directory_iterator it(shader_dir, ec), end;
+           it != end && !ec; it.increment(ec)) {
+        if (it->is_regular_file(ec) && it->path().extension() == ".fx") {
+          fx_files.push_back(it->path());
+        }
+      }
+      std::sort(fx_files.begin(), fx_files.end());
+      for (const auto& fx : fx_files) {
+        const std::string path_str = fx.string();
+        const std::string name = fx.filename().string();
+        bool selected = path_str == current_path;
+        if (ImGui::Selectable(name.c_str(), selected)) {
+          presenter->SetReShadeEffectPathFromUIThread(path_str);
+        }
+      }
+    }
+    ImGui::EndListBox();
+  }
+  ImGui::Separator();
+
+  if (!presenter->IsReShadeEffectLoaded()) {
+    ImGui::TextDisabled("No effect loaded - pick one above.");
     ImGui::End();
     if (!open) {
       Close();
@@ -3006,9 +3052,7 @@ void EmulatorWindow::ReShadeOverlayDialog::OnDraw(ImGuiIO& io) {
     presenter->SetReShadeEffectEnabledFromUIThread(enabled);
   }
   ImGui::SameLine();
-  ImGui::TextDisabled("(Home to toggle this window)");
-  ImGui::Separator();
-  ImGui::Text("Effect: %s", effect_name.c_str());
+  ImGui::Text("- %s", effect_name.c_str());
   ImGui::Spacing();
 
   std::vector<ui::Presenter::ReShadeUniformControl> controls =

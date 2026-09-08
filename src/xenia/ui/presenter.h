@@ -385,6 +385,12 @@ class Presenter {
   virtual void SetReShadeControlFromUIThread(const std::string& name,
                                              const float* values,
                                              int components) {}
+  // Shader browser: the directory to list .fx files from, the currently
+  // loaded shader's path (empty if none), and a request to load a different
+  // one (empty path unloads). The load happens on the paint thread.
+  virtual std::string GetReShadeShaderDirFromUIThread() const { return {}; }
+  virtual std::string GetReShadeCurrentPathFromUIThread() const { return {}; }
+  virtual void SetReShadeEffectPathFromUIThread(const std::string& path) {}
   // The implementation must be callable from any thread, including from
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.
