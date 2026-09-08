@@ -74,6 +74,9 @@ bool GtkFilePicker::Show(Window* parent_window) {
   if (!this->title().empty()) {
     gtk_window_set_title(GTK_WINDOW(dialog), this->title().c_str());
   }
+  if (multi_selection() && mode() == Mode::kOpen) {
+    gtk_file_chooser_set_select_multiple(GTK_FILE_CHOOSER(dialog), TRUE);
+  }
   if (!default_path().empty()) {
     std::error_code ec;
     if (std::filesystem::is_directory(default_path(), ec)) {
@@ -101,15 +104,21 @@ bool GtkFilePicker::Show(Window* parent_window) {
   }
 
   gint res = gtk_dialog_run(GTK_DIALOG(dialog));
-  char* filename;
   if (res == GTK_RESPONSE_ACCEPT) {
     GtkFileChooser* chooser = GTK_FILE_CHOOSER(dialog);
-    filename = gtk_file_chooser_get_filename(chooser);
     std::vector<std::filesystem::path> selected_files;
-    selected_files.push_back(xe::to_path(std::string(filename)));
+    GSList* filenames = gtk_file_chooser_get_filenames(chooser);
+    for (GSList* it = filenames; it; it = it->next) {
+      char* filename = static_cast<char*>(it->data);
+      if (filename) {
+        selected_files.push_back(xe::to_path(std::string(filename)));
+        g_free(filename);
+      }
+    }
+    g_slist_free(filenames);
     set_selected_files(selected_files);
     gtk_widget_destroy(dialog);
-    return true;
+    return !selected_files.empty();
   }
   gtk_widget_destroy(dialog);
   return false;
