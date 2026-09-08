@@ -288,6 +288,8 @@ class EmulatorWindow {
 
    private:
     EmulatorWindow& emulator_window_;
+    char shader_dir_buffer_[1024] = {};
+    bool shader_dir_buffer_initialized_ = false;
   };
   void ToggleReShadeOverlay();
   std::unique_ptr<ReShadeOverlayDialog> reshade_overlay_dialog_;

@@ -485,6 +485,7 @@ class VulkanPresenter final : public Presenter {
                                      const float* values,
                                      int components) override;
   std::string GetReShadeShaderDirFromUIThread() const override;
+  void SetReShadeShaderDirFromUIThread(const std::string& dir) override;
   std::string GetReShadeCurrentPathFromUIThread() const override;
   void SetReShadeEffectPathFromUIThread(const std::string& path) override;
 

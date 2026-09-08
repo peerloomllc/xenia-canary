@@ -3002,8 +3002,26 @@ void EmulatorWindow::ReShadeOverlayDialog::OnDraw(ImGuiIO& io) {
   ImGui::TextDisabled("Home toggles this window");
   ImGui::Separator();
 
-  // Shader browser: list the .fx files in the shader directory; click to load.
+  // Shader folder: editable path (type or paste, then Set). Persisted to
+  // the config so it is remembered next launch.
   const std::string shader_dir = presenter->GetReShadeShaderDirFromUIThread();
+  if (!shader_dir_buffer_initialized_) {
+    std::snprintf(shader_dir_buffer_, sizeof(shader_dir_buffer_), "%s",
+                  shader_dir.c_str());
+    shader_dir_buffer_initialized_ = true;
+  }
+  ImGui::TextUnformatted("Shader folder:");
+  ImGui::SetNextItemWidth(-70.0f);
+  bool apply_dir = ImGui::InputText(
+      "##rs_dir", shader_dir_buffer_, sizeof(shader_dir_buffer_),
+      ImGuiInputTextFlags_EnterReturnsTrue);
+  ImGui::SameLine();
+  if (ImGui::Button("Set##rs_setdir")) {
+    apply_dir = true;
+  }
+  if (apply_dir) {
+    presenter->SetReShadeShaderDirFromUIThread(shader_dir_buffer_);
+  }
   const std::string current_path =
       presenter->GetReShadeCurrentPathFromUIThread();
   ImGui::Text("Shaders (%s)",

@@ -14,6 +14,7 @@
 
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
+#include "xenia/config.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/platform.h"
@@ -2949,6 +2950,12 @@ std::string VulkanPresenter::GetReShadeShaderDirFromUIThread() const {
     return std::filesystem::path(cvars::reshade_effect).parent_path().string();
   }
   return {};
+}
+
+void VulkanPresenter::SetReShadeShaderDirFromUIThread(
+    const std::string& dir) {
+  cvars::reshade_shader_dir = dir;
+  config::SaveConfig();
 }
 
 std::string VulkanPresenter::GetReShadeCurrentPathFromUIThread() const {

@@ -389,6 +389,7 @@ class Presenter {
   // loaded shader's path (empty if none), and a request to load a different
   // one (empty path unloads). The load happens on the paint thread.
   virtual std::string GetReShadeShaderDirFromUIThread() const { return {}; }
+  virtual void SetReShadeShaderDirFromUIThread(const std::string& dir) {}
   virtual std::string GetReShadeCurrentPathFromUIThread() const { return {}; }
   virtual void SetReShadeEffectPathFromUIThread(const std::string& path) {}
   // The implementation must be callable from any thread, including from
