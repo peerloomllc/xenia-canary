@@ -9,6 +9,7 @@
 
 #include "xenia/ui/vulkan/vulkan_reshade.h"
 
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
 
@@ -87,6 +88,11 @@ std::unique_ptr<VulkanReShade::Effect> VulkanReShade::CompileEffect(
     Uniform uniform;
     uniform.name = u.name;
     uniform.offset = u.offset;
+    uniform.size = u.size;
+    uniform.default_value.assign(
+        reinterpret_cast<const uint8_t*>(u.initializer_value.as_float),
+        reinterpret_cast<const uint8_t*>(u.initializer_value.as_float) +
+            std::min<uint32_t>(u.size, uint32_t(sizeof(u.initializer_value.as_float))));
     if (const auto* a = FindAnnotation(u, "ui_label")) {
       uniform.ui_label = a->value.string_data;
     }
@@ -132,6 +138,7 @@ std::unique_ptr<VulkanReShade::Effect> VulkanReShade::CompileEffect(
       p.ps_entry_point = pass.ps_entry_point;
       p.vs_spirv = spirv_for(pass.vs_entry_point);
       p.ps_spirv = spirv_for(pass.ps_entry_point);
+      p.sampler_count = uint32_t(pass.sampler_bindings.size());
       if (p.vs_spirv.empty() || p.ps_spirv.empty()) {
         XELOGE("VulkanReShade: '{}' pass '{}' missing SPIR-V, skipping effect",
                effect->name, p.name);
@@ -146,6 +153,400 @@ std::unique_ptr<VulkanReShade::Effect> VulkanReShade::CompileEffect(
       effect->name, effect->uniforms.size(), effect->uniform_size,
       effect->passes.size());
   return effect;
+}
+
+}  // namespace vulkan
+}  // namespace ui
+}  // namespace xe
+
+namespace xe {
+namespace ui {
+namespace vulkan {
+
+VulkanReShade::~VulkanReShade() {}
+
+void VulkanReShade::DestroyRuntime(Effect& effect) {
+  const VulkanDevice::Functions& dfn = device_->functions();
+  const VkDevice device = device_->device();
+  for (Pass& pass : effect.passes) {
+    if (pass.pipeline != VK_NULL_HANDLE) {
+      dfn.vkDestroyPipeline(device, pass.pipeline, nullptr);
+      pass.pipeline = VK_NULL_HANDLE;
+    }
+    if (pass.vs_module != VK_NULL_HANDLE) {
+      dfn.vkDestroyShaderModule(device, pass.vs_module, nullptr);
+      pass.vs_module = VK_NULL_HANDLE;
+    }
+    if (pass.ps_module != VK_NULL_HANDLE) {
+      dfn.vkDestroyShaderModule(device, pass.ps_module, nullptr);
+      pass.ps_module = VK_NULL_HANDLE;
+    }
+    pass.descriptor_set = VK_NULL_HANDLE;
+  }
+  if (effect.uniform_mapped) {
+    dfn.vkUnmapMemory(device, effect.uniform_memory);
+    effect.uniform_mapped = nullptr;
+  }
+  if (effect.uniform_buffer != VK_NULL_HANDLE) {
+    dfn.vkDestroyBuffer(device, effect.uniform_buffer, nullptr);
+    effect.uniform_buffer = VK_NULL_HANDLE;
+  }
+  if (effect.uniform_memory != VK_NULL_HANDLE) {
+    dfn.vkFreeMemory(device, effect.uniform_memory, nullptr);
+    effect.uniform_memory = VK_NULL_HANDLE;
+  }
+  if (effect.descriptor_pool != VK_NULL_HANDLE) {
+    dfn.vkDestroyDescriptorPool(device, effect.descriptor_pool, nullptr);
+    effect.descriptor_pool = VK_NULL_HANDLE;
+  }
+  if (effect.pipeline_layout != VK_NULL_HANDLE) {
+    dfn.vkDestroyPipelineLayout(device, effect.pipeline_layout, nullptr);
+    effect.pipeline_layout = VK_NULL_HANDLE;
+  }
+  if (effect.set_layout_ubo != VK_NULL_HANDLE) {
+    dfn.vkDestroyDescriptorSetLayout(device, effect.set_layout_ubo, nullptr);
+    effect.set_layout_ubo = VK_NULL_HANDLE;
+  }
+  if (effect.set_layout_samplers != VK_NULL_HANDLE) {
+    dfn.vkDestroyDescriptorSetLayout(device, effect.set_layout_samplers,
+                                     nullptr);
+    effect.set_layout_samplers = VK_NULL_HANDLE;
+  }
+  if (effect.framebuffer != VK_NULL_HANDLE) {
+    dfn.vkDestroyFramebuffer(device, effect.framebuffer, nullptr);
+    effect.framebuffer = VK_NULL_HANDLE;
+  }
+  if (effect.render_pass != VK_NULL_HANDLE) {
+    dfn.vkDestroyRenderPass(device, effect.render_pass, nullptr);
+    effect.render_pass = VK_NULL_HANDLE;
+  }
+  effect.runtime_ready = false;
+}
+
+bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
+                                  VkSampler sampler) {
+  const VulkanDevice::Functions& dfn = device_->functions();
+  const VkDevice device = device_->device();
+  runtime_sampler_ = sampler;
+  effect.format = format;
+
+  uint32_t max_samplers = 0;
+  for (const Pass& pass : effect.passes) {
+    max_samplers = std::max(max_samplers, pass.sampler_count);
+  }
+
+  // Descriptor set layouts: set 0 = uniform buffer, set 1 = combined image
+  // samplers (ReShade's Vulkan SPIR-V uses set 0 binding 0 for the UBO and
+  // set 1 for sampled images).
+  {
+    VkDescriptorSetLayoutBinding ubo_binding = {};
+    ubo_binding.binding = 0;
+    ubo_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    ubo_binding.descriptorCount = 1;
+    ubo_binding.stageFlags =
+        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo ci = {
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    ci.bindingCount = 1;
+    ci.pBindings = &ubo_binding;
+    if (dfn.vkCreateDescriptorSetLayout(device, &ci, nullptr,
+                                        &effect.set_layout_ubo) != VK_SUCCESS) {
+      XELOGE("VulkanReShade: failed to create the UBO set layout");
+      DestroyRuntime(effect);
+      return false;
+    }
+  }
+  {
+    std::vector<VkDescriptorSetLayoutBinding> bindings(max_samplers);
+    for (uint32_t i = 0; i < max_samplers; ++i) {
+      bindings[i].binding = i;
+      bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+      bindings[i].descriptorCount = 1;
+      bindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo ci = {
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    ci.bindingCount = uint32_t(bindings.size());
+    ci.pBindings = bindings.empty() ? nullptr : bindings.data();
+    if (dfn.vkCreateDescriptorSetLayout(device, &ci, nullptr,
+                                        &effect.set_layout_samplers) !=
+        VK_SUCCESS) {
+      XELOGE("VulkanReShade: failed to create the sampler set layout");
+      DestroyRuntime(effect);
+      return false;
+    }
+  }
+  {
+    VkDescriptorSetLayout set_layouts[2] = {effect.set_layout_ubo,
+                                            effect.set_layout_samplers};
+    VkPipelineLayoutCreateInfo ci = {
+        VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    ci.setLayoutCount = 2;
+    ci.pSetLayouts = set_layouts;
+    if (dfn.vkCreatePipelineLayout(device, &ci, nullptr,
+                                   &effect.pipeline_layout) != VK_SUCCESS) {
+      XELOGE("VulkanReShade: failed to create the pipeline layout");
+      DestroyRuntime(effect);
+      return false;
+    }
+  }
+
+  // Render pass writing the effect output, left ready to sample.
+  {
+    VkAttachmentDescription attachment = {};
+    attachment.format = format;
+    attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    attachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkAttachmentReference color_ref = {0,
+                                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription subpass = {};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &color_ref;
+    VkRenderPassCreateInfo ci = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    ci.attachmentCount = 1;
+    ci.pAttachments = &attachment;
+    ci.subpassCount = 1;
+    ci.pSubpasses = &subpass;
+    if (dfn.vkCreateRenderPass(device, &ci, nullptr, &effect.render_pass) !=
+        VK_SUCCESS) {
+      XELOGE("VulkanReShade: failed to create the render pass");
+      DestroyRuntime(effect);
+      return false;
+    }
+  }
+
+  // Uniform buffer (host visible), filled with the reflected defaults.
+  const VkDeviceSize ubo_size = std::max<VkDeviceSize>(effect.uniform_size, 16);
+  if (!util::CreateDedicatedAllocationBuffer(
+          device_, ubo_size, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+          util::MemoryPurpose::kUpload, effect.uniform_buffer,
+          effect.uniform_memory) ||
+      dfn.vkMapMemory(device, effect.uniform_memory, 0, VK_WHOLE_SIZE, 0,
+                      &effect.uniform_mapped) != VK_SUCCESS) {
+    XELOGE("VulkanReShade: failed to create the uniform buffer");
+    DestroyRuntime(effect);
+    return false;
+  }
+  std::memset(effect.uniform_mapped, 0, size_t(ubo_size));
+  for (const Uniform& u : effect.uniforms) {
+    if (!u.default_value.empty() && u.offset + u.default_value.size() <=
+                                        size_t(ubo_size)) {
+      std::memcpy(static_cast<uint8_t*>(effect.uniform_mapped) + u.offset,
+                  u.default_value.data(), u.default_value.size());
+    }
+  }
+
+  // Descriptor pool and one (ubo, samplers) set pair per pass.
+  {
+    const uint32_t pass_count = uint32_t(effect.passes.size());
+    VkDescriptorPoolSize sizes[2];
+    sizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    sizes[0].descriptorCount = std::max(1u, pass_count);
+    sizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    sizes[1].descriptorCount = std::max(1u, pass_count * std::max(1u, max_samplers));
+    VkDescriptorPoolCreateInfo ci = {
+        VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    ci.maxSets = std::max(1u, pass_count * 2);
+    ci.poolSizeCount = 2;
+    ci.pPoolSizes = sizes;
+    if (dfn.vkCreateDescriptorPool(device, &ci, nullptr,
+                                   &effect.descriptor_pool) != VK_SUCCESS) {
+      XELOGE("VulkanReShade: failed to create the descriptor pool");
+      DestroyRuntime(effect);
+      return false;
+    }
+  }
+
+  VkPipelineShaderStageCreateInfo stages[2] = {};
+  for (Pass& pass : effect.passes) {
+    pass.vs_module = util::CreateShaderModule(device_, pass.vs_spirv.data(),
+                                              pass.vs_spirv.size() * 4);
+    pass.ps_module = util::CreateShaderModule(device_, pass.ps_spirv.data(),
+                                              pass.ps_spirv.size() * 4);
+    if (pass.vs_module == VK_NULL_HANDLE || pass.ps_module == VK_NULL_HANDLE) {
+      XELOGE("VulkanReShade: failed to create shader modules for pass '{}'",
+             pass.name);
+      DestroyRuntime(effect);
+      return false;
+    }
+    stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = pass.vs_module;
+    stages[0].pName = pass.vs_entry_point.c_str();
+    stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = pass.ps_module;
+    stages[1].pName = pass.ps_entry_point.c_str();
+
+    VkPipelineVertexInputStateCreateInfo vertex_input = {
+        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo input_assembly = {
+        VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo viewport_state = {
+        VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    viewport_state.viewportCount = 1;
+    viewport_state.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo raster = {
+        VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    raster.polygonMode = VK_POLYGON_MODE_FILL;
+    raster.cullMode = VK_CULL_MODE_NONE;
+    raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    raster.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo multisample = {
+        VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState blend_attachment = {};
+    blend_attachment.colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo color_blend = {
+        VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    color_blend.attachmentCount = 1;
+    color_blend.pAttachments = &blend_attachment;
+    VkDynamicState dynamic_states[2] = {VK_DYNAMIC_STATE_VIEWPORT,
+                                        VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic_state = {
+        VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynamic_state.dynamicStateCount = 2;
+    dynamic_state.pDynamicStates = dynamic_states;
+    VkGraphicsPipelineCreateInfo ci = {
+        VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    ci.stageCount = 2;
+    ci.pStages = stages;
+    ci.pVertexInputState = &vertex_input;
+    ci.pInputAssemblyState = &input_assembly;
+    ci.pViewportState = &viewport_state;
+    ci.pRasterizationState = &raster;
+    ci.pMultisampleState = &multisample;
+    ci.pColorBlendState = &color_blend;
+    ci.pDynamicState = &dynamic_state;
+    ci.layout = effect.pipeline_layout;
+    ci.renderPass = effect.render_pass;
+    if (dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &ci, nullptr,
+                                      &pass.pipeline) != VK_SUCCESS) {
+      XELOGE("VulkanReShade: failed to create the pipeline for pass '{}'",
+             pass.name);
+      DestroyRuntime(effect);
+      return false;
+    }
+
+    // Allocate and write the descriptor sets for this pass.
+    VkDescriptorSetLayout set_layouts[2] = {effect.set_layout_ubo,
+                                            effect.set_layout_samplers};
+    VkDescriptorSet sets[2];
+    VkDescriptorSetAllocateInfo ai = {
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = effect.descriptor_pool;
+    ai.descriptorSetCount = 2;
+    ai.pSetLayouts = set_layouts;
+    if (dfn.vkAllocateDescriptorSets(device, &ai, sets) != VK_SUCCESS) {
+      XELOGE("VulkanReShade: failed to allocate descriptor sets");
+      DestroyRuntime(effect);
+      return false;
+    }
+    pass.descriptor_set = sets[0];
+    pass.sampler_descriptor_set = sets[1];
+
+    VkDescriptorBufferInfo buffer_info = {};
+    buffer_info.buffer = effect.uniform_buffer;
+    buffer_info.range = ubo_size;
+    VkWriteDescriptorSet ubo_write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    ubo_write.dstSet = sets[0];
+    ubo_write.dstBinding = 0;
+    ubo_write.descriptorCount = 1;
+    ubo_write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    ubo_write.pBufferInfo = &buffer_info;
+    dfn.vkUpdateDescriptorSets(device, 1, &ubo_write, 0, nullptr);
+    // The sampler descriptors are written at render time (they reference the
+    // input image, which varies per frame).
+  }
+
+  effect.runtime_ready = true;
+  XELOGI("VulkanReShade: runtime built for '{}' ({} pass(es), {} sampler(s))",
+         effect.name, effect.passes.size(), max_samplers);
+  return true;
+}
+
+bool VulkanReShade::Render(VkCommandBuffer command_buffer, Effect& effect,
+                           VkImageView input_view, VkImage output_image,
+                           VkImageView output_view, VkExtent2D extent) {
+  if (!effect.runtime_ready) {
+    return false;
+  }
+  const VulkanDevice::Functions& dfn = device_->functions();
+  const VkDevice device = device_->device();
+
+  // The previous frame's framebuffer is done (the presenter awaits prior
+  // submissions before reusing the output image); destroy it and make a new
+  // one for this frame's output view.
+  if (effect.framebuffer != VK_NULL_HANDLE) {
+    dfn.vkDestroyFramebuffer(device, effect.framebuffer, nullptr);
+    effect.framebuffer = VK_NULL_HANDLE;
+  }
+  VkFramebufferCreateInfo fb_ci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+  fb_ci.renderPass = effect.render_pass;
+  fb_ci.attachmentCount = 1;
+  fb_ci.pAttachments = &output_view;
+  fb_ci.width = extent.width;
+  fb_ci.height = extent.height;
+  fb_ci.layers = 1;
+  if (dfn.vkCreateFramebuffer(device, &fb_ci, nullptr, &effect.framebuffer) !=
+      VK_SUCCESS) {
+    return false;
+  }
+  VkFramebuffer framebuffer = effect.framebuffer;
+
+  VkRenderPassBeginInfo rp_bi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+  rp_bi.renderPass = effect.render_pass;
+  rp_bi.framebuffer = framebuffer;
+  rp_bi.renderArea.extent = extent;
+  dfn.vkCmdBeginRenderPass(command_buffer, &rp_bi,
+                           VK_SUBPASS_CONTENTS_INLINE);
+  VkViewport viewport = {0.0f, 0.0f, float(extent.width), float(extent.height),
+                         0.0f, 1.0f};
+  VkRect2D scissor = {{0, 0}, extent};
+  dfn.vkCmdSetViewport(command_buffer, 0, 1, &viewport);
+  dfn.vkCmdSetScissor(command_buffer, 0, 1, &scissor);
+
+  for (Pass& pass : effect.passes) {
+    VkDescriptorSet sampler_set = pass.sampler_descriptor_set;
+    if (pass.sampler_count) {
+      // Bind the input image to every sampler slot (only BackBuffer supported).
+      std::vector<VkDescriptorImageInfo> image_infos(pass.sampler_count);
+      std::vector<VkWriteDescriptorSet> writes(pass.sampler_count);
+      for (uint32_t i = 0; i < pass.sampler_count; ++i) {
+        image_infos[i].sampler = runtime_sampler_;
+        image_infos[i].imageView = input_view;
+        image_infos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[i].dstSet = sampler_set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[i].pImageInfo = &image_infos[i];
+      }
+      dfn.vkUpdateDescriptorSets(device, uint32_t(writes.size()), writes.data(),
+                                 0, nullptr);
+    }
+    dfn.vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          pass.pipeline);
+    VkDescriptorSet bind_sets[2] = {pass.descriptor_set, sampler_set};
+    dfn.vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                effect.pipeline_layout, 0, 2, bind_sets, 0,
+                                nullptr);
+    dfn.vkCmdDraw(command_buffer, 3, 1, 0, 0);
+  }
+
+  dfn.vkCmdEndRenderPass(command_buffer);
+  (void)framebuffer;  // Kept on the effect, destroyed on the next Render.
+  return true;
 }
 
 }  // namespace vulkan
