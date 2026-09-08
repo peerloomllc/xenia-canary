@@ -380,23 +380,42 @@ class Presenter {
     uint32_t offset = 0;
     uint32_t size = 0;
   };
-  virtual bool IsReShadeEffectLoaded() const { return false; }
-  virtual std::string GetReShadeEffectNameFromUIThread() const { return {}; }
-  virtual bool IsReShadeEffectEnabledFromUIThread() const { return false; }
-  virtual void SetReShadeEffectEnabledFromUIThread(bool enabled) {}
-  virtual std::vector<ReShadeUniformControl> GetReShadeControlsFromUIThread() {
+  // One entry in the effect stack, as the UI sees it.
+  struct ReShadeEffectInfo {
+    std::string name;
+    std::string path;
+    bool enabled = true;
+  };
+  // True when the ReShade runtime exists (Vulkan build with the compiler).
+  virtual bool IsReShadeAvailable() const { return false; }
+  // The effect stack, in render order (guest output flows through each in
+  // turn). Empty = nothing applied.
+  virtual std::vector<ReShadeEffectInfo> GetReShadeStackFromUIThread() {
     return {};
   }
-  virtual void SetReShadeControlFromUIThread(const std::string& name,
+  // Append a compiled effect to the end of the stack.
+  virtual void AddReShadeEffectFromUIThread(const std::string& path) {}
+  // Remove the stack entry at `index`.
+  virtual void RemoveReShadeEffectFromUIThread(int index) {}
+  // Move the entry at `index` by `delta` positions (earlier/later in the
+  // chain), clamped.
+  virtual void MoveReShadeEffectFromUIThread(int index, int delta) {}
+  // Enable/disable the entry at `index` (kept in the stack, skipped when
+  // rendering).
+  virtual void SetReShadeEffectEnabledFromUIThread(int index, bool enabled) {}
+  // The controls of the stack entry at `index`.
+  virtual std::vector<ReShadeUniformControl> GetReShadeControlsFromUIThread(
+      int index) {
+    return {};
+  }
+  virtual void SetReShadeControlFromUIThread(int index,
+                                             const std::string& name,
                                              const float* values,
                                              int components) {}
-  // Shader browser: the directory to list .fx files from, the currently
-  // loaded shader's path (empty if none), and a request to load a different
-  // one (empty path unloads). The load happens on the paint thread.
+  // Shader browser: the directory to list .fx files from. The loaded stack
+  // is read via GetReShadeStackFromUIThread.
   virtual std::string GetReShadeShaderDirFromUIThread() const { return {}; }
   virtual void SetReShadeShaderDirFromUIThread(const std::string& dir) {}
-  virtual std::string GetReShadeCurrentPathFromUIThread() const { return {}; }
-  virtual void SetReShadeEffectPathFromUIThread(const std::string& path) {}
   // Per-game presets: `file` is where the running title's preset lives.
   // Setting a non-empty path loads and applies it (shader + enabled +
   // uniform values) if it exists, and later shader/enable changes are saved

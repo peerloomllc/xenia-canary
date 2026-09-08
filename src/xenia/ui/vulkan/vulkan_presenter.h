@@ -475,20 +475,19 @@ class VulkanPresenter final : public Presenter {
     return dlss_ != nullptr && !dlss_failed_;
   }
 
-  bool IsReShadeEffectLoaded() const override {
-    return reshade_effect_ != nullptr;
-  }
-  std::string GetReShadeEffectNameFromUIThread() const override;
-  bool IsReShadeEffectEnabledFromUIThread() const override;
-  void SetReShadeEffectEnabledFromUIThread(bool enabled) override;
-  std::vector<ReShadeUniformControl> GetReShadeControlsFromUIThread() override;
-  void SetReShadeControlFromUIThread(const std::string& name,
+  bool IsReShadeAvailable() const override { return reshade_ != nullptr; }
+  std::vector<ReShadeEffectInfo> GetReShadeStackFromUIThread() override;
+  void AddReShadeEffectFromUIThread(const std::string& path) override;
+  void RemoveReShadeEffectFromUIThread(int index) override;
+  void MoveReShadeEffectFromUIThread(int index, int delta) override;
+  void SetReShadeEffectEnabledFromUIThread(int index, bool enabled) override;
+  std::vector<ReShadeUniformControl> GetReShadeControlsFromUIThread(
+      int index) override;
+  void SetReShadeControlFromUIThread(int index, const std::string& name,
                                      const float* values,
                                      int components) override;
   std::string GetReShadeShaderDirFromUIThread() const override;
   void SetReShadeShaderDirFromUIThread(const std::string& dir) override;
-  std::string GetReShadeCurrentPathFromUIThread() const override;
-  void SetReShadeEffectPathFromUIThread(const std::string& path) override;
   void SetReShadePresetFileFromUIThread(const std::string& file) override;
   void SaveReShadePresetFromUIThread() override;
   std::string GetReShadePresetDirFromUIThread() const override;
@@ -508,34 +507,47 @@ class VulkanPresenter final : public Presenter {
   // Native ReShade post-process (experimental, notes/72). Its output image is
   // guest-output sized and sampled by the first paint effect when enabled.
   std::unique_ptr<VulkanReShade> reshade_;
-  std::unique_ptr<VulkanReShade::Effect> reshade_effect_;
+  // One loaded effect in the chain (paint-thread owned, render order).
+  struct ReShadeStackEntry {
+    std::unique_ptr<VulkanReShade::Effect> effect;
+    std::string path;
+    std::vector<ReShadeUniformControl> controls;
+    bool controls_dirty = false;
+  };
+  std::vector<ReShadeStackEntry> reshade_stack_;
   std::unique_ptr<GuestOutputImage> reshade_output_image_;
+  std::unique_ptr<GuestOutputImage> reshade_scratch_[2];
   uint64_t reshade_output_last_submission_ = 0;
   bool reshade_failed_ = false;
-  // UI-facing control values, guarded so the UI thread can edit while the
-  // paint thread applies them to the uniform buffer. Parallel to
-  // reshade_effect_->uniforms.
   std::mutex reshade_control_mutex_;
-  std::vector<ReShadeUniformControl> reshade_controls_;
-  bool reshade_controls_dirty_ = false;
-  // Shader browser request state (guarded by reshade_control_mutex_).
-  std::string reshade_current_path_;
-  std::string reshade_requested_path_;
-  bool reshade_request_pending_ = false;
-  // Per-game preset: file to persist the shader/enabled/values to (UI
-  // thread only), and values from a loaded preset waiting to be applied
-  // when the requested shader finishes compiling (guarded by
-  // reshade_control_mutex_, consumed with the request).
+  // UI-desired stack: the UI thread edits this, the paint thread reconciles
+  // reshade_stack_ to match (compile new, drop removed, reorder, apply
+  // enabled + values). Guarded by reshade_control_mutex_.
+  struct ReShadeDesiredEffect {
+    std::string path;
+    bool enabled = true;
+    std::vector<std::pair<std::string, std::array<float, 4>>> values;
+  };
+  std::vector<ReShadeDesiredEffect> reshade_desired_;
+  bool reshade_desired_dirty_ = false;
+  // UI snapshot published by the paint thread after each reconcile.
+  struct ReShadeUiEffect {
+    std::string name;
+    std::string path;
+    bool enabled = true;
+    std::vector<ReShadeUniformControl> controls;
+  };
+  std::vector<ReShadeUiEffect> reshade_ui_;
+  // Per-game preset file to persist the stack to (UI thread only).
   std::string reshade_preset_file_;
-  std::vector<std::pair<std::string, std::array<float, 4>>>
-      reshade_pending_values_;
-  bool reshade_pending_enabled_ = true;
-  // Writes the preset file from the current control state; `shader_path` is
-  // the shader to record (the current one, or the one just requested).
-  void SaveReShadePresetWithShader(const std::string& shader_path);
-  // Writes the current configuration to an arbitrary preset file.
-  void WriteReShadePresetFile(const std::string& file,
-                              const std::string& shader_path);
+  // Reconciles reshade_stack_ to reshade_desired_ (paint thread).
+  void ApplyReShadeStack(uint32_t width, uint32_t height);
+  // Rebuilds reshade_ui_ from the current stack (call under the mutex).
+  void PublishReShadeUi();
+  // Saves the desired stack to the current preset file, if set.
+  void SaveReShadePresetToCurrentFile();
+  // Writes the desired stack to an arbitrary preset file.
+  void WriteReShadePresetFile(const std::string& file);
   // One-shot readback of an image into 8bpc RGBA, awaiting its own
   // submission.
   bool CaptureImage(VkImage image, VkExtent2D image_extent,
@@ -543,13 +555,9 @@ class VulkanPresenter final : public Presenter {
                     VkAccessFlags image_access_mask,
                     VkPipelineStageFlags image_stage_mask,
                     RawImage& image_out);
-  // Parses a preset file; returns false if it cannot be read.
+  // Parses a preset file into a desired stack; false if unreadable.
   static bool ParseReShadePresetFile(
-      const std::string& file, std::string& shader_path, bool& enabled,
-      std::vector<std::pair<std::string, std::array<float, 4>>>& values);
-  // Loads/unloads the requested ReShade shader; call only from the paint
-  // thread (creates/destroys GPU objects, awaits in-flight submissions).
-  void ApplyPendingReShadeRequest(uint32_t width, uint32_t height);
+      const std::string& file, std::vector<ReShadeDesiredEffect>& effects);
 
   // Static objects for guest output presentation, used only when painting the
   // main target (can be destroyed only after awaiting main target usage

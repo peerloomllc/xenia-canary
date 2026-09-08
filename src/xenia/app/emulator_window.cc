@@ -3113,15 +3113,24 @@ void EmulatorWindow::ToggleReShadeEffect() {
   gpu::GraphicsSystem* graphics_system = emulator_->graphics_system();
   ui::Presenter* presenter =
       graphics_system ? graphics_system->presenter() : nullptr;
-  if (!presenter || !presenter->IsReShadeEffectLoaded()) {
+  std::vector<ui::Presenter::ReShadeEffectInfo> stack =
+      presenter ? presenter->GetReShadeStackFromUIThread()
+                : std::vector<ui::Presenter::ReShadeEffectInfo>();
+  if (!presenter || stack.empty()) {
     new xe::ui::HostNotificationWindow(imgui_drawer(), "ReShade",
-                                       "No effect loaded", 0);
+                                       "No effects loaded", 0);
     return;
   }
-  const bool enabled = !presenter->IsReShadeEffectEnabledFromUIThread();
-  presenter->SetReShadeEffectEnabledFromUIThread(enabled);
+  bool any_on = false;
+  for (const auto& e : stack) {
+    any_on = any_on || e.enabled;
+  }
+  const bool turn_on = !any_on;  // all off -> on; otherwise all off.
+  for (int i = 0; i < int(stack.size()); ++i) {
+    presenter->SetReShadeEffectEnabledFromUIThread(i, turn_on);
+  }
   new xe::ui::HostNotificationWindow(
-      imgui_drawer(), "ReShade", enabled ? "Effect on" : "Effect off", 0);
+      imgui_drawer(), "ReShade", turn_on ? "Effects on" : "Effects off", 0);
 }
 
 void EmulatorWindow::ToggleReShadeOverlay() {
@@ -3199,15 +3208,10 @@ void EmulatorWindow::ReShadeOverlayDialog::OnDraw(ImGuiIO& io) {
     ew.app_context().CallInUIThreadDeferred(
         [&ew]() { ew.PickReShadeShaderDir(); });
   }
-  const std::string current_path =
-      presenter->GetReShadeCurrentPathFromUIThread();
   ImGui::Text("Shaders (%s)",
               shader_dir.empty() ? "no folder set" : shader_dir.c_str());
-  if (ImGui::BeginListBox("##rs_shaders", ImVec2(-FLT_MIN, 140.0f))) {
-    bool none_selected = current_path.empty();
-    if (ImGui::Selectable("(none)", none_selected)) {
-      presenter->SetReShadeEffectPathFromUIThread("");
-    }
+  ImGui::TextDisabled("click to add to the stack");
+  if (ImGui::BeginListBox("##rs_shaders", ImVec2(-FLT_MIN, 120.0f))) {
     if (!shader_dir.empty()) {
       std::error_code ec;
       std::vector<std::filesystem::path> fx_files;
@@ -3221,9 +3225,8 @@ void EmulatorWindow::ReShadeOverlayDialog::OnDraw(ImGuiIO& io) {
       for (const auto& fx : fx_files) {
         const std::string path_str = fx.string();
         const std::string name = fx.filename().string();
-        bool selected = path_str == current_path;
-        if (ImGui::Selectable(name.c_str(), selected)) {
-          presenter->SetReShadeEffectPathFromUIThread(path_str);
+        if (ImGui::Selectable(name.c_str(), false)) {
+          presenter->AddReShadeEffectFromUIThread(path_str);
         }
       }
     }
@@ -3299,8 +3302,10 @@ void EmulatorWindow::ReShadeOverlayDialog::OnDraw(ImGuiIO& io) {
   }
   ImGui::Separator();
 
-  if (!presenter->IsReShadeEffectLoaded()) {
-    ImGui::TextDisabled("No effect loaded - pick one above.");
+  std::vector<ui::Presenter::ReShadeEffectInfo> stack =
+      presenter->GetReShadeStackFromUIThread();
+  if (stack.empty()) {
+    ImGui::TextDisabled("No effects - click a shader above to add one.");
     ImGui::End();
     if (!open) {
       Close();
@@ -3308,50 +3313,70 @@ void EmulatorWindow::ReShadeOverlayDialog::OnDraw(ImGuiIO& io) {
     return;
   }
 
-  const std::string effect_name =
-      presenter->GetReShadeEffectNameFromUIThread();
-  bool enabled = presenter->IsReShadeEffectEnabledFromUIThread();
-  if (ImGui::Checkbox("Enabled", &enabled)) {
-    presenter->SetReShadeEffectEnabledFromUIThread(enabled);
-  }
-  ImGui::SameLine();
-  ImGui::Text("- %s", effect_name.c_str());
-  ImGui::Spacing();
-
-  std::vector<ui::Presenter::ReShadeUniformControl> controls =
-      presenter->GetReShadeControlsFromUIThread();
-  if (controls.empty()) {
-    ImGui::TextDisabled("This effect exposes no adjustable settings.");
-  }
-  for (auto& control : controls) {
-    const std::string id = "##rs_" + control.name;
-    bool changed = false;
-    if (control.ui_type == "color" && control.components >= 3) {
-      changed = ImGui::ColorEdit3((control.label + id).c_str(), control.value,
-                                  ImGuiColorEditFlags_NoInputs);
-    } else if (control.ui_type == "bool" || control.components == 0) {
-      bool b = control.value[0] != 0.0f;
-      if (ImGui::Checkbox((control.label + id).c_str(), &b)) {
-        control.value[0] = b ? 1.0f : 0.0f;
-        changed = true;
+  ImGui::TextUnformatted("Active effects (top runs first):");
+  for (int i = 0; i < int(stack.size()); ++i) {
+    ImGui::PushID(i);
+    // Enable checkbox.
+    bool enabled = stack[i].enabled;
+    if (ImGui::Checkbox("##en", &enabled)) {
+      presenter->SetReShadeEffectEnabledFromUIThread(i, enabled);
+    }
+    ImGui::SameLine();
+    // Reorder / remove.
+    if (ImGui::SmallButton("up")) {
+      presenter->MoveReShadeEffectFromUIThread(i, -1);
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("dn")) {
+      presenter->MoveReShadeEffectFromUIThread(i, 1);
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("X")) {
+      presenter->RemoveReShadeEffectFromUIThread(i);
+      ImGui::PopID();
+      break;  // stack changed; redraw next frame
+    }
+    ImGui::SameLine();
+    if (ImGui::CollapsingHeader(stack[i].name.c_str())) {
+      std::vector<ui::Presenter::ReShadeUniformControl> controls =
+          presenter->GetReShadeControlsFromUIThread(i);
+      if (controls.empty()) {
+        ImGui::TextDisabled("  No adjustable settings.");
       }
-    } else if (control.components == 1) {
-      changed = ImGui::SliderFloat((control.label + id).c_str(),
-                                   &control.value[0], control.min_value,
-                                   control.max_value, "%.3f");
-    } else {
-      changed = ImGui::SliderScalarN((control.label + id).c_str(),
-                                     ImGuiDataType_Float, control.value,
-                                     control.components, &control.min_value,
-                                     &control.max_value, "%.3f");
+      for (auto& control : controls) {
+        const std::string id = "##rs_" + std::to_string(i) + "_" + control.name;
+        bool changed = false;
+        if (control.ui_type == "color" && control.components >= 3) {
+          changed = ImGui::ColorEdit3((control.label + id).c_str(),
+                                      control.value,
+                                      ImGuiColorEditFlags_NoInputs);
+        } else if (control.ui_type == "bool" || control.components == 0) {
+          bool b = control.value[0] != 0.0f;
+          if (ImGui::Checkbox((control.label + id).c_str(), &b)) {
+            control.value[0] = b ? 1.0f : 0.0f;
+            changed = true;
+          }
+        } else if (control.components == 1) {
+          changed = ImGui::SliderFloat((control.label + id).c_str(),
+                                       &control.value[0], control.min_value,
+                                       control.max_value, "%.3f");
+        } else {
+          changed = ImGui::SliderScalarN(
+              (control.label + id).c_str(), ImGuiDataType_Float, control.value,
+              control.components, &control.min_value, &control.max_value,
+              "%.3f");
+        }
+        if (changed) {
+          presenter->SetReShadeControlFromUIThread(i, control.name,
+                                                   control.value,
+                                                   control.components);
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+          presenter->SaveReShadePresetFromUIThread();
+        }
+      }
     }
-    if (changed) {
-      presenter->SetReShadeControlFromUIThread(control.name, control.value,
-                                               control.components);
-    }
-    if (ImGui::IsItemDeactivatedAfterEdit()) {
-      presenter->SaveReShadePresetFromUIThread();
-    }
+    ImGui::PopID();
   }
 
   ImGui::End();
