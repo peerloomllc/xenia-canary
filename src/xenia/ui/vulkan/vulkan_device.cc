@@ -164,6 +164,16 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_maintenance4, 1, 3)
   }
 
+  if (get_physical_device_properties2_supported) {
+    // NGX (DLSS super resolution in the presenter): the extensions
+    // NVSDK_NGX_VULKAN_RequiredExtensions returns. All optional; the DLSS
+    // wrapper checks them before initializing NGX.
+    XE_UI_VULKAN_STRUCT_EXTENSION(KHR_push_descriptor)
+    XE_UI_VULKAN_STRUCT_EXTENSION(EXT_buffer_device_address)
+    XE_UI_VULKAN_STRUCT_EXTENSION(NVX_binary_import)
+    XE_UI_VULKAN_STRUCT_EXTENSION(NVX_image_view_handle)
+  }
+
   if (with_swapchain) {
     // #2.
     XE_UI_VULKAN_STRUCT_EXTENSION(KHR_swapchain)
@@ -654,6 +664,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_1_2, uniformBufferStandardLayout);
       XE_UI_VULKAN_FEATURE_2(features_1_2, scalarBlockLayout);
       XE_UI_VULKAN_FEATURE_2(features_1_2, hostQueryReset);
+    }
+    if (device->extensions_.ext_NVX_binary_import &&
+        device->extensions_.ext_NVX_image_view_handle) {
+      // Only of interest to NGX (DLSS), so only enabled where NGX can exist.
+      XE_UI_VULKAN_FEATURE_2(features_1_2, bufferDeviceAddress);
     }
   } else {
     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {

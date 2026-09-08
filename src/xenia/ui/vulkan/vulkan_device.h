@@ -133,6 +133,10 @@ class VulkanDevice {
 
     bool hostQueryReset = false;
 
+    // VK_KHR_buffer_device_address (promoted to 1.2; for NGX / DLSS)
+
+    bool bufferDeviceAddress = false;
+
     // VK_KHR_portability_subset (#164)
 
     bool constantAlphaColorBlendFactors = false;
@@ -196,6 +200,12 @@ class VulkanDevice {
     bool ext_1_2_EXT_host_query_reset = false;          // promoted to 1.2
     // Has optional features not implied by this being true.
     bool ext_1_3_KHR_maintenance4 = false;  // #414
+    // NGX (DLSS). #30, #83, #245, #1000. Requested only so that the NGX
+    // runtime can be initialized on NVIDIA drivers; nothing else uses them.
+    bool ext_KHR_push_descriptor = false;
+    bool ext_EXT_buffer_device_address = false;
+    bool ext_NVX_binary_import = false;
+    bool ext_NVX_image_view_handle = false;
 #if XE_PLATFORM_WIN32
     // VK_EXT_full_screen_exclusive (#256, Windows only)
     bool ext_EXT_full_screen_exclusive = false;

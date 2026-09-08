@@ -842,6 +842,24 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
   uint32_t output_width_clamped = std::min(output_width, max_rt_width);
   uint32_t output_height_clamped = std::min(output_height, max_rt_height);
 
+  if (config.GetEffect() == GuestOutputPaintConfig::Effect::kDlaa &&
+      SupportsDlaaGuestOutputPaintEffect()) {
+    // NVIDIA DLAA: neural anti-aliasing of the guest output at its own
+    // resolution. The emulator has no motion vectors or jitter to offer, so
+    // the super resolution modes of DLSS have nothing to reconstruct detail
+    // from and are not exposed; anti-aliasing a frame the guest has fully
+    // rendered still works. The DLAA pass writes to a storage image, never
+    // to the swapchain, so a bilinear pass (1:1 when the window matches)
+    // always follows.
+    assert_true(flow.effect_count + 2 <= flow.effects.size());
+    flow.effect_output_sizes[flow.effect_count] = std::make_pair(
+        properties.frontbuffer_width, properties.frontbuffer_height);
+    flow.effects[flow.effect_count++] = GuestOutputPaintEffect::kDlaa;
+    flow.effect_output_sizes[flow.effect_count] =
+        std::make_pair(output_width, output_height);
+    flow.effects[flow.effect_count++] = GuestOutputPaintEffect::kBilinear;
+  }
+
   if (config.GetEffect() == GuestOutputPaintConfig::Effect::kCas ||
       config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr) {
     // FidelityFX Super Resolution and Contrast Adaptive Sharpening only work
