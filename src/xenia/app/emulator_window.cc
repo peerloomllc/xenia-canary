@@ -152,6 +152,13 @@ DEFINE_int32(screenshot_burst_seconds, 0,
 DEFINE_int32(screenshot_burst_frames, 30,
              "Diagnostic: frames to save for --screenshot_burst_seconds.",
              "UI");
+DEFINE_int32(reshade_capture_seconds, 0,
+             "Diagnostic: this many seconds after launch, save the "
+             "post-ReShade frame (the raw guest output if no effect is "
+             "active) to --reshade_capture_path as a PNG.",
+             "UI");
+DEFINE_string(reshade_capture_path, "",
+              "Where --reshade_capture_seconds writes its PNG.", "UI");
 DEFINE_string(screenshot_burst_dir, "",
               "Diagnostic: folder for --screenshot_burst_seconds (default "
               "<exe folder>/screenshots/<title id>/burst).",
@@ -1307,6 +1314,25 @@ bool EmulatorWindow::Initialize() {
              captured.size(), dir.string(),
              captured.empty() ? 0 : captured.front().first,
              captured.empty() ? 0 : captured.back().first);
+    }).detach();
+  }
+
+  if (cvars::reshade_capture_seconds > 0 &&
+      !cvars::reshade_capture_path.empty()) {
+    std::thread([this]() {
+      xe::threading::set_name("ReShade Capture");
+      std::this_thread::sleep_for(
+          std::chrono::seconds(cvars::reshade_capture_seconds));
+      app_context().CallInUIThreadSynchronous([this]() {
+        xe::ui::RawImage image;
+        auto* presenter = GetGraphicsSystemPresenter();
+        if (presenter && presenter->CaptureReShadeOutput(image)) {
+          SaveImage(cvars::reshade_capture_path, image);
+          XELOGI("RESHADE CAPTURE: saved {}", cvars::reshade_capture_path);
+        } else {
+          XELOGE("RESHADE CAPTURE: capture failed");
+        }
+      });
     }).detach();
   }
 

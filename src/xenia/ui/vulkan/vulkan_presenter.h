@@ -147,6 +147,7 @@ class VulkanPresenter final : public Presenter {
   Surface::TypeFlags GetSupportedSurfaceTypes() const override;
 
   bool CaptureGuestOutput(RawImage& image_out) override;
+  bool CaptureReShadeOutput(RawImage& image_out) override;
 
   void AwaitUISubmissionCompletionFromUIThread(uint64_t submission_index) {
     ui_completion_timeline_.AwaitSubmissionAndUpdateCompleted(submission_index);
@@ -535,6 +536,13 @@ class VulkanPresenter final : public Presenter {
   // Writes the current configuration to an arbitrary preset file.
   void WriteReShadePresetFile(const std::string& file,
                               const std::string& shader_path);
+  // One-shot readback of an image into 8bpc RGBA, awaiting its own
+  // submission.
+  bool CaptureImage(VkImage image, VkExtent2D image_extent,
+                    VkImageLayout image_layout,
+                    VkAccessFlags image_access_mask,
+                    VkPipelineStageFlags image_stage_mask,
+                    RawImage& image_out);
   // Parses a preset file; returns false if it cannot be read.
   static bool ParseReShadePresetFile(
       const std::string& file, std::string& shader_path, bool& enabled,

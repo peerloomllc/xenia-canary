@@ -273,8 +273,35 @@ bool VulkanPresenter::CaptureGuestOutput(RawImage& image_out) {
   if (!guest_output_image) {
     return false;
   }
+  return CaptureImage(guest_output_image->image(),
+                      guest_output_image->extent(),
+                      kGuestOutputInternalLayout,
+                      kGuestOutputInternalAccessMask,
+                      kGuestOutputInternalStageMask, image_out);
+}
 
-  VkExtent2D image_extent = guest_output_image->extent();
+bool VulkanPresenter::CaptureReShadeOutput(RawImage& image_out) {
+  // Diagnostic capture of the post-effect image (the picture the paint
+  // effects sample when a ReShade effect is on). Falls back to the raw
+  // guest output when no effect is rendering, so baseline runs of a
+  // comparison land in the same code path. The image is owned by the paint
+  // thread; call this only while no shader load/unload is pending.
+  if (!reshade_effect_ || !reshade_effect_->enabled || reshade_failed_ ||
+      !reshade_output_image_) {
+    return CaptureGuestOutput(image_out);
+  }
+  return CaptureImage(reshade_output_image_->image(),
+                      reshade_output_image_->extent(),
+                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                      VK_ACCESS_SHADER_READ_BIT,
+                      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, image_out);
+}
+
+bool VulkanPresenter::CaptureImage(VkImage image, VkExtent2D image_extent,
+                                   VkImageLayout image_layout,
+                                   VkAccessFlags image_access_mask,
+                                   VkPipelineStageFlags image_stage_mask,
+                                   RawImage& image_out) {
   size_t pixel_count = size_t(image_extent.width) * image_extent.height;
   VkDeviceSize buffer_size = VkDeviceSize(sizeof(uint32_t) * pixel_count);
   VkBuffer buffer;
@@ -347,15 +374,15 @@ bool VulkanPresenter::CaptureGuestOutput(RawImage& image_out) {
     VkImageMemoryBarrier image_memory_barrier;
     image_memory_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     image_memory_barrier.pNext = nullptr;
-    image_memory_barrier.srcAccessMask = kGuestOutputInternalAccessMask;
+    image_memory_barrier.srcAccessMask = image_access_mask;
     image_memory_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    image_memory_barrier.oldLayout = kGuestOutputInternalLayout;
+    image_memory_barrier.oldLayout = image_layout;
     image_memory_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     image_memory_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     image_memory_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    image_memory_barrier.image = guest_output_image->image();
+    image_memory_barrier.image = image;
     image_memory_barrier.subresourceRange = util::InitializeSubresourceRange();
-    dfn.vkCmdPipelineBarrier(command_buffer, kGuestOutputInternalStageMask,
+    dfn.vkCmdPipelineBarrier(command_buffer, image_stage_mask,
                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
                              nullptr, 1, &image_memory_barrier);
 
@@ -365,7 +392,7 @@ bool VulkanPresenter::CaptureGuestOutput(RawImage& image_out) {
     buffer_image_copy.imageExtent.width = image_extent.width;
     buffer_image_copy.imageExtent.height = image_extent.height;
     buffer_image_copy.imageExtent.depth = 1;
-    dfn.vkCmdCopyImageToBuffer(command_buffer, guest_output_image->image(),
+    dfn.vkCmdCopyImageToBuffer(command_buffer, image,
                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1,
                                &buffer_image_copy);
 
@@ -385,8 +412,8 @@ bool VulkanPresenter::CaptureGuestOutput(RawImage& image_out) {
     std::swap(image_memory_barrier.oldLayout, image_memory_barrier.newLayout);
     dfn.vkCmdPipelineBarrier(
         command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_HOST_BIT | kGuestOutputInternalStageMask, 0, 0,
-        nullptr, 1, &buffer_memory_barrier, 1, &image_memory_barrier);
+        VK_PIPELINE_STAGE_HOST_BIT | image_stage_mask, 0, 0, nullptr, 1,
+        &buffer_memory_barrier, 1, &image_memory_barrier);
 
     if (dfn.vkEndCommandBuffer(command_buffer) != VK_SUCCESS) {
       XELOGE(

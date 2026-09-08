@@ -417,6 +417,11 @@ class Presenter {
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.
   virtual bool CaptureGuestOutput(RawImage& image_out) = 0;
+  // Captures the guest output after the ReShade effect ran (the raw guest
+  // output when no effect is active). Diagnostic; UI thread.
+  virtual bool CaptureReShadeOutput(RawImage& image_out) {
+    return CaptureGuestOutput(image_out);
+  }
   const GuestOutputPaintConfig& GetGuestOutputPaintConfigFromUIThread() const {
     return guest_output_paint_config_;
   }
