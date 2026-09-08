@@ -1386,6 +1386,17 @@ bool EmulatorWindow::Initialize() {
     app_context().CallInUIThread([this]() {
       status_overlay_.reset();
       UpdateStatusOverlay(nullptr);
+      // Point the ReShade runtime at this title's preset so its shader and
+      // settings load now and edits are remembered per game.
+      gpu::GraphicsSystem* graphics_system = emulator_->graphics_system();
+      ui::Presenter* presenter =
+          graphics_system ? graphics_system->presenter() : nullptr;
+      if (presenter && emulator_->title_id()) {
+        presenter->SetReShadePresetFileFromUIThread(
+            (emulator_->storage_root() / "reshade_presets" /
+             fmt::format("{:08X}.txt", emulator_->title_id()))
+                .string());
+      }
     });
   });
 
@@ -3131,6 +3142,9 @@ void EmulatorWindow::ReShadeOverlayDialog::OnDraw(ImGuiIO& io) {
     if (changed) {
       presenter->SetReShadeControlFromUIThread(control.name, control.value,
                                                control.components);
+    }
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+      presenter->SaveReShadePresetFromUIThread();
     }
   }
 

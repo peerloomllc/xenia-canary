@@ -374,6 +374,11 @@ class Presenter {
     float max_value = 1.0f;
     int components = 1;
     float value[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    // Byte placement of the uniform in the effect's uniform buffer (controls
+    // skip built-in uniforms, so their index does not line up with the
+    // effect's uniform list).
+    uint32_t offset = 0;
+    uint32_t size = 0;
   };
   virtual bool IsReShadeEffectLoaded() const { return false; }
   virtual std::string GetReShadeEffectNameFromUIThread() const { return {}; }
@@ -392,6 +397,14 @@ class Presenter {
   virtual void SetReShadeShaderDirFromUIThread(const std::string& dir) {}
   virtual std::string GetReShadeCurrentPathFromUIThread() const { return {}; }
   virtual void SetReShadeEffectPathFromUIThread(const std::string& path) {}
+  // Per-game presets: `file` is where the running title's preset lives.
+  // Setting a non-empty path loads and applies it (shader + enabled +
+  // uniform values) if it exists, and later shader/enable changes are saved
+  // back to it. Empty turns persistence off.
+  virtual void SetReShadePresetFileFromUIThread(const std::string& file) {}
+  // Writes the current shader/enabled/values to the preset file now (the
+  // overlay calls this when a slider edit completes).
+  virtual void SaveReShadePresetFromUIThread() {}
   // The implementation must be callable from any thread, including from
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.

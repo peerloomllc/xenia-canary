@@ -11,6 +11,8 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
@@ -1895,16 +1897,12 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
             {
               std::lock_guard<std::mutex> lock(reshade_control_mutex_);
               if (reshade_controls_dirty_ && reshade_effect_->uniform_mapped) {
-                for (size_t ci = 0;
-                     ci < reshade_controls_.size() &&
-                     ci < reshade_effect_->uniforms.size();
-                     ++ci) {
-                  const auto& u = reshade_effect_->uniforms[ci];
+                for (const auto& control : reshade_controls_) {
                   std::memcpy(
                       static_cast<uint8_t*>(reshade_effect_->uniform_mapped) +
-                          u.offset,
-                      reshade_controls_[ci].value,
-                      std::min<size_t>(u.size, sizeof(float) * 4));
+                          control.offset,
+                      control.value,
+                      std::min<size_t>(control.size, sizeof(float) * 4));
                 }
                 reshade_controls_dirty_ = false;
               }
@@ -2859,6 +2857,7 @@ bool VulkanPresenter::IsReShadeEffectEnabledFromUIThread() const {
 void VulkanPresenter::SetReShadeEffectEnabledFromUIThread(bool enabled) {
   if (reshade_effect_) {
     reshade_effect_->enabled = enabled;
+    SaveReShadePresetFromUIThread();
   }
 }
 
@@ -2888,6 +2887,8 @@ void VulkanPresenter::SetReShadeControlFromUIThread(const std::string& name,
 void VulkanPresenter::ApplyPendingReShadeRequest(uint32_t width,
                                                  uint32_t height) {
   std::string path;
+  std::vector<std::pair<std::string, std::array<float, 4>>> preset_values;
+  bool preset_enabled = true;
   {
     std::lock_guard<std::mutex> lock(reshade_control_mutex_);
     if (!reshade_request_pending_) {
@@ -2895,6 +2896,10 @@ void VulkanPresenter::ApplyPendingReShadeRequest(uint32_t width,
     }
     reshade_request_pending_ = false;
     path = reshade_requested_path_;
+    preset_values = std::move(reshade_pending_values_);
+    reshade_pending_values_.clear();
+    preset_enabled = reshade_pending_enabled_;
+    reshade_pending_enabled_ = true;
   }
   if (!reshade_) {
     return;
@@ -2924,7 +2929,8 @@ void VulkanPresenter::ApplyPendingReShadeRequest(uint32_t width,
   if (!reshade_->CreateRuntime(*effect, kGuestOutputFormat, sampler)) {
     return;
   }
-  effect->enabled = true;
+  effect->enabled = preset_enabled;
+  bool controls_dirty = false;
   std::vector<ReShadeUniformControl> controls;
   for (const auto& u : effect->uniforms) {
     if (!u.source.empty()) {
@@ -2937,9 +2943,19 @@ void VulkanPresenter::ApplyPendingReShadeRequest(uint32_t width,
     control.min_value = u.ui_min;
     control.max_value = u.ui_max;
     control.components = std::max(1, std::min(4, int(u.size / sizeof(float))));
+    control.offset = u.offset;
+    control.size = u.size;
     if (!u.default_value.empty()) {
       std::memcpy(control.value, u.default_value.data(),
                   std::min(u.default_value.size(), sizeof(control.value)));
+    }
+    for (const auto& preset_value : preset_values) {
+      if (preset_value.first == control.name) {
+        std::memcpy(control.value, preset_value.second.data(),
+                    sizeof(control.value));
+        controls_dirty = true;
+        break;
+      }
     }
     controls.push_back(control);
   }
@@ -2948,6 +2964,9 @@ void VulkanPresenter::ApplyPendingReShadeRequest(uint32_t width,
     std::lock_guard<std::mutex> lock(reshade_control_mutex_);
     reshade_controls_ = std::move(controls);
     reshade_current_path_ = path;
+    // Preset values land in the uniform buffer through the regular
+    // controls-dirty copy on the next frame.
+    reshade_controls_dirty_ = controls_dirty;
   }
 }
 
@@ -2976,9 +2995,112 @@ std::string VulkanPresenter::GetReShadeCurrentPathFromUIThread() const {
 
 void VulkanPresenter::SetReShadeEffectPathFromUIThread(
     const std::string& path) {
+  {
+    std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+    reshade_requested_path_ = path;
+    reshade_request_pending_ = true;
+    // A user-picked shader starts from its defaults.
+    reshade_pending_values_.clear();
+    reshade_pending_enabled_ = true;
+  }
+  SaveReShadePresetWithShader(path);
+}
+
+void VulkanPresenter::SetReShadePresetFileFromUIThread(
+    const std::string& file) {
+  reshade_preset_file_ = file;
+  if (file.empty()) {
+    return;
+  }
+  std::ifstream stream(file);
+  if (!stream) {
+    // No preset for this title yet; keep whatever is loaded, and the first
+    // change writes the file.
+    return;
+  }
+  std::string shader_path;
+  bool enabled = true;
+  std::vector<std::pair<std::string, std::array<float, 4>>> values;
+  std::string line;
+  while (std::getline(stream, line)) {
+    std::istringstream tokens(line);
+    std::string key;
+    tokens >> key;
+    std::string name, equals;
+    if (key == "shader") {
+      tokens >> equals;
+      std::getline(tokens, shader_path);
+      const size_t start = shader_path.find_first_not_of(' ');
+      shader_path =
+          start == std::string::npos ? "" : shader_path.substr(start);
+    } else if (key == "enabled") {
+      int value = 1;
+      tokens >> equals >> value;
+      enabled = value != 0;
+    } else if (key == "uniform") {
+      std::array<float, 4> value = {};
+      tokens >> name >> equals;
+      for (float& component : value) {
+        if (!(tokens >> component)) {
+          break;
+        }
+      }
+      if (!name.empty()) {
+        values.emplace_back(name, value);
+      }
+    }
+  }
+  XELOGI("VulkanPresenter: applying ReShade preset '{}' (shader '{}')", file,
+         shader_path);
   std::lock_guard<std::mutex> lock(reshade_control_mutex_);
-  reshade_requested_path_ = path;
+  reshade_requested_path_ = shader_path;
   reshade_request_pending_ = true;
+  reshade_pending_values_ = std::move(values);
+  reshade_pending_enabled_ = enabled;
+}
+
+void VulkanPresenter::SaveReShadePresetFromUIThread() {
+  SaveReShadePresetWithShader(GetReShadeCurrentPathFromUIThread());
+}
+
+void VulkanPresenter::SaveReShadePresetWithShader(
+    const std::string& shader_path) {
+  if (reshade_preset_file_.empty()) {
+    return;
+  }
+  bool fresh_selection = true;
+  std::vector<ReShadeUniformControl> controls;
+  if (!shader_path.empty()) {
+    std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+    // Only keep values that belong to the shader being recorded (a fresh
+    // selection's controls are not built yet - it saves defaults by saving
+    // nothing).
+    if (reshade_current_path_ == shader_path) {
+      fresh_selection = false;
+      controls = reshade_controls_;
+    }
+  }
+  // A fresh selection loads enabled; otherwise record the current toggle.
+  const bool enabled =
+      fresh_selection || !reshade_effect_ || reshade_effect_->enabled;
+  std::error_code ec;
+  std::filesystem::create_directories(
+      std::filesystem::path(reshade_preset_file_).parent_path(), ec);
+  std::ofstream stream(reshade_preset_file_, std::ios::trunc);
+  if (!stream) {
+    XELOGW("VulkanPresenter: could not write the ReShade preset '{}'",
+           reshade_preset_file_);
+    return;
+  }
+  stream << "shader = " << shader_path << "\n";
+  stream << "enabled = " << (enabled ? 1 : 0) << "\n";
+  for (const auto& control : controls) {
+    stream << "uniform " << control.name << " =";
+    for (int i = 0; i < control.components; ++i) {
+      stream << ' ' << control.value[i];
+    }
+    stream << "\n";
+  }
 }
 
 
