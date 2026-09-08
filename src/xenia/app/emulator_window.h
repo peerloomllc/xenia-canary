@@ -509,6 +509,7 @@ class EmulatorWindow {
   // Folder setting (cvar save_state_dir, "" = <storage root>/savestates).
   void PickSaveStateDir();  // folder picker; call from the UI loop
   void SetSaveStateDir(const std::filesystem::path& dir);
+  void PickReShadeShaderDir();  // folder picker for the ReShade overlay
   static size_t CountSaveStateFiles(const std::filesystem::path& dir);
   // Deletes a slot's .sav and its .png thumbnail. Reports what happened in a
   // notification; a slot with no file is left alone.

@@ -2148,6 +2148,27 @@ void EmulatorWindow::DeleteSaveStateSlot(int slot) {
   new xe::ui::HostNotificationWindow(imgui_drawer(), "Save state", text, 0);
 }
 
+void EmulatorWindow::PickReShadeShaderDir() {
+  auto picker = xe::ui::FilePicker::Create();
+  picker->set_mode(ui::FilePicker::Mode::kOpen);
+  picker->set_type(ui::FilePicker::Type::kDirectory);
+  picker->set_multi_selection(false);
+  picker->set_title("Select the ReShade shader folder");
+  if (!picker->Show(window_.get())) {
+    return;
+  }
+  auto selected = picker->selected_files();
+  if (selected.empty() || selected[0].empty()) {
+    return;
+  }
+  gpu::GraphicsSystem* graphics_system = emulator_->graphics_system();
+  ui::Presenter* presenter =
+      graphics_system ? graphics_system->presenter() : nullptr;
+  if (presenter) {
+    presenter->SetReShadeShaderDirFromUIThread(selected[0].string());
+  }
+}
+
 void EmulatorWindow::PickSaveStateDir() {
   auto picker = xe::ui::FilePicker::Create();
   picker->set_mode(ui::FilePicker::Mode::kOpen);
@@ -3022,6 +3043,13 @@ void EmulatorWindow::ReShadeOverlayDialog::OnDraw(ImGuiIO& io) {
   if (apply_dir) {
     presenter->SetReShadeShaderDirFromUIThread(shader_dir_buffer_);
   }
+  // Browse: the GTK folder picker can't run inside the ImGui draw, so defer
+  // it to the UI loop.
+  if (ImGui::Button("Browse...##rs_browse")) {
+    EmulatorWindow& ew = emulator_window_;
+    ew.app_context().CallInUIThreadDeferred(
+        [&ew]() { ew.PickReShadeShaderDir(); });
+  }
   const std::string current_path =
       presenter->GetReShadeCurrentPathFromUIThread();
   ImGui::Text("Shaders (%s)",
@@ -3759,6 +3787,9 @@ void EmulatorWindow::OnKeyChar(ui::KeyEvent& e) {
   if (!emulator_initialized_ || disable_hotkeys_) {
     return;
   }
+  if (imgui_drawer_ && imgui_drawer_->GetIO().WantTextInput) {
+    return;
+  }
   // On GTK the virtual key of a char event is the Unicode code point.
   uint32_t c = uint32_t(e.virtual_key());
   ui::VirtualKey key;
@@ -3791,6 +3822,13 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
   XELOGD("OnKeyDown vk={:X} initialized={} capturing={}",
          uint16_t(e.virtual_key()), emulator_initialized_, capturing_action_);
   if (!emulator_initialized_) {
+    return;
+  }
+
+  // When an ImGui text field is active (e.g. the ReShade overlay's shader
+  // folder box), let the keystrokes go to it instead of firing emulator
+  // hotkeys like '-' (slow motion).
+  if (imgui_drawer_ && imgui_drawer_->GetIO().WantTextInput) {
     return;
   }
 
