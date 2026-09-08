@@ -24,6 +24,7 @@
 #include "xenia/ui/vulkan/ui_samplers.h"
 #include "xenia/ui/vulkan/vulkan_device.h"
 #include "xenia/ui/vulkan/vulkan_dlss.h"
+#include "xenia/ui/vulkan/vulkan_reshade.h"
 #include "xenia/ui/vulkan/vulkan_gpu_completion_timeline.h"
 #include "xenia/ui/vulkan/vulkan_instance.h"
 
@@ -334,9 +335,14 @@ class VulkanPresenter final : public Presenter {
           kGuestOutputDescriptorSetGuestOutput0Sampled +
           kGuestOutputMailboxSize,
 
-      kGuestOutputDescriptorSetCount =
+      // Sampled view of the ReShade effect output (its result feeds the
+      // first paint effect when a ReShade effect is enabled).
+      kGuestOutputDescriptorSetReShadeSampled =
           kGuestOutputDescriptorSetIntermediate0Sampled +
           kMaxGuestOutputPaintEffects - 1,
+
+      kGuestOutputDescriptorSetCount =
+          kGuestOutputDescriptorSetReShadeSampled + 1,
     };
 
     struct UISetupCommandBuffer {
@@ -474,6 +480,14 @@ class VulkanPresenter final : public Presenter {
   // evaluation failure, permanently falling back to bilinear.
   std::unique_ptr<VulkanDlss> dlss_;
   bool dlss_failed_ = false;
+
+  // Native ReShade post-process (experimental, notes/72). Its output image is
+  // guest-output sized and sampled by the first paint effect when enabled.
+  std::unique_ptr<VulkanReShade> reshade_;
+  std::unique_ptr<VulkanReShade::Effect> reshade_effect_;
+  std::unique_ptr<GuestOutputImage> reshade_output_image_;
+  uint64_t reshade_output_last_submission_ = 0;
+  bool reshade_failed_ = false;
 
   // Static objects for guest output presentation, used only when painting the
   // main target (can be destroyed only after awaiting main target usage

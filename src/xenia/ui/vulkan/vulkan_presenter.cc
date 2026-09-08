@@ -157,6 +157,12 @@ VulkanPresenter::~VulkanPresenter() {
   ui_completion_timeline_.AwaitAllSubmissions();
   guest_output_image_refresher_completion_timeline_.AwaitAllSubmissions();
 
+  if (reshade_ && reshade_effect_) {
+    reshade_->DestroyRuntime(*reshade_effect_);
+    reshade_effect_.reset();
+  }
+  reshade_output_image_.reset();
+
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
 
@@ -1818,6 +1824,63 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
           paint_context_.guest_output_intermediate_image_last_submission =
               current_paint_submission_index;
         }
+
+        // ReShade post-process: run the enabled effect on the guest output
+        // into a dedicated image, which the first paint effect then samples
+        // instead of the raw guest output (experimental, notes/72).
+        bool reshade_source = false;
+        if (reshade_ && reshade_effect_ && reshade_effect_->enabled &&
+            !reshade_failed_) {
+          const uint32_t rs_width =
+              guest_output_flow.properties.frontbuffer_width;
+          const uint32_t rs_height =
+              guest_output_flow.properties.frontbuffer_height;
+          if (reshade_output_image_ &&
+              (reshade_output_image_->extent().width != rs_width ||
+               reshade_output_image_->extent().height != rs_height)) {
+            paint_context_.completion_timeline.AwaitSubmissionAndUpdateCompleted(
+                reshade_output_last_submission_);
+            reshade_output_image_.reset();
+          }
+          if (!reshade_output_image_) {
+            reshade_output_image_ =
+                GuestOutputImage::Create(vulkan_device_, rs_width, rs_height);
+            if (reshade_output_image_) {
+              VkDescriptorImageInfo image_info;
+              image_info.sampler = VK_NULL_HANDLE;
+              image_info.imageView = reshade_output_image_->view();
+              image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+              VkWriteDescriptorSet write;
+              write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+              write.pNext = nullptr;
+              write.dstSet = paint_context_.guest_output_descriptor_sets
+                                 [PaintContext::
+                                      kGuestOutputDescriptorSetReShadeSampled];
+              write.dstBinding = 0;
+              write.dstArrayElement = 0;
+              write.descriptorCount = 1;
+              write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+              write.pImageInfo = &image_info;
+              write.pBufferInfo = nullptr;
+              write.pTexelBufferView = nullptr;
+              dfn.vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+            }
+          }
+          if (reshade_output_image_) {
+            reshade_output_last_submission_ = current_paint_submission_index;
+            VkExtent2D rs_extent{rs_width, rs_height};
+            if (reshade_->Render(draw_command_buffer, *reshade_effect_,
+                                 guest_output_image->view(),
+                                 reshade_output_image_->image(),
+                                 reshade_output_image_->view(), rs_extent)) {
+              reshade_source = true;
+            } else {
+              XELOGE("VulkanPresenter: ReShade render failed, disabling it");
+              reshade_failed_ = true;
+            }
+          }
+        }
+
         for (size_t i = 0; i < guest_output_flow.effect_count; ++i) {
           bool is_final_effect = i + 1 >= guest_output_flow.effect_count;
 
@@ -1990,6 +2053,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
             effect_src_descriptor_set = PaintContext::GuestOutputDescriptorSet(
                 PaintContext::kGuestOutputDescriptorSetIntermediate0Sampled +
                 (i - 1));
+          } else if (reshade_source) {
+            effect_src_descriptor_set =
+                PaintContext::kGuestOutputDescriptorSetReShadeSampled;
           } else {
             effect_src_descriptor_set = PaintContext::GuestOutputDescriptorSet(
                 PaintContext::kGuestOutputDescriptorSetGuestOutput0Sampled +
@@ -2288,14 +2354,17 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
   }
 
   if (!cvars::reshade_effect.empty()) {
-    // Work in progress (notes/72): compile the effect and log its reflected
-    // module. The runtime that executes the passes is not wired up yet.
-    VulkanReShade reshade(vulkan_device_);
-    auto effect = reshade.CompileEffect(cvars::reshade_effect, 2560, 1440);
-    if (effect) {
-      for (const auto& u : effect->uniforms) {
-        XELOGI("VulkanReShade:   control '{}' (type '{}', {}..{})",
-               u.ui_label, u.ui_type, u.ui_min, u.ui_max);
+    reshade_ = std::make_unique<VulkanReShade>(vulkan_device_);
+    reshade_effect_ =
+        reshade_->CompileEffect(cvars::reshade_effect, 1280, 720);
+    if (reshade_effect_) {
+      const VkSampler sampler =
+          ui_samplers_->samplers()[UISamplers::kSamplerIndexLinearClampToEdge];
+      if (reshade_->CreateRuntime(*reshade_effect_, kGuestOutputFormat,
+                                  sampler)) {
+        reshade_effect_->enabled = true;
+      } else {
+        reshade_effect_.reset();
       }
     }
   }

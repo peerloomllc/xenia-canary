@@ -68,7 +68,7 @@ std::unique_ptr<VulkanReShade::Effect> VulkanReShade::CompileEffect(
 
   std::unique_ptr<reshadefx::codegen> backend(reshadefx::create_codegen_spirv(
       /*vulkan_semantics=*/true, /*debug_info=*/false, /*spec_constants=*/false,
-      /*invert_y_axis=*/false));
+      /*invert_y_axis=*/true));
 
   reshadefx::parser parser;
   if (!parser.parse(pp.output(), backend.get())) {
