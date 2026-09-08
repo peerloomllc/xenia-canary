@@ -224,6 +224,23 @@ else()
   set(XE_HAS_NVIDIA_DLSS OFF CACHE INTERNAL "NVIDIA DLSS SDK available")
 endif()
 
+# reshade-fx (BSD-3-Clause: ReShade FX shader compiler -> SPIR-V, for the
+# native ReShade-style post-process runtime in the Vulkan presenter)
+# ==============================================================================
+add_library(reshade-fx STATIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/reshade-fx/effect_lexer.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/reshade-fx/effect_preprocessor.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/reshade-fx/effect_parser_exp.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/reshade-fx/effect_parser_stmt.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/reshade-fx/effect_symbol_table.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/reshade-fx/effect_expression.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/reshade-fx/effect_codegen_spirv.cpp)
+target_include_directories(reshade-fx PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/reshade-fx)
+target_include_directories(reshade-fx PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/reshade-fx/include)
+set_target_properties(reshade-fx PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # snappy
 # ==============================================================================
 # Generate snappy-stubs-public.h if missing
