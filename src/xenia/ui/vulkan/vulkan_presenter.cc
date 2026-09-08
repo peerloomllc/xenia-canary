@@ -1841,6 +1841,16 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
               guest_output_flow.properties.frontbuffer_width;
           const uint32_t rs_load_h =
               guest_output_flow.properties.frontbuffer_height;
+          if (reshade_effect_ && (reshade_effect_->width != rs_load_w ||
+                                  reshade_effect_->height != rs_load_h)) {
+            // BUFFER_WIDTH/HEIGHT and the effect's render-target textures are
+            // baked at compile time; recompile for the new guest output size.
+            std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+            if (!reshade_request_pending_ && !reshade_current_path_.empty()) {
+              reshade_requested_path_ = reshade_current_path_;
+              reshade_request_pending_ = true;
+            }
+          }
           ApplyPendingReShadeRequest(rs_load_w, rs_load_h);
         }
         if (reshade_ && reshade_effect_ && reshade_effect_->enabled &&

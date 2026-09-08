@@ -60,10 +60,36 @@ class VulkanReShade {
     uint32_t sampler_count = 0;
     // The texture (unique) name each sampler slot references, in slot order.
     std::vector<std::string> sampler_texture_names;
+    // The effect-owned textures this pass renders to, in attachment order.
+    // Empty = the pass writes the backbuffer (the effect's output chain).
+    std::vector<std::string> render_target_names;
+    bool clear_render_targets = false;
+    // Fixed-function state reflected from the FX pass (attachment 0's blend
+    // is applied to every attachment slot below).
+    bool blend_enable = false;
+    VkBlendFactor src_color_factor = VK_BLEND_FACTOR_ONE;
+    VkBlendFactor dst_color_factor = VK_BLEND_FACTOR_ZERO;
+    VkBlendOp color_op = VK_BLEND_OP_ADD;
+    VkBlendFactor src_alpha_factor = VK_BLEND_FACTOR_ONE;
+    VkBlendFactor dst_alpha_factor = VK_BLEND_FACTOR_ZERO;
+    VkBlendOp alpha_op = VK_BLEND_OP_ADD;
+    VkColorComponentFlags color_write_mask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    uint32_t num_vertices = 3;
+    // Render area for a render-target pass (the targets' size); 0 = the
+    // effect output extent (backbuffer passes).
+    uint32_t viewport_width = 0;
+    uint32_t viewport_height = 0;
     // Vulkan runtime objects (created by CreateRuntime).
     VkShaderModule vs_module = VK_NULL_HANDLE;
     VkShaderModule ps_module = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    VkRenderPass render_pass = VK_NULL_HANDLE;
+    // Stable framebuffer for a render-target pass (its attachments are the
+    // effect's own images); backbuffer passes use per-frame transient ones.
+    VkFramebuffer framebuffer = VK_NULL_HANDLE;
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
     VkDescriptorSet sampler_descriptor_set = VK_NULL_HANDLE;
   };
@@ -75,6 +101,12 @@ class VulkanReShade {
     std::string source_file;  // absolute path if loaded from a file
     bool is_backbuffer = false;
     bool is_depth = false;
+    // A pass renders into this texture (created as a color attachment that
+    // later passes sample).
+    bool is_render_target = false;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
@@ -84,6 +116,10 @@ class VulkanReShade {
     std::string name;
     std::string path;
     bool enabled = false;
+    // Output size the effect was compiled for (BUFFER_WIDTH/HEIGHT are baked
+    // into the shader, and the render-target textures are sized from them).
+    uint32_t width = 0;
+    uint32_t height = 0;
     std::vector<Uniform> uniforms;
     std::vector<Pass> passes;
     std::vector<Texture> textures;
@@ -93,15 +129,22 @@ class VulkanReShade {
     VkDescriptorSetLayout set_layout_ubo = VK_NULL_HANDLE;
     VkDescriptorSetLayout set_layout_samplers = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
-    VkRenderPass render_pass = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkBuffer uniform_buffer = VK_NULL_HANDLE;
     VkDeviceMemory uniform_memory = VK_NULL_HANDLE;
     void* uniform_mapped = nullptr;
     VkFormat format = VK_FORMAT_UNDEFINED;
-    // Framebuffer from the most recent Render; destroyed on the next Render or
-    // teardown (the presenter awaits prior submissions before reusing images).
-    VkFramebuffer framebuffer = VK_NULL_HANDLE;
+    // Ping-pong partner for the presenter's output image when more than one
+    // pass writes the backbuffer: passes alternate between the two so each
+    // one can sample the previous result, with the last landing on the
+    // presenter's output.
+    VkImage chain_image = VK_NULL_HANDLE;
+    VkDeviceMemory chain_memory = VK_NULL_HANDLE;
+    VkImageView chain_view = VK_NULL_HANDLE;
+    // Backbuffer-pass framebuffers from the most recent Render; destroyed on
+    // the next Render or teardown (the presenter awaits prior submissions
+    // before reusing images).
+    std::vector<VkFramebuffer> transient_framebuffers;
     bool runtime_ready = false;
   };
 
@@ -121,8 +164,9 @@ class VulkanReShade {
 
   // Records the effect's passes: samples `input_view` (guest output, in
   // SHADER_READ_ONLY_OPTIMAL) and writes `output` (in COLOR_ATTACHMENT via a
-  // framebuffer, left in SHADER_READ_ONLY_OPTIMAL). A transient framebuffer is
-  // created and destroyed around the recording.
+  // framebuffer, left in SHADER_READ_ONLY_OPTIMAL). Render-target passes
+  // write the effect's own textures; backbuffer passes ping-pong between the
+  // output and the chain image, the last one landing on the output.
   bool Render(VkCommandBuffer command_buffer, Effect& effect,
               VkImageView input_view, VkImage output_image,
               VkImageView output_view, VkExtent2D extent);
