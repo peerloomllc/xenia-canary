@@ -64,6 +64,7 @@ class EmulatorWindow {
     kLoadState,
     kNextSlot,
     kPrevSlot,
+    kToggleReShade,
     kCount
   };
 
@@ -514,6 +515,14 @@ class EmulatorWindow {
   void SetSaveStateDir(const std::filesystem::path& dir);
   void PickReShadeShaderDir();
   void PickReShadePresetDir();  // folder picker for the ReShade overlay
+  void ToggleReShadeEffect();   // enable/disable the active effect (hotkey)
+  // Default ReShade folder next to the content/games folders (the content
+  // folder's parent), e.g. <.../Xenia>/reshade-shaders. `leaf` is the
+  // folder name.
+  std::filesystem::path ReShadeDefaultDir(const char* leaf) const;
+  // On first run, copy the bundled curated shaders (next to the executable)
+  // into the default shader folder if it has none yet.
+  void SeedReShadeShaders();
   static size_t CountSaveStateFiles(const std::filesystem::path& dir);
   // Deletes a slot's .sav and its .png thumbnail. Reports what happened in a
   // notification; a slot with no file is left alone.
