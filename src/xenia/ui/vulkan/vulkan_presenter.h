@@ -490,6 +490,10 @@ class VulkanPresenter final : public Presenter {
   void SetReShadeEffectPathFromUIThread(const std::string& path) override;
   void SetReShadePresetFileFromUIThread(const std::string& file) override;
   void SaveReShadePresetFromUIThread() override;
+  std::string GetReShadePresetDirFromUIThread() const override;
+  void SetReShadePresetDirFromUIThread(const std::string& dir) override;
+  void LoadReShadePresetFileFromUIThread(const std::string& file) override;
+  void SaveReShadePresetToFileFromUIThread(const std::string& file) override;
 
   VulkanDevice* vulkan_device_;
   const UISamplers* ui_samplers_;
@@ -528,6 +532,13 @@ class VulkanPresenter final : public Presenter {
   // Writes the preset file from the current control state; `shader_path` is
   // the shader to record (the current one, or the one just requested).
   void SaveReShadePresetWithShader(const std::string& shader_path);
+  // Writes the current configuration to an arbitrary preset file.
+  void WriteReShadePresetFile(const std::string& file,
+                              const std::string& shader_path);
+  // Parses a preset file; returns false if it cannot be read.
+  static bool ParseReShadePresetFile(
+      const std::string& file, std::string& shader_path, bool& enabled,
+      std::vector<std::pair<std::string, std::array<float, 4>>>& values);
   // Loads/unloads the requested ReShade shader; call only from the paint
   // thread (creates/destroys GPU objects, awaits in-flight submissions).
   void ApplyPendingReShadeRequest(uint32_t width, uint32_t height);

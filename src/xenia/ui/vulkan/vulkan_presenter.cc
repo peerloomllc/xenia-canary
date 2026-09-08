@@ -59,6 +59,11 @@ DEFINE_string(
     "(experimental, work in progress). Empty to disable.",
     "Vulkan");
 DEFINE_string(
+    reshade_preset_dir, "",
+    "Folder the ReShade overlay lists preset files from and saves new ones "
+    "into. Empty falls back to <storage root>/reshade_presets.",
+    "GPU");
+DEFINE_string(
     reshade_shader_dir, "",
     "Directory the ReShade overlay's shader browser lists .fx files from. "
     "Empty falls back to the folder of --reshade_effect.",
@@ -3006,21 +3011,13 @@ void VulkanPresenter::SetReShadeEffectPathFromUIThread(
   SaveReShadePresetWithShader(path);
 }
 
-void VulkanPresenter::SetReShadePresetFileFromUIThread(
-    const std::string& file) {
-  reshade_preset_file_ = file;
-  if (file.empty()) {
-    return;
-  }
+bool VulkanPresenter::ParseReShadePresetFile(
+    const std::string& file, std::string& shader_path, bool& enabled,
+    std::vector<std::pair<std::string, std::array<float, 4>>>& values) {
   std::ifstream stream(file);
   if (!stream) {
-    // No preset for this title yet; keep whatever is loaded, and the first
-    // change writes the file.
-    return;
+    return false;
   }
-  std::string shader_path;
-  bool enabled = true;
-  std::vector<std::pair<std::string, std::array<float, 4>>> values;
   std::string line;
   while (std::getline(stream, line)) {
     std::istringstream tokens(line);
@@ -3050,6 +3047,23 @@ void VulkanPresenter::SetReShadePresetFileFromUIThread(
       }
     }
   }
+  return true;
+}
+
+void VulkanPresenter::SetReShadePresetFileFromUIThread(
+    const std::string& file) {
+  reshade_preset_file_ = file;
+  if (file.empty()) {
+    return;
+  }
+  std::string shader_path;
+  bool enabled = true;
+  std::vector<std::pair<std::string, std::array<float, 4>>> values;
+  if (!ParseReShadePresetFile(file, shader_path, enabled, values)) {
+    // No preset for this title yet; keep whatever is loaded, and the first
+    // change writes the file.
+    return;
+  }
   XELOGI("VulkanPresenter: applying ReShade preset '{}' (shader '{}')", file,
          shader_path);
   std::lock_guard<std::mutex> lock(reshade_control_mutex_);
@@ -3057,6 +3071,51 @@ void VulkanPresenter::SetReShadePresetFileFromUIThread(
   reshade_request_pending_ = true;
   reshade_pending_values_ = std::move(values);
   reshade_pending_enabled_ = enabled;
+}
+
+void VulkanPresenter::LoadReShadePresetFileFromUIThread(
+    const std::string& file) {
+  std::string shader_path;
+  bool enabled = true;
+  std::vector<std::pair<std::string, std::array<float, 4>>> values;
+  if (!ParseReShadePresetFile(file, shader_path, enabled, values)) {
+    XELOGW("VulkanPresenter: could not read the ReShade preset '{}'", file);
+    return;
+  }
+  XELOGI("VulkanPresenter: loading ReShade preset '{}' (shader '{}')", file,
+         shader_path);
+  {
+    std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+    reshade_requested_path_ = shader_path;
+    reshade_request_pending_ = true;
+    reshade_pending_values_ = std::move(values);
+    reshade_pending_enabled_ = enabled;
+  }
+  // The loaded preset becomes the running title's remembered state too
+  // (same file format, so a straight copy).
+  if (!reshade_preset_file_.empty() && reshade_preset_file_ != file) {
+    std::error_code ec;
+    std::filesystem::create_directories(
+        std::filesystem::path(reshade_preset_file_).parent_path(), ec);
+    std::filesystem::copy_file(
+        file, reshade_preset_file_,
+        std::filesystem::copy_options::overwrite_existing, ec);
+  }
+}
+
+void VulkanPresenter::SaveReShadePresetToFileFromUIThread(
+    const std::string& file) {
+  WriteReShadePresetFile(file, GetReShadeCurrentPathFromUIThread());
+}
+
+std::string VulkanPresenter::GetReShadePresetDirFromUIThread() const {
+  return cvars::reshade_preset_dir;
+}
+
+void VulkanPresenter::SetReShadePresetDirFromUIThread(
+    const std::string& dir) {
+  cvars::reshade_preset_dir = dir;
+  config::SaveConfig();
 }
 
 void VulkanPresenter::SaveReShadePresetFromUIThread() {
@@ -3068,6 +3127,11 @@ void VulkanPresenter::SaveReShadePresetWithShader(
   if (reshade_preset_file_.empty()) {
     return;
   }
+  WriteReShadePresetFile(reshade_preset_file_, shader_path);
+}
+
+void VulkanPresenter::WriteReShadePresetFile(const std::string& file,
+                                             const std::string& shader_path) {
   bool fresh_selection = true;
   std::vector<ReShadeUniformControl> controls;
   if (!shader_path.empty()) {
@@ -3085,11 +3149,10 @@ void VulkanPresenter::SaveReShadePresetWithShader(
       fresh_selection || !reshade_effect_ || reshade_effect_->enabled;
   std::error_code ec;
   std::filesystem::create_directories(
-      std::filesystem::path(reshade_preset_file_).parent_path(), ec);
-  std::ofstream stream(reshade_preset_file_, std::ios::trunc);
+      std::filesystem::path(file).parent_path(), ec);
+  std::ofstream stream(file, std::ios::trunc);
   if (!stream) {
-    XELOGW("VulkanPresenter: could not write the ReShade preset '{}'",
-           reshade_preset_file_);
+    XELOGW("VulkanPresenter: could not write the ReShade preset '{}'", file);
     return;
   }
   stream << "shader = " << shader_path << "\n";

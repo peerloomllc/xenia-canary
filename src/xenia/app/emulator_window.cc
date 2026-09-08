@@ -2159,6 +2159,27 @@ void EmulatorWindow::DeleteSaveStateSlot(int slot) {
   new xe::ui::HostNotificationWindow(imgui_drawer(), "Save state", text, 0);
 }
 
+void EmulatorWindow::PickReShadePresetDir() {
+  auto picker = xe::ui::FilePicker::Create();
+  picker->set_mode(ui::FilePicker::Mode::kOpen);
+  picker->set_type(ui::FilePicker::Type::kDirectory);
+  picker->set_multi_selection(false);
+  picker->set_title("Select the ReShade preset folder");
+  if (!picker->Show(window_.get())) {
+    return;
+  }
+  auto selected = picker->selected_files();
+  if (selected.empty() || selected[0].empty()) {
+    return;
+  }
+  gpu::GraphicsSystem* graphics_system = emulator_->graphics_system();
+  ui::Presenter* presenter =
+      graphics_system ? graphics_system->presenter() : nullptr;
+  if (presenter) {
+    presenter->SetReShadePresetDirFromUIThread(selected[0].string());
+  }
+}
+
 void EmulatorWindow::PickReShadeShaderDir() {
   auto picker = xe::ui::FilePicker::Create();
   picker->set_mode(ui::FilePicker::Mode::kOpen);
@@ -3012,7 +3033,7 @@ void EmulatorWindow::ReShadeOverlayDialog::OnDraw(ImGuiIO& io) {
   }
 
   ImGui::SetNextWindowPos(ImVec2(20.0f, 20.0f), ImGuiCond_FirstUseEver);
-  ImGui::SetNextWindowSize(ImVec2(360.0f, 420.0f), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(380.0f, 640.0f), ImGuiCond_FirstUseEver);
   bool open = true;
   if (!ImGui::Begin("ReShade", &open, ImGuiWindowFlags_NoSavedSettings)) {
     ImGui::End();
@@ -3091,6 +3112,75 @@ void EmulatorWindow::ReShadeOverlayDialog::OnDraw(ImGuiIO& io) {
     }
     ImGui::EndListBox();
   }
+  ImGui::Separator();
+
+  // Named presets: a folder of preset files; clicking one loads it, Save
+  // writes the current configuration under the typed name.
+  std::string preset_dir = presenter->GetReShadePresetDirFromUIThread();
+  if (preset_dir.empty()) {
+    preset_dir = (emulator_window_.emulator_->storage_root() /
+                  "reshade_presets")
+                     .string();
+  }
+  if (!preset_dir_buffer_initialized_) {
+    std::snprintf(preset_dir_buffer_, sizeof(preset_dir_buffer_), "%s",
+                  preset_dir.c_str());
+    preset_dir_buffer_initialized_ = true;
+  }
+  ImGui::TextUnformatted("Preset folder:");
+  ImGui::SetNextItemWidth(-70.0f);
+  bool apply_preset_dir = ImGui::InputText(
+      "##rs_presetdir", preset_dir_buffer_, sizeof(preset_dir_buffer_),
+      ImGuiInputTextFlags_EnterReturnsTrue);
+  ImGui::SameLine();
+  if (ImGui::Button("Set##rs_setpresetdir")) {
+    apply_preset_dir = true;
+  }
+  if (apply_preset_dir) {
+    presenter->SetReShadePresetDirFromUIThread(preset_dir_buffer_);
+  }
+  if (ImGui::Button("Browse...##rs_presetbrowse")) {
+    EmulatorWindow& ew = emulator_window_;
+    ew.app_context().CallInUIThreadDeferred(
+        [&ew]() { ew.PickReShadePresetDir(); });
+  }
+  ImGui::TextUnformatted("Presets (click to load):");
+  if (ImGui::BeginListBox("##rs_presets", ImVec2(-FLT_MIN, 80.0f))) {
+    std::error_code ec;
+    std::vector<std::filesystem::path> preset_files;
+    for (std::filesystem::directory_iterator it(preset_dir, ec), end;
+         it != end && !ec; it.increment(ec)) {
+      if (it->is_regular_file(ec) && it->path().extension() == ".txt") {
+        preset_files.push_back(it->path());
+      }
+    }
+    std::sort(preset_files.begin(), preset_files.end());
+    for (const auto& preset : preset_files) {
+      const std::string name = preset.stem().string();
+      if (ImGui::Selectable((name + "##rs_preset_" + name).c_str(), false)) {
+        presenter->LoadReShadePresetFileFromUIThread(preset.string());
+      }
+    }
+    ImGui::EndListBox();
+  }
+  ImGui::SetNextItemWidth(-70.0f);
+  bool save_preset = ImGui::InputText(
+      "##rs_presetname", preset_name_buffer_, sizeof(preset_name_buffer_),
+      ImGuiInputTextFlags_EnterReturnsTrue);
+  ImGui::SameLine();
+  if (ImGui::Button("Save##rs_savepreset")) {
+    save_preset = true;
+  }
+  if (save_preset && preset_name_buffer_[0]) {
+    std::filesystem::path preset_path =
+        std::filesystem::path(preset_dir) / preset_name_buffer_;
+    if (preset_path.extension() != ".txt") {
+      preset_path += ".txt";
+    }
+    presenter->SaveReShadePresetToFileFromUIThread(preset_path.string());
+  }
+  ImGui::SameLine();
+  ImGui::TextDisabled("name");
   ImGui::Separator();
 
   if (!presenter->IsReShadeEffectLoaded()) {

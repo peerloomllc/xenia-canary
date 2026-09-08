@@ -290,6 +290,9 @@ class EmulatorWindow {
     EmulatorWindow& emulator_window_;
     char shader_dir_buffer_[1024] = {};
     bool shader_dir_buffer_initialized_ = false;
+    char preset_dir_buffer_[1024] = {};
+    bool preset_dir_buffer_initialized_ = false;
+    char preset_name_buffer_[256] = {};
   };
   void ToggleReShadeOverlay();
   std::unique_ptr<ReShadeOverlayDialog> reshade_overlay_dialog_;
@@ -509,7 +512,8 @@ class EmulatorWindow {
   // Folder setting (cvar save_state_dir, "" = <storage root>/savestates).
   void PickSaveStateDir();  // folder picker; call from the UI loop
   void SetSaveStateDir(const std::filesystem::path& dir);
-  void PickReShadeShaderDir();  // folder picker for the ReShade overlay
+  void PickReShadeShaderDir();
+  void PickReShadePresetDir();  // folder picker for the ReShade overlay
   static size_t CountSaveStateFiles(const std::filesystem::path& dir);
   // Deletes a slot's .sav and its .png thumbnail. Reports what happened in a
   // notification; a slot with no file is left alone.

@@ -405,6 +405,14 @@ class Presenter {
   // Writes the current shader/enabled/values to the preset file now (the
   // overlay calls this when a slider edit completes).
   virtual void SaveReShadePresetFromUIThread() {}
+  // Named presets: the folder the overlay lists preset files from (persisted
+  // to the config), loading one applies it (and it becomes the running
+  // title's remembered state), and saving writes the current configuration
+  // to the given file.
+  virtual std::string GetReShadePresetDirFromUIThread() const { return {}; }
+  virtual void SetReShadePresetDirFromUIThread(const std::string& dir) {}
+  virtual void LoadReShadePresetFileFromUIThread(const std::string& file) {}
+  virtual void SaveReShadePresetToFileFromUIThread(const std::string& file) {}
   // The implementation must be callable from any thread, including from
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.
