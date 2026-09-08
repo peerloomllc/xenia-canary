@@ -68,7 +68,7 @@ std::unique_ptr<VulkanReShade::Effect> VulkanReShade::CompileEffect(
 
   std::unique_ptr<reshadefx::codegen> backend(reshadefx::create_codegen_spirv(
       /*vulkan_semantics=*/true, /*debug_info=*/false, /*spec_constants=*/false,
-      /*invert_y_axis=*/true));
+      /*invert_y_axis=*/false));
 
   reshadefx::parser parser;
   if (!parser.parse(pp.output(), backend.get())) {
@@ -509,8 +509,11 @@ bool VulkanReShade::Render(VkCommandBuffer command_buffer, Effect& effect,
   rp_bi.renderArea.extent = extent;
   dfn.vkCmdBeginRenderPass(command_buffer, &rp_bi,
                            VK_SUBPASS_CONTENTS_INLINE);
-  VkViewport viewport = {0.0f, 0.0f, float(extent.width), float(extent.height),
-                         0.0f, 1.0f};
+  // Flip Y with a negative-height viewport: ReShade's fullscreen vertex shader
+  // targets Direct3D clip space, so without this the output is vertically
+  // mirrored under Vulkan (confirmed with a UV probe).
+  VkViewport viewport = {0.0f, float(extent.height), float(extent.width),
+                         -float(extent.height), 0.0f, 1.0f};
   VkRect2D scissor = {{0, 0}, extent};
   dfn.vkCmdSetViewport(command_buffer, 0, 1, &viewport);
   dfn.vkCmdSetScissor(command_buffer, 0, 1, &scissor);
