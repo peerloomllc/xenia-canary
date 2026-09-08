@@ -94,8 +94,15 @@ bool GtkFilePicker::Show(Window* parent_window) {
         size_t end = patterns.find(';', start);
         if (end == std::string::npos) end = patterns.size();
         if (end > start) {
-          gtk_file_filter_add_pattern(
-              filter, patterns.substr(start, end - start).c_str());
+          std::string pattern = patterns.substr(start, end - start);
+          // GTK glob "*.*" matches only names containing a dot, so the
+          // Windows-idiom "all files" filter hides extensionless files -
+          // e.g. Xbox content packages, whose names are a bare content-id
+          // hash. Map it to "*", which matches everything.
+          if (pattern == "*.*") {
+            pattern = "*";
+          }
+          gtk_file_filter_add_pattern(filter, pattern.c_str());
         }
         start = end + 1;
       }
