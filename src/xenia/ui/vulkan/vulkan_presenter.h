@@ -11,6 +11,7 @@
 #define XENIA_UI_VULKAN_VULKAN_PRESENTER_H_
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -167,6 +168,10 @@ class VulkanPresenter final : public Presenter {
                                    VkFormat format);
   // The view of the depth image (color aspect), for use as a render target.
   VkImageView GetReShadeDepthView() const { return reshade_depth_view_; }
+  // CP thread, at swap: last frame's depth-buffer candidates for the UI,
+  // and the current manual choice for the render target cache.
+  void SetReShadeDepthBufferList(std::vector<ReShadeDepthBufferInfo>&& list);
+  int GetReShadeDepthBufferChoice() const;
   // Marks whether the depth image holds valid scene depth for this frame.
   // Set true only after the submission that writes the image has been
   // submitted to the queue (see reshade_depth_mutex_).
@@ -515,6 +520,16 @@ class VulkanPresenter final : public Presenter {
   void SetReShadePresetDirFromUIThread(const std::string& dir) override;
   void LoadReShadePresetFileFromUIThread(const std::string& file) override;
   void SaveReShadePresetToFileFromUIThread(const std::string& file) override;
+  std::vector<ReShadeDepthBufferInfo> GetReShadeDepthBuffersFromUIThread()
+      override;
+  int GetReShadeDepthBufferChoiceFromUIThread() const override;
+  void SetReShadeDepthBufferChoiceFromUIThread(int choice) override;
+  bool GetReShadeDepthEnabledFromUIThread() const override;
+  void SetReShadeDepthEnabledFromUIThread(bool enabled) override;
+  bool GetReShadeDepthReversedFromUIThread() const override;
+  bool GetReShadeDepthUpsideDownFromUIThread() const override;
+  void SetReShadeDepthOrientationFromUIThread(bool reversed,
+                                              bool upside_down) override;
 
   VulkanDevice* vulkan_device_;
   const UISamplers* ui_samplers_;
@@ -569,6 +584,12 @@ class VulkanPresenter final : public Presenter {
     uint64_t paint_submission = 0;
   };
   std::vector<ReShadeRetiredDepthImage> reshade_depth_retired_;
+  // Set by the UI thread when the depth orientation changes; the paint
+  // thread applies the new convention and recompiles the depth effects.
+  std::atomic<bool> reshade_convention_dirty_{false};
+  // Last frame's depth-buffer candidates, published by the CP at swap and
+  // read by the overlay. Guarded by reshade_depth_mutex_.
+  std::vector<ReShadeDepthBufferInfo> reshade_depth_buffer_list_;
   std::mutex reshade_control_mutex_;
   // UI-desired stack: the UI thread edits this, the paint thread reconciles
   // reshade_stack_ to match (compile new, drop removed, reorder, apply

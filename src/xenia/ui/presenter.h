@@ -432,6 +432,34 @@ class Presenter {
   virtual void SetReShadePresetDirFromUIThread(const std::string& dir) {}
   virtual void LoadReShadePresetFileFromUIThread(const std::string& file) {}
   virtual void SaveReShadePresetToFileFromUIThread(const std::string& file) {}
+  // Depth feed (--reshade_depth): one guest depth buffer scene passes wrote
+  // last frame, for the overlay's manual depth-buffer picker.
+  struct ReShadeDepthBufferInfo {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t samples = 1;
+    uint32_t passes = 0;
+    // The buffer the feed actually captured last frame.
+    bool picked = false;
+  };
+  virtual std::vector<ReShadeDepthBufferInfo>
+  GetReShadeDepthBuffersFromUIThread() {
+    return {};
+  }
+  // Manual depth-buffer choice: -1 = auto (largest scene depth), >= 0 = the
+  // listed ordinal. Persisted to the config.
+  virtual int GetReShadeDepthBufferChoiceFromUIThread() const { return -1; }
+  virtual void SetReShadeDepthBufferChoiceFromUIThread(int choice) {}
+  // Depth feed on/off (--reshade_depth). Live; persisted to the config.
+  virtual bool GetReShadeDepthEnabledFromUIThread() const { return false; }
+  virtual void SetReShadeDepthEnabledFromUIThread(bool enabled) {}
+  // Depth orientation (--reshade_depth_reversed / _upside_down). Baked into
+  // the shaders at compile, so a change recompiles the loaded depth effects.
+  // Persisted to the config.
+  virtual bool GetReShadeDepthReversedFromUIThread() const { return true; }
+  virtual bool GetReShadeDepthUpsideDownFromUIThread() const { return false; }
+  virtual void SetReShadeDepthOrientationFromUIThread(bool reversed,
+                                                      bool upside_down) {}
   // The implementation must be callable from any thread, including from
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.

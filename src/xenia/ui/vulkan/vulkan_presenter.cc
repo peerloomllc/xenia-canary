@@ -86,6 +86,13 @@ DEFINE_bool(
     "Flip the guest depth buffer vertically for ReShade "
     "(RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN).",
     "GPU");
+DEFINE_int32(
+    reshade_depth_buffer, -1,
+    "Which guest depth buffer the ReShade depth feed captures: -1 picks "
+    "automatically (the largest depth a colour+depth scene pass wrote), 0 "
+    "and up pick the Nth depth buffer scene passes used in the frame (the "
+    "overlay's depth buffer list shows them).",
+    "GPU");
 DEFINE_bool(
     vulkan_semaphore_reuse_workaround, false,
     "Wait for presentation queue idle before each frame to prevent semaphore "
@@ -3274,8 +3281,22 @@ std::string VulkanPresenter::GetReShadeShaderDirFromUIThread() const {
   return {};
 }
 
+namespace {
+// Persists a cvar to the config file. Assigning cvars::x only updates the
+// live value; the config writer serializes the ConfigVar's config_value_,
+// so a UI change must go through SetConfigValue (which also refreshes the
+// live value) to survive a restart.
+template <typename T>
+void PersistCvar(cvar::IConfigVar* var, const T& value) {
+  auto* typed = dynamic_cast<cvar::ConfigVar<T>*>(var);
+  if (typed) {
+    typed->SetConfigValue(value);
+  }
+}
+}  // namespace
+
 void VulkanPresenter::SetReShadeShaderDirFromUIThread(const std::string& dir) {
-  cvars::reshade_shader_dir = dir;
+  PersistCvar<std::string>(cv::cv_reshade_shader_dir, dir);
   config::SaveConfig();
 }
 
@@ -3284,8 +3305,60 @@ std::string VulkanPresenter::GetReShadePresetDirFromUIThread() const {
 }
 
 void VulkanPresenter::SetReShadePresetDirFromUIThread(const std::string& dir) {
-  cvars::reshade_preset_dir = dir;
+  PersistCvar<std::string>(cv::cv_reshade_preset_dir, dir);
   config::SaveConfig();
+}
+
+std::vector<Presenter::ReShadeDepthBufferInfo>
+VulkanPresenter::GetReShadeDepthBuffersFromUIThread() {
+  std::lock_guard<std::mutex> lock(reshade_depth_mutex_);
+  return reshade_depth_buffer_list_;
+}
+
+int VulkanPresenter::GetReShadeDepthBufferChoiceFromUIThread() const {
+  return cvars::reshade_depth_buffer;
+}
+
+void VulkanPresenter::SetReShadeDepthBufferChoiceFromUIThread(int choice) {
+  PersistCvar<int32_t>(cv::cv_reshade_depth_buffer, choice);
+  config::SaveConfig();
+}
+
+bool VulkanPresenter::GetReShadeDepthEnabledFromUIThread() const {
+  return cvars::reshade_depth;
+}
+
+void VulkanPresenter::SetReShadeDepthEnabledFromUIThread(bool enabled) {
+  PersistCvar<bool>(cv::cv_reshade_depth, enabled);
+  config::SaveConfig();
+}
+
+bool VulkanPresenter::GetReShadeDepthReversedFromUIThread() const {
+  return cvars::reshade_depth_reversed;
+}
+
+bool VulkanPresenter::GetReShadeDepthUpsideDownFromUIThread() const {
+  return cvars::reshade_depth_upside_down;
+}
+
+void VulkanPresenter::SetReShadeDepthOrientationFromUIThread(bool reversed,
+                                                             bool upside_down) {
+  PersistCvar<bool>(cv::cv_reshade_depth_reversed, reversed);
+  PersistCvar<bool>(cv::cv_reshade_depth_upside_down, upside_down);
+  config::SaveConfig();
+  // The convention is baked into the depth shaders at compile; ask the paint
+  // thread to reapply it and recompile the loaded depth effects.
+  reshade_convention_dirty_.store(true);
+}
+
+void VulkanPresenter::SetReShadeDepthBufferList(
+    std::vector<ReShadeDepthBufferInfo>&& list) {
+  std::lock_guard<std::mutex> lock(reshade_depth_mutex_);
+  reshade_depth_buffer_list_ = std::move(list);
+}
+
+int VulkanPresenter::GetReShadeDepthBufferChoice() const {
+  return cvars::reshade_depth_buffer;
 }
 
 // Builds the adjustable controls for a compiled effect and applies any preset
@@ -3348,6 +3421,13 @@ void VulkanPresenter::ApplyReShadeStack(uint32_t width, uint32_t height) {
   if (!reshade_) {
     return;
   }
+  // A depth-orientation change reapplies the convention and forces the depth
+  // effects to recompile (the convention is baked in at compile time).
+  bool convention_changed = reshade_convention_dirty_.exchange(false);
+  if (convention_changed) {
+    reshade_->SetDepthConvention(cvars::reshade_depth_reversed,
+                                 cvars::reshade_depth_upside_down);
+  }
   bool size_mismatch = false;
   for (const ReShadeStackEntry& entry : reshade_stack_) {
     if (entry.effect &&
@@ -3359,15 +3439,17 @@ void VulkanPresenter::ApplyReShadeStack(uint32_t width, uint32_t height) {
   std::vector<ReShadeDesiredEffect> desired;
   {
     std::lock_guard<std::mutex> lock(reshade_control_mutex_);
-    if (!reshade_desired_dirty_ && !size_mismatch) {
+    if (!reshade_desired_dirty_ && !size_mismatch && !convention_changed) {
       return;
     }
     reshade_desired_dirty_ = false;
     desired = reshade_desired_;
   }
 
-  // Does the structure (paths, in order) or the output size differ?
-  bool structural = size_mismatch || desired.size() != reshade_stack_.size();
+  // Does the structure (paths, in order) or the output size differ? A
+  // convention change forces a full rebuild so the depth effects recompile.
+  bool structural = size_mismatch || convention_changed ||
+                    desired.size() != reshade_stack_.size();
   if (!structural) {
     for (size_t i = 0; i < desired.size(); ++i) {
       if (desired[i].path != reshade_stack_[i].path) {
@@ -3389,8 +3471,10 @@ void VulkanPresenter::ApplyReShadeStack(uint32_t width, uint32_t height) {
     for (const ReShadeDesiredEffect& d : desired) {
       ReShadeStackEntry entry;
       entry.path = d.path;
-      // Reuse an already-compiled effect for this path at the right size.
-      for (size_t i = 0; i < old.size(); ++i) {
+      // Reuse an already-compiled effect for this path at the right size,
+      // unless the depth convention just changed (then recompile so the new
+      // orientation is baked in).
+      for (size_t i = 0; i < old.size() && !convention_changed; ++i) {
         if (!reused[i] && old[i].effect && old[i].path == d.path &&
             old[i].effect->width == width &&
             old[i].effect->height == height) {

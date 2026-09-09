@@ -3317,6 +3317,85 @@ void EmulatorWindow::ReShadeOverlayDialog::OnDraw(ImGuiIO& io) {
   }
   ImGui::Separator();
 
+  // Depth feed on/off and orientation (for depth-based effects: AO, DOF,
+  // fog). These mirror --reshade_depth and the depth convention flags and
+  // are persisted to the config.
+  {
+    bool depth_enabled = presenter->GetReShadeDepthEnabledFromUIThread();
+    if (ImGui::Checkbox("Depth feed (for AO / DOF / fog)", &depth_enabled)) {
+      presenter->SetReShadeDepthEnabledFromUIThread(depth_enabled);
+    }
+    ImGui::TextDisabled(
+        "Feeds the guest depth buffer to effects that sample DEPTH.");
+    bool reversed = presenter->GetReShadeDepthReversedFromUIThread();
+    bool upside_down = presenter->GetReShadeDepthUpsideDownFromUIThread();
+    bool orientation_changed = false;
+    if (ImGui::Checkbox("Reversed depth (1 = near)", &reversed)) {
+      orientation_changed = true;
+    }
+    if (ImGui::Checkbox("Flip depth vertically", &upside_down)) {
+      orientation_changed = true;
+    }
+    if (orientation_changed) {
+      presenter->SetReShadeDepthOrientationFromUIThread(reversed, upside_down);
+    }
+  }
+
+  // Depth feed: which guest depth buffer the feed captures. The candidates
+  // are what scene passes wrote last frame; Auto takes the largest.
+  {
+    std::vector<ui::Presenter::ReShadeDepthBufferInfo> depth_buffers =
+        presenter->GetReShadeDepthBuffersFromUIThread();
+    int depth_choice = presenter->GetReShadeDepthBufferChoiceFromUIThread();
+    auto depth_buffer_label = [&](int index) {
+      const ui::Presenter::ReShadeDepthBufferInfo& info =
+          depth_buffers[index];
+      std::string label = std::to_string(index) + ": " +
+                          std::to_string(info.width) + "x" +
+                          std::to_string(info.height);
+      if (info.samples > 1) {
+        label += " " + std::to_string(info.samples) + "x MSAA";
+      }
+      label += ", " + std::to_string(info.passes) +
+               (info.passes == 1 ? " pass" : " passes");
+      if (info.picked) {
+        label += " - captured";
+      }
+      return label;
+    };
+    ImGui::TextUnformatted("Depth buffer:");
+    ImGui::SameLine();
+    std::string preview;
+    if (depth_choice < 0) {
+      preview = "Auto";
+    } else if (depth_choice < int(depth_buffers.size())) {
+      preview = depth_buffer_label(depth_choice);
+    } else {
+      preview = std::to_string(depth_choice) + ": (not seen this frame)";
+    }
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::BeginCombo("##rs_depthbuf", preview.c_str())) {
+      if (ImGui::Selectable("Auto (largest scene depth)", depth_choice < 0)) {
+        presenter->SetReShadeDepthBufferChoiceFromUIThread(-1);
+      }
+      for (int i = 0; i < int(depth_buffers.size()); ++i) {
+        if (ImGui::Selectable(
+                (depth_buffer_label(i) + "##rs_depthbuf_" + std::to_string(i))
+                    .c_str(),
+                depth_choice == i)) {
+          presenter->SetReShadeDepthBufferChoiceFromUIThread(i);
+        }
+      }
+      ImGui::EndCombo();
+    }
+    if (depth_buffers.empty()) {
+      ImGui::TextDisabled(
+          "No depth buffers listed - the depth feed is off or no effect "
+          "samples depth.");
+    }
+  }
+  ImGui::Separator();
+
   std::vector<ui::Presenter::ReShadeEffectInfo> stack =
       presenter->GetReShadeStackFromUIThread();
   if (stack.empty()) {

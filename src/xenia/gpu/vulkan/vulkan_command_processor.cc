@@ -2088,7 +2088,33 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
           if (reshade_presenter && !depth_fed) {
             reshade_presenter->SetReShadeDepthValid(false);
           }
+          // The manual depth-buffer choice for next frame's snapshots.
+          render_target_cache_->SetReShadeDepthBufferChoice(
+              depth_wanted && reshade_presenter
+                  ? reshade_presenter->GetReShadeDepthBufferChoice()
+                  : -1);
           render_target_cache_->ResetReShadeDepthSnapshot();
+          // Publish this frame's depth-buffer candidates for the overlay's
+          // picker.
+          if (reshade_presenter && depth_wanted) {
+            const auto& candidates =
+                render_target_cache_->GetReShadeDepthCandidates();
+            int32_t picked_ordinal =
+                render_target_cache_->GetReShadeDepthSnapshotOrdinal();
+            std::vector<ui::Presenter::ReShadeDepthBufferInfo> buffer_list;
+            buffer_list.reserve(candidates.size());
+            for (size_t i = 0; i < candidates.size(); ++i) {
+              ui::Presenter::ReShadeDepthBufferInfo info;
+              info.width = candidates[i].width;
+              info.height = candidates[i].height;
+              info.samples = candidates[i].samples;
+              info.passes = candidates[i].passes;
+              info.picked = int32_t(i) == picked_ordinal;
+              buffer_list.push_back(info);
+            }
+            reshade_presenter->SetReShadeDepthBufferList(
+                std::move(buffer_list));
+          }
         }
 
         // Need to submit all the commands before giving the image back to the
