@@ -3171,6 +3171,14 @@ void VulkanPresenter::AddReShadeEffectFromUIThread(const std::string& path) {
   }
   {
     std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+    // Clicking a shader that is already in the stack is a no-op (don't add a
+    // duplicate on repeated clicks); to run one twice, load a copy of the .fx
+    // under a different name.
+    for (const ReShadeDesiredEffect& existing : reshade_desired_) {
+      if (existing.path == path) {
+        return;
+      }
+    }
     ReShadeDesiredEffect desired;
     desired.path = path;
     desired.enabled = true;
