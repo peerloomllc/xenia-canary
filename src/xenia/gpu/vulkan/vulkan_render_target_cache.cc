@@ -2378,6 +2378,11 @@ void VulkanRenderTargetCache::DestroyReShadeDepthResolve() {
   const VkDevice device = vulkan_device->device();
   ui::vulkan::util::DestroyAndNullHandle(
       dfn.vkDestroyFramebuffer, device, reshade_depth_resolve_framebuffer_);
+  for (const auto& retired_fb : reshade_depth_resolve_retired_fbs_) {
+    dfn.vkDestroyFramebuffer(device, retired_fb.second, nullptr);
+  }
+  reshade_depth_resolve_retired_fbs_.clear();
+  reshade_depth_resolve_fb_last_submission_ = 0;
   reshade_depth_resolve_fb_view_ = VK_NULL_HANDLE;
   reshade_depth_resolve_fb_width_ = 0;
   reshade_depth_resolve_fb_height_ = 0;
@@ -2427,13 +2432,34 @@ void VulkanRenderTargetCache::RecordReShadeDepthResolve(
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
+  // Destroy retired framebuffers whose last-use submission has completed.
+  uint64_t completed_submission = command_processor_.GetCompletedSubmission();
+  while (!reshade_depth_resolve_retired_fbs_.empty() &&
+         reshade_depth_resolve_retired_fbs_.front().first <=
+             completed_submission) {
+    dfn.vkDestroyFramebuffer(
+        device, reshade_depth_resolve_retired_fbs_.front().second, nullptr);
+    reshade_depth_resolve_retired_fbs_.pop_front();
+  }
+
   // (Re)create the framebuffer for the destination view/size.
   if (reshade_depth_resolve_framebuffer_ == VK_NULL_HANDLE ||
       reshade_depth_resolve_fb_view_ != dst_view ||
       reshade_depth_resolve_fb_width_ != width ||
       reshade_depth_resolve_fb_height_ != height) {
-    ui::vulkan::util::DestroyAndNullHandle(
-        dfn.vkDestroyFramebuffer, device, reshade_depth_resolve_framebuffer_);
+    if (reshade_depth_resolve_framebuffer_ != VK_NULL_HANDLE) {
+      // The old framebuffer may still be referenced by an in-flight
+      // submission; retire it until its last-use submission completes.
+      if (reshade_depth_resolve_fb_last_submission_ <= completed_submission) {
+        dfn.vkDestroyFramebuffer(device, reshade_depth_resolve_framebuffer_,
+                                 nullptr);
+      } else {
+        reshade_depth_resolve_retired_fbs_.emplace_back(
+            reshade_depth_resolve_fb_last_submission_,
+            reshade_depth_resolve_framebuffer_);
+      }
+      reshade_depth_resolve_framebuffer_ = VK_NULL_HANDLE;
+    }
     VkFramebufferCreateInfo fb_ci = {
         VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
     fb_ci.renderPass = reshade_depth_resolve_render_pass_;
@@ -2512,6 +2538,8 @@ void VulkanRenderTargetCache::RecordReShadeDepthResolve(
                              0, nullptr);
   cb.CmdVkDraw(3, 1, 0, 0);
   cb.CmdVkEndRenderPass();
+  reshade_depth_resolve_fb_last_submission_ =
+      command_processor_.GetCurrentSubmission();
 
   // Destination is now in SHADER_READ (render pass finalLayout); restore the
   // source depth RT to its prior layout/usage.

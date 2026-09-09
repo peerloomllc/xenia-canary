@@ -168,7 +168,12 @@ class VulkanPresenter final : public Presenter {
   // The view of the depth image (color aspect), for use as a render target.
   VkImageView GetReShadeDepthView() const { return reshade_depth_view_; }
   // Marks whether the depth image holds valid scene depth for this frame.
-  void SetReShadeDepthValid(bool valid) { reshade_depth_valid_ = valid; }
+  // Set true only after the submission that writes the image has been
+  // submitted to the queue (see reshade_depth_mutex_).
+  void SetReShadeDepthValid(bool valid) {
+    std::lock_guard<std::mutex> lock(reshade_depth_mutex_);
+    reshade_depth_valid_ = valid;
+  }
 
  protected:
   SurfacePaintConnectResult ConnectOrReconnectPaintingToSurfaceFromUIThread(
@@ -539,13 +544,31 @@ class VulkanPresenter final : public Presenter {
   // processor blits the guest scene depth into this image during the guest
   // output refresh (same submission as the color image); a ReShade effect's
   // DEPTH sampler binds it. Written on the CP thread, sampled on the paint
-  // thread - opt-in, so the one-frame staleness risk is acceptable.
+  // thread. reshade_depth_mutex_ guards the image/view/valid handoff and the
+  // retired list. On a size/format change the old image is not destroyed
+  // immediately (an in-flight submission may still sample it): it is
+  // retired, tagged on the paint thread with the next paint submission, and
+  // destroyed once that submission completes (fence completion of a later
+  // batch covers all earlier batches on the queue). reshade_depth_valid_
+  // becomes true only after the CP submission writing the image has been
+  // submitted to the queue, so a paint observing it true is enqueued after
+  // the write.
+  std::mutex reshade_depth_mutex_;
   VkImage reshade_depth_image_ = VK_NULL_HANDLE;
   VkDeviceMemory reshade_depth_memory_ = VK_NULL_HANDLE;
   VkImageView reshade_depth_view_ = VK_NULL_HANDLE;
   VkFormat reshade_depth_format_ = VK_FORMAT_UNDEFINED;
   VkExtent2D reshade_depth_extent_ = {0, 0};
   bool reshade_depth_valid_ = false;
+  struct ReShadeRetiredDepthImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    // Paint submission after whose completion the destroy is safe; 0 until
+    // the paint thread tags the entry.
+    uint64_t paint_submission = 0;
+  };
+  std::vector<ReShadeRetiredDepthImage> reshade_depth_retired_;
   std::mutex reshade_control_mutex_;
   // UI-desired stack: the UI thread edits this, the paint thread reconciles
   // reshade_stack_ to match (compile new, drop removed, reorder, apply

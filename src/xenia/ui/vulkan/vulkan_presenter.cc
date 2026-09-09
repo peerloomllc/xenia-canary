@@ -217,6 +217,19 @@ VulkanPresenter::~VulkanPresenter() {
       dfn_reshade.vkFreeMemory(device_reshade, reshade_depth_memory_, nullptr);
       reshade_depth_memory_ = VK_NULL_HANDLE;
     }
+    // All submissions were awaited above, so retired depth images can go too.
+    for (const ReShadeRetiredDepthImage& retired : reshade_depth_retired_) {
+      if (retired.view != VK_NULL_HANDLE) {
+        dfn_reshade.vkDestroyImageView(device_reshade, retired.view, nullptr);
+      }
+      if (retired.image != VK_NULL_HANDLE) {
+        dfn_reshade.vkDestroyImage(device_reshade, retired.image, nullptr);
+      }
+      if (retired.memory != VK_NULL_HANDLE) {
+        dfn_reshade.vkFreeMemory(device_reshade, retired.memory, nullptr);
+      }
+    }
+    reshade_depth_retired_.clear();
   }
 
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
@@ -377,19 +390,21 @@ VkImage VulkanPresenter::AcquireReShadeDepthImage(uint32_t width,
       (reshade_depth_extent_.width != width ||
        reshade_depth_extent_.height != height ||
        reshade_depth_format_ != format)) {
-    // Size/format changed - wait for the refresher to finish with the old
-    // image (same timeline the color guest output image uses), then destroy.
-    guest_output_image_refresher_completion_timeline_.AwaitAllSubmissions();
-    if (reshade_depth_view_ != VK_NULL_HANDLE) {
-      dfn.vkDestroyImageView(device, reshade_depth_view_, nullptr);
-      reshade_depth_view_ = VK_NULL_HANDLE;
-    }
-    dfn.vkDestroyImage(device, reshade_depth_image_, nullptr);
+    // Size/format changed. The old image may still be sampled by an
+    // in-flight paint submission (and was written by a prior CP submission),
+    // so don't destroy it here: retire it, and the paint thread destroys it
+    // once a paint submission enqueued after this point completes. Also drop
+    // the valid flag so no paint samples the new, not yet written image.
+    std::lock_guard<std::mutex> lock(reshade_depth_mutex_);
+    ReShadeRetiredDepthImage retired;
+    retired.image = reshade_depth_image_;
+    retired.view = reshade_depth_view_;
+    retired.memory = reshade_depth_memory_;
+    reshade_depth_retired_.push_back(retired);
     reshade_depth_image_ = VK_NULL_HANDLE;
-    if (reshade_depth_memory_ != VK_NULL_HANDLE) {
-      dfn.vkFreeMemory(device, reshade_depth_memory_, nullptr);
-      reshade_depth_memory_ = VK_NULL_HANDLE;
-    }
+    reshade_depth_view_ = VK_NULL_HANDLE;
+    reshade_depth_memory_ = VK_NULL_HANDLE;
+    reshade_depth_valid_ = false;
   }
   if (reshade_depth_image_ == VK_NULL_HANDLE) {
     VkImageCreateInfo image_create_info = {};
@@ -405,33 +420,39 @@ VkImage VulkanPresenter::AcquireReShadeDepthImage(uint32_t width,
         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImage new_image = VK_NULL_HANDLE;
+    VkDeviceMemory new_memory = VK_NULL_HANDLE;
     if (!ui::vulkan::util::CreateDedicatedAllocationImage(
             vulkan_device_, image_create_info,
-            ui::vulkan::util::MemoryPurpose::kDeviceLocal,
-            reshade_depth_image_, reshade_depth_memory_)) {
-      reshade_depth_image_ = VK_NULL_HANDLE;
-      reshade_depth_memory_ = VK_NULL_HANDLE;
+            ui::vulkan::util::MemoryPurpose::kDeviceLocal, new_image,
+            new_memory)) {
       return VK_NULL_HANDLE;
     }
     VkImageViewCreateInfo view_create_info = {};
     view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    view_create_info.image = reshade_depth_image_;
+    view_create_info.image = new_image;
     view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
     view_create_info.format = format;
     view_create_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     view_create_info.subresourceRange.levelCount = 1;
     view_create_info.subresourceRange.layerCount = 1;
-    if (dfn.vkCreateImageView(device, &view_create_info, nullptr,
-                              &reshade_depth_view_) != VK_SUCCESS) {
-      dfn.vkDestroyImage(device, reshade_depth_image_, nullptr);
-      dfn.vkFreeMemory(device, reshade_depth_memory_, nullptr);
-      reshade_depth_image_ = VK_NULL_HANDLE;
-      reshade_depth_memory_ = VK_NULL_HANDLE;
-      reshade_depth_view_ = VK_NULL_HANDLE;
+    VkImageView new_view = VK_NULL_HANDLE;
+    if (dfn.vkCreateImageView(device, &view_create_info, nullptr, &new_view) !=
+        VK_SUCCESS) {
+      dfn.vkDestroyImage(device, new_image, nullptr);
+      dfn.vkFreeMemory(device, new_memory, nullptr);
       return VK_NULL_HANDLE;
     }
+    // Publish under the handoff mutex (the paint thread reads the view). The
+    // new image is UNDEFINED until this frame's resolve submission; the CP
+    // sets the valid flag after submitting it.
+    std::lock_guard<std::mutex> lock(reshade_depth_mutex_);
+    reshade_depth_image_ = new_image;
+    reshade_depth_memory_ = new_memory;
+    reshade_depth_view_ = new_view;
     reshade_depth_extent_ = {width, height};
     reshade_depth_format_ = format;
+    reshade_depth_valid_ = false;
   }
   return reshade_depth_image_;
 }
@@ -1615,6 +1636,39 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
 
+  // Retired ReShade depth images: destroy the ones whose tagged paint
+  // submission has completed (all queue work referencing them was enqueued
+  // before that submission), and tag fresh ones with this paint submission.
+  {
+    std::lock_guard<std::mutex> lock(reshade_depth_mutex_);
+    if (!reshade_depth_retired_.empty()) {
+      uint64_t completed_paint_submission =
+          paint_context_.completion_timeline
+              .GetCompletedSubmissionFromLastUpdate();
+      auto it = reshade_depth_retired_.begin();
+      while (it != reshade_depth_retired_.end()) {
+        if (it->paint_submission &&
+            completed_paint_submission >= it->paint_submission) {
+          if (it->view != VK_NULL_HANDLE) {
+            dfn.vkDestroyImageView(device, it->view, nullptr);
+          }
+          if (it->image != VK_NULL_HANDLE) {
+            dfn.vkDestroyImage(device, it->image, nullptr);
+          }
+          if (it->memory != VK_NULL_HANDLE) {
+            dfn.vkFreeMemory(device, it->memory, nullptr);
+          }
+          it = reshade_depth_retired_.erase(it);
+        } else {
+          if (!it->paint_submission) {
+            it->paint_submission = current_paint_submission_index;
+          }
+          ++it;
+        }
+      }
+    }
+  }
+
   VkCommandPool draw_command_pool = paint_submission.draw_command_pool();
   if (dfn.vkResetCommandPool(device, draw_command_pool, 0) != VK_SUCCESS) {
     XELOGE(
@@ -2091,6 +2145,17 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
                 }
               }
               VkExtent2D rs_extent{rs_width, rs_height};
+              // Snapshot the depth handoff for this paint under the mutex:
+              // the CP thread may retire/recreate the image concurrently.
+              VkImage paint_depth_image = VK_NULL_HANDLE;
+              VkImageView paint_depth_view = VK_NULL_HANDLE;
+              {
+                std::lock_guard<std::mutex> lock(reshade_depth_mutex_);
+                if (reshade_depth_valid_) {
+                  paint_depth_image = reshade_depth_image_;
+                  paint_depth_view = reshade_depth_view_;
+                }
+              }
               // Acquire the ReShade depth image for sampling. The command
               // processor blitted the scene depth into it in a prior
               // submission on the same queue and left it in
@@ -2098,7 +2163,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
               // written content is preserved (UNDEFINED would discard it).
               // This barrier makes the CP's write visible to the fragment
               // shader in this submission.
-              if (reshade_depth_valid_ && reshade_depth_image_ != VK_NULL_HANDLE) {
+              if (paint_depth_image != VK_NULL_HANDLE) {
                 VkImageMemoryBarrier depth_acquire = {};
                 depth_acquire.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
                 depth_acquire.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -2109,7 +2174,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
                 depth_acquire.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 depth_acquire.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                depth_acquire.image = reshade_depth_image_;
+                depth_acquire.image = paint_depth_image;
                 depth_acquire.subresourceRange.aspectMask =
                     VK_IMAGE_ASPECT_COLOR_BIT;
                 depth_acquire.subresourceRange.levelCount = 1;
@@ -2132,11 +2197,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
                     last ? reshade_output_image_.get()
                          : reshade_scratch_[rendered % 2].get();
                 reshade_->UpdateSystemUniforms(*entry.effect);
-                VkImageView depth_view =
-                    (reshade_depth_valid_ &&
-                     reshade_depth_view_ != VK_NULL_HANDLE)
-                        ? reshade_depth_view_
-                        : VK_NULL_HANDLE;
+                VkImageView depth_view = paint_depth_view;
                 if (!reshade_->Render(draw_command_buffer, *entry.effect,
                                       input_view, out->image(), out->view(),
                                       rs_extent, depth_view)) {

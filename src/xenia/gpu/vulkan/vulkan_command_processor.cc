@@ -2038,10 +2038,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
         // scene depth into a presenter-owned image so depth-based effects can
         // read it. Same submission as the color image, so it rides the same
         // presenter synchronization.
+        auto* reshade_presenter = static_cast<ui::vulkan::VulkanPresenter*>(
+            graphics_system_->presenter());
+        bool reshade_depth_fed = false;
         {
-          auto* reshade_presenter =
-              static_cast<ui::vulkan::VulkanPresenter*>(
-                  graphics_system_->presenter());
           const bool depth_wanted =
               reshade_presenter && reshade_presenter->WantsReShadeDepth();
           // Cache for the NEXT frame's mid-frame snapshot (EndRenderPass).
@@ -2084,8 +2084,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
               }
             }
           }
-          if (reshade_presenter) {
-            reshade_presenter->SetReShadeDepthValid(depth_fed);
+          reshade_depth_fed = depth_fed;
+          if (reshade_presenter && !depth_fed) {
+            reshade_presenter->SetReShadeDepthValid(false);
           }
           render_target_cache_->ResetReShadeDepthSnapshot();
         }
@@ -2093,7 +2094,14 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
         // Need to submit all the commands before giving the image back to the
         // presenter so it can submit its own commands for displaying it to the
         // queue, and also need to submit the release barrier.
-        EndSubmission(true);
+        bool submitted = EndSubmission(true);
+        // Mark the depth image valid only now that the submission writing it
+        // is in the queue: a paint that observes the flag is then enqueued
+        // after the write (a paint enqueued before it would sample the image
+        // in the wrong layout on its first frame).
+        if (reshade_presenter && reshade_depth_fed && submitted) {
+          reshade_presenter->SetReShadeDepthValid(true);
+        }
         return true;
       });
 

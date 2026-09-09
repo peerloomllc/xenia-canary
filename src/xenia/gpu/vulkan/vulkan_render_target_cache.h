@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <deque>
 #include <memory>
 #include <chrono>
 #include <unordered_map>
@@ -362,6 +363,13 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   VkImageView reshade_depth_resolve_fb_view_ = VK_NULL_HANDLE;
   uint32_t reshade_depth_resolve_fb_width_ = 0;
   uint32_t reshade_depth_resolve_fb_height_ = 0;
+  // Submission the current framebuffer was last recorded into, and old
+  // framebuffers retired on a destination change, kept until the submission
+  // that last used them completes (destroying one still referenced by an
+  // in-flight command buffer is invalid).
+  uint64_t reshade_depth_resolve_fb_last_submission_ = 0;
+  std::deque<std::pair<uint64_t, VkFramebuffer>>
+      reshade_depth_resolve_retired_fbs_;
   // Scene depth snapshot (depth-buffer detection): a persistent MSAA holding
   // image copied from this frame's largest scene pass's depth, resolved at
   // swap.
