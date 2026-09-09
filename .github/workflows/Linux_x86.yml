@@ -119,18 +119,13 @@ jobs:
           # Copy any extra runtime data directories alongside the binary
           find build/bin/Linux/Release -maxdepth 1 -type d ! -name Release -exec cp -r {} ${APPDIR}/usr/bin/ \;
 
-          # The NGX loader looks for the DLSS runtime library next to the
-          # executable. The build copies it into the output directory, but the
-          # directory copy above takes directories only, so carry the file over
-          # as well.
-          for lib in build/bin/Linux/Release/libnvidia-ngx-*.so.*; do
-            [ -e "$lib" ] || continue
-            cp "$lib" ${APPDIR}/usr/bin/
-          done
-          # Losing it is silent at runtime (DLSS just reports itself
-          # unavailable), so fail the build instead when the SDK is there.
+          # The build puts the DLSS runtime library in a dlss folder next to
+          # the executable, which the directory copy above carries over. Keep
+          # it out of usr/bin itself: linuxdeploy runs patchelf over every ELF
+          # file there and NGX rejects a modified snippet. Losing it is silent
+          # at runtime, so fail the build instead when the SDK is present.
           if ls third_party/nvidia-dlss/lib/Linux_x86_64/rel/libnvidia-ngx-dlss.so.* >/dev/null 2>&1 \
-             && ! ls ${APPDIR}/usr/bin/libnvidia-ngx-dlss.so.* >/dev/null 2>&1; then
+             && ! ls ${APPDIR}/usr/bin/dlss/libnvidia-ngx-dlss.so.* >/dev/null 2>&1; then
             echo "::error::The DLSS SDK is present but its runtime library was not bundled."
             exit 1
           fi

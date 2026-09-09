@@ -9,6 +9,8 @@
 
 #include "xenia/ui/vulkan/vulkan_dlss.h"
 
+#include <iterator>
+
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
@@ -67,15 +69,20 @@ std::unique_ptr<VulkanDlss> VulkanDlss::TryCreate(const VulkanDevice* device) {
 
   auto dlss = std::unique_ptr<VulkanDlss>(new VulkanDlss(device));
 
-  // The DLSS runtime library (libnvidia-ngx-dlss.so.*) is searched next to
-  // the executable.
-  const std::wstring executable_folder =
-      xe::filesystem::GetExecutableFolder().wstring();
-  const wchar_t* feature_paths[] = {executable_folder.c_str()};
+  // The DLSS runtime library (libnvidia-ngx-dlss.so.*) is searched in a dlss
+  // folder next to the executable, and next to the executable itself for
+  // installations laid out the old way.
+  const std::filesystem::path executable_path =
+      xe::filesystem::GetExecutableFolder();
+  const std::wstring executable_folder = executable_path.wstring();
+  const std::wstring dlss_folder = (executable_path / "dlss").wstring();
+  const wchar_t* feature_paths[] = {dlss_folder.c_str(),
+                                    executable_folder.c_str()};
   NVSDK_NGX_FeatureCommonInfo feature_common_info = {};
   feature_common_info.PathListInfo.Path =
       const_cast<wchar_t**>(feature_paths);
-  feature_common_info.PathListInfo.Length = 1;
+  feature_common_info.PathListInfo.Length =
+      uint32_t(std::size(feature_paths));
 
   const VulkanInstance* instance = device->vulkan_instance();
   const NVSDK_NGX_Result init_result = NVSDK_NGX_VULKAN_Init(
