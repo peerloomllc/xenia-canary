@@ -709,6 +709,16 @@ class RenderTargetCache {
   RenderTarget* GetLastUpdateDepthRenderTarget() const {
     return last_update_used_render_targets_[0];
   }
+  // Whether the last update bound at least one colour render target (i.e. it
+  // was a scene pass, not a depth-only shadow pass).
+  bool LastUpdateHasColorRenderTarget() const {
+    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+      if (last_update_used_render_targets_[1 + i]) {
+        return true;
+      }
+    }
+    return false;
+  }
   const std::unordered_map<RenderTargetKey, RenderTarget*,
                            RenderTargetKey::Hasher>&
   GetRenderTargetsMap() const {

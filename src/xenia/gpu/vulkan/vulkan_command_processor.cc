@@ -2042,10 +2042,18 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
           auto* reshade_presenter =
               static_cast<ui::vulkan::VulkanPresenter*>(
                   graphics_system_->presenter());
+          const bool depth_wanted =
+              reshade_presenter && reshade_presenter->WantsReShadeDepth();
+          // Cache for the NEXT frame's mid-frame snapshot (EndRenderPass).
+          reshade_depth_active_ = depth_wanted;
           bool depth_fed = false;
-          if (reshade_presenter && reshade_presenter->WantsReShadeDepth()) {
+          if (depth_wanted) {
             VulkanRenderTargetCache::ReShadeSceneDepth scene_depth;
-            if (render_target_cache_->GetReShadeSceneDepth(scene_depth)) {
+            // Prefer this frame's scene-depth snapshot (captured mid-frame,
+            // before the shadow pass reused the buffer); fall back to the live
+            // pick at swap.
+            if (render_target_cache_->GetReShadeDepthSnapshot(scene_depth) ||
+                render_target_cache_->GetReShadeSceneDepth(scene_depth)) {
               // Resolve the scene depth (MSAA or 1x) into a single-sampled
               // R32F image the ReShade runtime samples. Sized to the depth RT
               // so the fullscreen pass maps 1:1.
@@ -2079,6 +2087,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
           if (reshade_presenter) {
             reshade_presenter->SetReShadeDepthValid(depth_fed);
           }
+          render_target_cache_->ResetReShadeDepthSnapshot();
         }
 
         // Need to submit all the commands before giving the image back to the
@@ -2329,6 +2338,16 @@ void VulkanCommandProcessor::EndRenderPass() {
   deferred_command_buffer_.CmdVkEndRenderPass();
   current_render_pass_ = VK_NULL_HANDLE;
   current_framebuffer_ = nullptr;
+
+  // ReShade depth-buffer detection: the pass that just ended may be the scene
+  // pass whose depth the depth feed wants. Snapshot it now (a plain image
+  // copy into a holding buffer), while it is still valid, before a later pass
+  // (e.g. the character shadow map) reuses the buffer. Gated on the per-frame
+  // flag so it is a single branch when the feed is off; the copy does not
+  // touch the guest pipeline/descriptor state.
+  if (reshade_depth_active_) {
+    render_target_cache_->SnapshotSceneDepthIfScenePass();
+  }
 }
 
 VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(

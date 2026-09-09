@@ -1983,21 +1983,183 @@ bool VulkanRenderTargetCache::GetReShadeSceneDepth(
       best->current_layout() == VK_IMAGE_LAYOUT_UNDEFINED) {
     return false;
   }
-  RenderTargetKey key = best->key();
-  out.image = best->image();
+  FillReShadeSceneDepthFrom(best, out);
+  return true;
+}
+
+void VulkanRenderTargetCache::FillReShadeSceneDepthFrom(
+    const RenderTarget* rt_base, ReShadeSceneDepth& out) const {
+  const VulkanRenderTarget* rt =
+      static_cast<const VulkanRenderTarget*>(rt_base);
+  RenderTargetKey key = rt->key();
+  out.image = rt->image();
   out.width = key.GetWidth() * GetKeyScaleX(key);
   out.height =
       GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples) *
       GetKeyScaleY(key);
   out.format = GetDepthVulkanFormat(key.GetDepthFormat());
-  out.view = best->view_depth_color();
-  out.layout = best->current_layout();
-  out.stage_mask = best->current_stage_mask();
-  out.access_mask = best->current_access_mask();
+  out.view = rt->view_depth_color();
+  out.layout = rt->current_layout();
+  out.stage_mask = rt->current_stage_mask();
+  out.access_mask = rt->current_access_mask();
   static const VkSampleCountFlagBits kSampleCounts[] = {
       VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_2_BIT, VK_SAMPLE_COUNT_4_BIT,
       VK_SAMPLE_COUNT_4_BIT};
   out.samples = kSampleCounts[uint32_t(key.msaa_samples) & 3];
+}
+
+void VulkanRenderTargetCache::ResetReShadeDepthSnapshot() {
+  reshade_depth_snapshot_valid_ = false;
+  reshade_depth_snapshot_best_area_ = 0;
+}
+
+bool VulkanRenderTargetCache::GetReShadeDepthSnapshot(
+    ReShadeSceneDepth& out) const {
+  if (!reshade_depth_snapshot_valid_ ||
+      reshade_depth_snapshot_image_ == VK_NULL_HANDLE) {
+    return false;
+  }
+  out.image = reshade_depth_snapshot_image_;
+  out.view = reshade_depth_snapshot_view_;
+  out.width = reshade_depth_snapshot_width_;
+  out.height = reshade_depth_snapshot_height_;
+  out.format = reshade_depth_snapshot_format_;
+  out.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  out.stage_mask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+  out.access_mask = VK_ACCESS_SHADER_READ_BIT;
+  out.samples = reshade_depth_snapshot_samples_;
+  return true;
+}
+
+bool VulkanRenderTargetCache::SnapshotSceneDepthIfScenePass() {
+  if (GetPath() != Path::kHostRenderTargets) {
+    return false;
+  }
+  // A scene pass has depth (index 0) and at least one colour RT bound; a
+  // depth-only pass (index 0 only) is a shadow map - skip it.
+  RenderTarget* depth = GetLastUpdateDepthRenderTarget();
+  if (!depth || !LastUpdateHasColorRenderTarget()) {
+    return false;
+  }
+  const VulkanRenderTarget* depth_rt =
+      static_cast<const VulkanRenderTarget*>(depth);
+  RenderTargetKey key = depth_rt->key();
+  if (!key.is_depth || depth_rt->image() == VK_NULL_HANDLE) {
+    return false;
+  }
+  uint32_t width = key.GetWidth() * GetKeyScaleX(key);
+  uint32_t height =
+      GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples) *
+      GetKeyScaleY(key);
+  if (!width || !height) {
+    return false;
+  }
+  uint64_t area = uint64_t(width) * height;
+  // Keep the largest scene pass's depth this frame.
+  if (reshade_depth_snapshot_valid_ &&
+      area <= reshade_depth_snapshot_best_area_) {
+    return false;
+  }
+  VkFormat format = GetDepthVulkanFormat(key.GetDepthFormat());
+  static const VkSampleCountFlagBits kSampleCounts[] = {
+      VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_2_BIT, VK_SAMPLE_COUNT_4_BIT,
+      VK_SAMPLE_COUNT_4_BIT};
+  VkSampleCountFlagBits samples = kSampleCounts[uint32_t(key.msaa_samples) & 3];
+
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  // The holding image is created once and reused. Destroying it while a
+  // prior frame's swap resolve descriptor still references its view causes a
+  // destroy-in-use error and device loss, so once it exists, only snapshots
+  // that match its size/format are taken (mismatches are skipped, not
+  // recreated). Size is stable per title/resolution in practice.
+  if (reshade_depth_snapshot_image_ != VK_NULL_HANDLE &&
+      (reshade_depth_snapshot_width_ != width ||
+       reshade_depth_snapshot_height_ != height ||
+       reshade_depth_snapshot_format_ != format ||
+       reshade_depth_snapshot_samples_ != samples)) {
+    return false;
+  }
+  if (reshade_depth_snapshot_image_ == VK_NULL_HANDLE) {
+    VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = format;
+    ici.extent = {width, height, 1};
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = samples;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage =
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+            vulkan_device, ici, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+            reshade_depth_snapshot_image_, reshade_depth_snapshot_memory_)) {
+      reshade_depth_snapshot_image_ = VK_NULL_HANDLE;
+      reshade_depth_snapshot_memory_ = VK_NULL_HANDLE;
+      return false;
+    }
+    VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = reshade_depth_snapshot_image_;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = format;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    if (dfn.vkCreateImageView(device, &vci, nullptr,
+                              &reshade_depth_snapshot_view_) != VK_SUCCESS) {
+      ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device,
+                                             reshade_depth_snapshot_image_);
+      ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                             reshade_depth_snapshot_memory_);
+      reshade_depth_snapshot_view_ = VK_NULL_HANDLE;
+      return false;
+    }
+    reshade_depth_snapshot_width_ = width;
+    reshade_depth_snapshot_height_ = height;
+    reshade_depth_snapshot_format_ = format;
+    reshade_depth_snapshot_samples_ = samples;
+  }
+
+  // Copy the scene depth (depth aspect) into the holding image. A plain
+  // image copy between passes - no render pass, so it cannot corrupt the
+  // guest render-pass state.
+  VkImageSubresourceRange range = {
+      VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1};
+  command_processor_.PushImageMemoryBarrier(
+      depth_rt->image(), range, depth_rt->current_stage_mask(),
+      VK_PIPELINE_STAGE_TRANSFER_BIT, depth_rt->current_access_mask(),
+      VK_ACCESS_TRANSFER_READ_BIT, depth_rt->current_layout(),
+      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+  command_processor_.PushImageMemoryBarrier(
+      reshade_depth_snapshot_image_, range, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+  command_processor_.SubmitBarriers(true);
+  DeferredCommandBuffer& cb = command_processor_.deferred_command_buffer();
+  VkImageCopy copy = {};
+  copy.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+  copy.dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+  copy.extent = {width, height, 1};
+  cb.CmdVkCopyImage(depth_rt->image(),
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    reshade_depth_snapshot_image_,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+  command_processor_.PushImageMemoryBarrier(
+      reshade_depth_snapshot_image_, range, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  command_processor_.PushImageMemoryBarrier(
+      depth_rt->image(), range, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      depth_rt->current_stage_mask(), VK_ACCESS_TRANSFER_READ_BIT,
+      depth_rt->current_access_mask(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+      depth_rt->current_layout());
+  command_processor_.SubmitBarriers(true);
+  reshade_depth_snapshot_valid_ = true;
+  reshade_depth_snapshot_best_area_ = area;
   return true;
 }
 bool VulkanRenderTargetCache::EnsureReShadeDepthResolve() {
@@ -2237,6 +2399,16 @@ void VulkanRenderTargetCache::DestroyReShadeDepthResolve() {
       reshade_depth_resolve_set_layout_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyRenderPass, device,
                                          reshade_depth_resolve_render_pass_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device,
+                                         reshade_depth_snapshot_view_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device,
+                                         reshade_depth_snapshot_image_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                         reshade_depth_snapshot_memory_);
+  reshade_depth_snapshot_width_ = 0;
+  reshade_depth_snapshot_height_ = 0;
+  reshade_depth_snapshot_valid_ = false;
+  reshade_depth_snapshot_best_area_ = 0;
 }
 
 void VulkanRenderTargetCache::RecordReShadeDepthResolve(

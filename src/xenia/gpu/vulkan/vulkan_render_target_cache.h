@@ -228,6 +228,19 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   void RecordReShadeDepthResolve(const ReShadeSceneDepth& src, VkImage dst,
                                  VkImageView dst_view, uint32_t width,
                                  uint32_t height);
+  // ReShade depth-buffer detection. During the frame, when a scene pass
+  // ends (one with both colour and depth bound - not a depth-only shadow
+  // pass), copy the largest such depth into a persistent MSAA holding image
+  // while it is still valid, before a later pass reuses the buffer. A plain
+  // image copy (no render pass), safe to record between passes. Returns true
+  // if it copied.
+  bool SnapshotSceneDepthIfScenePass();
+  // Fills `out` from this frame's scene-depth snapshot (the MSAA holding
+  // image, in SHADER_READ), if one was captured; the command processor
+  // resolves it at swap.
+  bool GetReShadeDepthSnapshot(ReShadeSceneDepth& out) const;
+  // Clears the snapshot's per-frame validity; call once per presented frame.
+  void ResetReShadeDepthSnapshot();
 
  protected:
   bool IsGammaFormatHostStorageSeparate() const override;
@@ -349,6 +362,22 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   VkImageView reshade_depth_resolve_fb_view_ = VK_NULL_HANDLE;
   uint32_t reshade_depth_resolve_fb_width_ = 0;
   uint32_t reshade_depth_resolve_fb_height_ = 0;
+  // Scene depth snapshot (depth-buffer detection): a persistent MSAA holding
+  // image copied from this frame's largest scene pass's depth, resolved at
+  // swap.
+  VkImage reshade_depth_snapshot_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory reshade_depth_snapshot_memory_ = VK_NULL_HANDLE;
+  VkImageView reshade_depth_snapshot_view_ = VK_NULL_HANDLE;
+  uint32_t reshade_depth_snapshot_width_ = 0;
+  uint32_t reshade_depth_snapshot_height_ = 0;
+  VkFormat reshade_depth_snapshot_format_ = VK_FORMAT_UNDEFINED;
+  VkSampleCountFlagBits reshade_depth_snapshot_samples_ =
+      VK_SAMPLE_COUNT_1_BIT;
+  bool reshade_depth_snapshot_valid_ = false;
+  uint64_t reshade_depth_snapshot_best_area_ = 0;
+  // Fills ReShadeSceneDepth from a specific depth render target.
+  void FillReShadeSceneDepthFrom(const RenderTarget* rt,
+                                 ReShadeSceneDepth& out) const;
   // Host-visible staging for RestoreEdramSnapshot, kept for reuse.
   VkBuffer edram_snapshot_upload_buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory edram_snapshot_upload_buffer_memory_ = VK_NULL_HANDLE;

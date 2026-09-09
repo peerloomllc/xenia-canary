@@ -570,6 +570,10 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   ui::vulkan::VulkanGPUCompletionTimeline completion_timeline_;
   bool submission_open_ = false;
+  // ReShade depth-buffer detection: cached each frame (--reshade_depth on and
+  // an effect wants depth) so EndRenderPass can cheaply snapshot the scene
+  // pass's depth mid-frame.
+  bool reshade_depth_active_ = false;
   // In case vkQueueSubmit fails after something like a successful
   // vkQueueBindSparse, to wait correctly on the next attempt.
   std::vector<VkSemaphore> current_submission_wait_semaphores_;
