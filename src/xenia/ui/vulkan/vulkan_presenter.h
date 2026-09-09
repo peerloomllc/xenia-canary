@@ -11,11 +11,14 @@
 #define XENIA_UI_VULKAN_VULKAN_PRESENTER_H_
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <utility>
+#include <mutex>
+#include <string>
 #include <vector>
 
 #include "xenia/base/assert.h"
@@ -24,6 +27,7 @@
 #include "xenia/ui/vulkan/ui_samplers.h"
 #include "xenia/ui/vulkan/vulkan_device.h"
 #include "xenia/ui/vulkan/vulkan_dlss.h"
+#include "xenia/ui/vulkan/vulkan_reshade.h"
 #include "xenia/ui/vulkan/vulkan_gpu_completion_timeline.h"
 #include "xenia/ui/vulkan/vulkan_instance.h"
 
@@ -144,11 +148,37 @@ class VulkanPresenter final : public Presenter {
   Surface::TypeFlags GetSupportedSurfaceTypes() const override;
 
   bool CaptureGuestOutput(RawImage& image_out) override;
+  bool CaptureReShadeOutput(RawImage& image_out) override;
 
   void AwaitUISubmissionCompletionFromUIThread(uint64_t submission_index) {
     ui_completion_timeline_.AwaitSubmissionAndUpdateCompleted(submission_index);
   }
   VkCommandBuffer AcquireUISetupCommandBufferFromUIThread();
+
+  // ReShade depth feed handoff, called from the guest output refresher (CP
+  // thread). Whether the depth feed is wanted (--reshade_depth on and a
+  // ReShade effect is loaded).
+  bool WantsReShadeDepth() const;
+  // (Re)creates the depth image (a single-sampled R32_SFLOAT colour image the
+  // scene depth is resolved into) at the given size on the refresher timeline
+  // if needed and returns it, so the CP can render the resolved depth into it
+  // (left in VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL). Returns VK_NULL_HANDLE
+  // on failure. `format` should be VK_FORMAT_R32_SFLOAT.
+  VkImage AcquireReShadeDepthImage(uint32_t width, uint32_t height,
+                                   VkFormat format);
+  // The view of the depth image (color aspect), for use as a render target.
+  VkImageView GetReShadeDepthView() const { return reshade_depth_view_; }
+  // CP thread, at swap: last frame's depth-buffer candidates for the UI,
+  // and the current manual choice for the render target cache.
+  void SetReShadeDepthBufferList(std::vector<ReShadeDepthBufferInfo>&& list);
+  int GetReShadeDepthBufferChoice() const;
+  // Marks whether the depth image holds valid scene depth for this frame.
+  // Set true only after the submission that writes the image has been
+  // submitted to the queue (see reshade_depth_mutex_).
+  void SetReShadeDepthValid(bool valid) {
+    std::lock_guard<std::mutex> lock(reshade_depth_mutex_);
+    reshade_depth_valid_ = valid;
+  }
 
  protected:
   SurfacePaintConnectResult ConnectOrReconnectPaintingToSurfaceFromUIThread(
@@ -334,9 +364,14 @@ class VulkanPresenter final : public Presenter {
           kGuestOutputDescriptorSetGuestOutput0Sampled +
           kGuestOutputMailboxSize,
 
-      kGuestOutputDescriptorSetCount =
+      // Sampled view of the ReShade effect output (its result feeds the
+      // first paint effect when a ReShade effect is enabled).
+      kGuestOutputDescriptorSetReShadeSampled =
           kGuestOutputDescriptorSetIntermediate0Sampled +
           kMaxGuestOutputPaintEffects - 1,
+
+      kGuestOutputDescriptorSetCount =
+          kGuestOutputDescriptorSetReShadeSampled + 1,
     };
 
     struct UISetupCommandBuffer {
@@ -466,6 +501,36 @@ class VulkanPresenter final : public Presenter {
     return dlss_ != nullptr && !dlss_failed_;
   }
 
+  bool IsReShadeAvailable() const override { return reshade_ != nullptr; }
+  std::vector<ReShadeEffectInfo> GetReShadeStackFromUIThread() override;
+  void AddReShadeEffectFromUIThread(const std::string& path) override;
+  void RemoveReShadeEffectFromUIThread(int index) override;
+  void MoveReShadeEffectFromUIThread(int index, int delta) override;
+  void SetReShadeEffectEnabledFromUIThread(int index, bool enabled) override;
+  std::vector<ReShadeUniformControl> GetReShadeControlsFromUIThread(
+      int index) override;
+  void SetReShadeControlFromUIThread(int index, const std::string& name,
+                                     const float* values,
+                                     int components) override;
+  std::string GetReShadeShaderDirFromUIThread() const override;
+  void SetReShadeShaderDirFromUIThread(const std::string& dir) override;
+  void SetReShadePresetFileFromUIThread(const std::string& file) override;
+  void SaveReShadePresetFromUIThread() override;
+  std::string GetReShadePresetDirFromUIThread() const override;
+  void SetReShadePresetDirFromUIThread(const std::string& dir) override;
+  void LoadReShadePresetFileFromUIThread(const std::string& file) override;
+  void SaveReShadePresetToFileFromUIThread(const std::string& file) override;
+  std::vector<ReShadeDepthBufferInfo> GetReShadeDepthBuffersFromUIThread()
+      override;
+  int GetReShadeDepthBufferChoiceFromUIThread() const override;
+  void SetReShadeDepthBufferChoiceFromUIThread(int choice) override;
+  bool GetReShadeDepthEnabledFromUIThread() const override;
+  void SetReShadeDepthEnabledFromUIThread(bool enabled) override;
+  bool GetReShadeDepthReversedFromUIThread() const override;
+  bool GetReShadeDepthUpsideDownFromUIThread() const override;
+  void SetReShadeDepthOrientationFromUIThread(bool reversed,
+                                              bool upside_down) override;
+
   VulkanDevice* vulkan_device_;
   const UISamplers* ui_samplers_;
 
@@ -474,6 +539,96 @@ class VulkanPresenter final : public Presenter {
   // evaluation failure, permanently falling back to bilinear.
   std::unique_ptr<VulkanDlss> dlss_;
   bool dlss_failed_ = false;
+
+  // Native ReShade post-process (experimental, notes/72). Its output image is
+  // guest-output sized and sampled by the first paint effect when enabled.
+  std::unique_ptr<VulkanReShade> reshade_;
+  // One loaded effect in the chain (paint-thread owned, render order).
+  struct ReShadeStackEntry {
+    std::unique_ptr<VulkanReShade::Effect> effect;
+    std::string path;
+    std::vector<ReShadeUniformControl> controls;
+    bool controls_dirty = false;
+  };
+  std::vector<ReShadeStackEntry> reshade_stack_;
+  std::unique_ptr<GuestOutputImage> reshade_output_image_;
+  std::unique_ptr<GuestOutputImage> reshade_scratch_[2];
+  uint64_t reshade_output_last_submission_ = 0;
+  bool reshade_failed_ = false;
+  // ReShade depth feed (experimental, --reshade_depth). The command
+  // processor blits the guest scene depth into this image during the guest
+  // output refresh (same submission as the color image); a ReShade effect's
+  // DEPTH sampler binds it. Written on the CP thread, sampled on the paint
+  // thread. reshade_depth_mutex_ guards the image/view/valid handoff and the
+  // retired list. On a size/format change the old image is not destroyed
+  // immediately (an in-flight submission may still sample it): it is
+  // retired, tagged on the paint thread with the next paint submission, and
+  // destroyed once that submission completes (fence completion of a later
+  // batch covers all earlier batches on the queue). reshade_depth_valid_
+  // becomes true only after the CP submission writing the image has been
+  // submitted to the queue, so a paint observing it true is enqueued after
+  // the write.
+  std::mutex reshade_depth_mutex_;
+  VkImage reshade_depth_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory reshade_depth_memory_ = VK_NULL_HANDLE;
+  VkImageView reshade_depth_view_ = VK_NULL_HANDLE;
+  VkFormat reshade_depth_format_ = VK_FORMAT_UNDEFINED;
+  VkExtent2D reshade_depth_extent_ = {0, 0};
+  bool reshade_depth_valid_ = false;
+  struct ReShadeRetiredDepthImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    // Paint submission after whose completion the destroy is safe; 0 until
+    // the paint thread tags the entry.
+    uint64_t paint_submission = 0;
+  };
+  std::vector<ReShadeRetiredDepthImage> reshade_depth_retired_;
+  // Set by the UI thread when the depth orientation changes; the paint
+  // thread applies the new convention and recompiles the depth effects.
+  std::atomic<bool> reshade_convention_dirty_{false};
+  // Last frame's depth-buffer candidates, published by the CP at swap and
+  // read by the overlay. Guarded by reshade_depth_mutex_.
+  std::vector<ReShadeDepthBufferInfo> reshade_depth_buffer_list_;
+  std::mutex reshade_control_mutex_;
+  // UI-desired stack: the UI thread edits this, the paint thread reconciles
+  // reshade_stack_ to match (compile new, drop removed, reorder, apply
+  // enabled + values). Guarded by reshade_control_mutex_.
+  struct ReShadeDesiredEffect {
+    std::string path;
+    bool enabled = true;
+    std::vector<std::pair<std::string, std::array<float, 4>>> values;
+  };
+  std::vector<ReShadeDesiredEffect> reshade_desired_;
+  bool reshade_desired_dirty_ = false;
+  // UI snapshot published by the paint thread after each reconcile.
+  struct ReShadeUiEffect {
+    std::string name;
+    std::string path;
+    bool enabled = true;
+    std::vector<ReShadeUniformControl> controls;
+  };
+  std::vector<ReShadeUiEffect> reshade_ui_;
+  // Per-game preset file to persist the stack to (UI thread only).
+  std::string reshade_preset_file_;
+  // Reconciles reshade_stack_ to reshade_desired_ (paint thread).
+  void ApplyReShadeStack(uint32_t width, uint32_t height);
+  // Rebuilds reshade_ui_ from the current stack (call under the mutex).
+  void PublishReShadeUi();
+  // Saves the desired stack to the current preset file, if set.
+  void SaveReShadePresetToCurrentFile();
+  // Writes the desired stack to an arbitrary preset file.
+  void WriteReShadePresetFile(const std::string& file);
+  // One-shot readback of an image into 8bpc RGBA, awaiting its own
+  // submission.
+  bool CaptureImage(VkImage image, VkExtent2D image_extent,
+                    VkImageLayout image_layout,
+                    VkAccessFlags image_access_mask,
+                    VkPipelineStageFlags image_stage_mask,
+                    RawImage& image_out);
+  // Parses a preset file into a desired stack; false if unreadable.
+  static bool ParseReShadePresetFile(
+      const std::string& file, std::vector<ReShadeDesiredEffect>& effects);
 
   // Static objects for guest output presentation, used only when painting the
   // main target (can be destroyed only after awaiting main target usage

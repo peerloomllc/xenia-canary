@@ -28,6 +28,8 @@
 #include <fstream>
 #include <cmath>
 #include <algorithm>
+#include <filesystem>
+#include <system_error>
 #include <array>
 #include <chrono>
 
@@ -150,6 +152,13 @@ DEFINE_int32(screenshot_burst_seconds, 0,
 DEFINE_int32(screenshot_burst_frames, 30,
              "Diagnostic: frames to save for --screenshot_burst_seconds.",
              "UI");
+DEFINE_int32(reshade_capture_seconds, 0,
+             "Diagnostic: this many seconds after launch, save the "
+             "post-ReShade frame (the raw guest output if no effect is "
+             "active) to --reshade_capture_path as a PNG.",
+             "UI");
+DEFINE_string(reshade_capture_path, "",
+              "Where --reshade_capture_seconds writes its PNG.", "UI");
 DEFINE_string(screenshot_burst_dir, "",
               "Diagnostic: folder for --screenshot_burst_seconds (default "
               "<exe folder>/screenshots/<title id>/burst).",
@@ -191,6 +200,11 @@ DEFINE_int32(save_state_slot, 1,
              "General");
 DEFINE_string(next_slot_hotkey, "PageDown",
               "Key that selects the next save state slot. Same key names as "
+              "pause_hotkey; empty to disable.",
+              "General");
+DEFINE_string(reshade_toggle_hotkey, "End",
+              "Key that toggles the active ReShade effect on/off (mirrors the "
+              "Enabled box in the Home overlay). Same key names as "
               "pause_hotkey; empty to disable.",
               "General");
 DEFINE_string(prev_slot_hotkey, "PageUp",
@@ -1016,6 +1030,8 @@ bool EmulatorWindow::Initialize() {
       ParseHotkeyName(cvars::next_slot_hotkey);
   action_keys_[int(HotkeyAction::kPrevSlot)] =
       ParseHotkeyName(cvars::prev_slot_hotkey);
+  action_keys_[int(HotkeyAction::kToggleReShade)] =
+      ParseHotkeyName(cvars::reshade_toggle_hotkey);
   auto hotkey_of = [this](HotkeyAction action, const std::string& name) {
     return action_key(action).has_value() ? name : std::string();
   };
@@ -1308,6 +1324,25 @@ bool EmulatorWindow::Initialize() {
     }).detach();
   }
 
+  if (cvars::reshade_capture_seconds > 0 &&
+      !cvars::reshade_capture_path.empty()) {
+    std::thread([this]() {
+      xe::threading::set_name("ReShade Capture");
+      std::this_thread::sleep_for(
+          std::chrono::seconds(cvars::reshade_capture_seconds));
+      app_context().CallInUIThreadSynchronous([this]() {
+        xe::ui::RawImage image;
+        auto* presenter = GetGraphicsSystemPresenter();
+        if (presenter && presenter->CaptureReShadeOutput(image)) {
+          SaveImage(cvars::reshade_capture_path, image);
+          XELOGI("RESHADE CAPTURE: saved {}", cvars::reshade_capture_path);
+        } else {
+          XELOGE("RESHADE CAPTURE: capture failed");
+        }
+      });
+    }).detach();
+  }
+
   if (!cvars::ui_experiment_dialog.empty()) {
     std::thread([this]() {
       xe::threading::set_name("UI Experiment");
@@ -1384,10 +1419,25 @@ bool EmulatorWindow::Initialize() {
     app_context().CallInUIThread([this]() {
       status_overlay_.reset();
       UpdateStatusOverlay(nullptr);
+      // Point the ReShade runtime at this title's preset so its shader and
+      // settings load now and edits are remembered per game.
+      gpu::GraphicsSystem* graphics_system = emulator_->graphics_system();
+      ui::Presenter* presenter =
+          graphics_system ? graphics_system->presenter() : nullptr;
+      if (presenter && emulator_->title_id()) {
+        presenter->SetReShadePresetFileFromUIThread(
+            (ReShadeDefaultDir("reshade-presets") /
+             fmt::format("{:08X}.txt", emulator_->title_id()))
+                .string());
+      }
     });
   });
 
   Profiler::SetUserIO(kZOrderProfiler, window_.get(), nullptr, nullptr);
+
+  // Populate the default shader folder from the bundled curated set on first
+  // run (no-op if the user already has shaders there or set their own folder).
+  SeedReShadeShaders();
 
   return true;
 }
@@ -1639,6 +1689,8 @@ const char* HotkeyActionLabel(EmulatorWindow::HotkeyAction action) {
       return "Next save state slot";
     case EmulatorWindow::HotkeyAction::kPrevSlot:
       return "Previous save state slot";
+    case EmulatorWindow::HotkeyAction::kToggleReShade:
+      return "Toggle ReShade effect";
     default:
       return "?";
   }
@@ -1659,6 +1711,8 @@ const char* HotkeyActionCvar(EmulatorWindow::HotkeyAction action) {
       return "next_slot_hotkey";
     case EmulatorWindow::HotkeyAction::kPrevSlot:
       return "prev_slot_hotkey";
+    case EmulatorWindow::HotkeyAction::kToggleReShade:
+      return "reshade_toggle_hotkey";
     default:
       return "";
   }
@@ -1707,6 +1761,9 @@ bool EmulatorWindow::SetActionHotkey(HotkeyAction action,
     case HotkeyAction::kPrevSlot:
       OVERRIDE_string(prev_slot_hotkey, name);
       break;
+    case HotkeyAction::kToggleReShade:
+      OVERRIDE_string(reshade_toggle_hotkey, name);
+      break;
     default:
       break;
   }
@@ -1737,6 +1794,9 @@ void EmulatorWindow::ClearActionHotkey(HotkeyAction action) {
       break;
     case HotkeyAction::kPrevSlot:
       OVERRIDE_string(prev_slot_hotkey, "");
+      break;
+    case HotkeyAction::kToggleReShade:
+      OVERRIDE_string(reshade_toggle_hotkey, "");
       break;
     default:
       break;
@@ -2144,6 +2204,48 @@ void EmulatorWindow::DeleteSaveStateSlot(int slot) {
   // that is gone.
   slot_thumbnails_.erase(slot);
   new xe::ui::HostNotificationWindow(imgui_drawer(), "Save state", text, 0);
+}
+
+void EmulatorWindow::PickReShadePresetDir() {
+  auto picker = xe::ui::FilePicker::Create();
+  picker->set_mode(ui::FilePicker::Mode::kOpen);
+  picker->set_type(ui::FilePicker::Type::kDirectory);
+  picker->set_multi_selection(false);
+  picker->set_title("Select the ReShade preset folder");
+  if (!picker->Show(window_.get())) {
+    return;
+  }
+  auto selected = picker->selected_files();
+  if (selected.empty() || selected[0].empty()) {
+    return;
+  }
+  gpu::GraphicsSystem* graphics_system = emulator_->graphics_system();
+  ui::Presenter* presenter =
+      graphics_system ? graphics_system->presenter() : nullptr;
+  if (presenter) {
+    presenter->SetReShadePresetDirFromUIThread(selected[0].string());
+  }
+}
+
+void EmulatorWindow::PickReShadeShaderDir() {
+  auto picker = xe::ui::FilePicker::Create();
+  picker->set_mode(ui::FilePicker::Mode::kOpen);
+  picker->set_type(ui::FilePicker::Type::kDirectory);
+  picker->set_multi_selection(false);
+  picker->set_title("Select the ReShade shader folder");
+  if (!picker->Show(window_.get())) {
+    return;
+  }
+  auto selected = picker->selected_files();
+  if (selected.empty() || selected[0].empty()) {
+    return;
+  }
+  gpu::GraphicsSystem* graphics_system = emulator_->graphics_system();
+  ui::Presenter* presenter =
+      graphics_system ? graphics_system->presenter() : nullptr;
+  if (presenter) {
+    presenter->SetReShadeShaderDirFromUIThread(selected[0].string());
+  }
 }
 
 void EmulatorWindow::PickSaveStateDir() {
@@ -2956,6 +3058,427 @@ void EmulatorWindow::ToggleGpuOptionsDialog() {
   }
 }
 
+std::filesystem::path EmulatorWindow::ReShadeDefaultDir(
+    const char* leaf) const {
+  // Sit alongside the content and games folders (the content folder's
+  // parent), e.g. <.../Xenia>/reshade-shaders.
+  std::filesystem::path base = emulator_->content_root().parent_path();
+  if (base.empty()) {
+    base = emulator_->storage_root();
+  }
+  return base / leaf;
+}
+
+void EmulatorWindow::SeedReShadeShaders() {
+  // Only when the user has not set an explicit shader folder.
+  gpu::GraphicsSystem* graphics_system = emulator_->graphics_system();
+  ui::Presenter* presenter =
+      graphics_system ? graphics_system->presenter() : nullptr;
+  if (!presenter || !presenter->GetReShadeShaderDirFromUIThread().empty()) {
+    return;
+  }
+  const std::filesystem::path dest = ReShadeDefaultDir("reshade-shaders");
+  std::error_code ec;
+  // If the folder already has a .fx, leave it alone.
+  if (std::filesystem::exists(dest, ec)) {
+    for (std::filesystem::directory_iterator it(dest, ec), end;
+         it != end && !ec; it.increment(ec)) {
+      if (it->path().extension() == ".fx") {
+        return;
+      }
+    }
+  }
+  // Bundled curated shaders ship next to the executable.
+  const std::filesystem::path bundled =
+      xe::filesystem::GetExecutableFolder() / "reshade-shaders";
+  if (!std::filesystem::exists(bundled, ec)) {
+    return;
+  }
+  std::filesystem::create_directories(dest, ec);
+  std::filesystem::copy(
+      bundled, dest,
+      std::filesystem::copy_options::recursive |
+          std::filesystem::copy_options::overwrite_existing,
+      ec);
+  if (ec) {
+    XELOGW("ReShade: could not seed shaders into '{}': {}", dest.string(),
+           ec.message());
+    return;
+  }
+  XELOGI("ReShade: seeded bundled shaders into '{}'", dest.string());
+  presenter->SetReShadeShaderDirFromUIThread(dest.string());
+}
+
+void EmulatorWindow::ToggleReShadeEffect() {
+  gpu::GraphicsSystem* graphics_system = emulator_->graphics_system();
+  ui::Presenter* presenter =
+      graphics_system ? graphics_system->presenter() : nullptr;
+  std::vector<ui::Presenter::ReShadeEffectInfo> stack =
+      presenter ? presenter->GetReShadeStackFromUIThread()
+                : std::vector<ui::Presenter::ReShadeEffectInfo>();
+  if (!presenter || stack.empty()) {
+    new xe::ui::HostNotificationWindow(imgui_drawer(), "ReShade",
+                                       "No effects loaded", 0);
+    return;
+  }
+  bool any_on = false;
+  for (const auto& e : stack) {
+    any_on = any_on || e.enabled;
+  }
+  const bool turn_on = !any_on;  // all off -> on; otherwise all off.
+  for (int i = 0; i < int(stack.size()); ++i) {
+    presenter->SetReShadeEffectEnabledFromUIThread(i, turn_on);
+  }
+  new xe::ui::HostNotificationWindow(
+      imgui_drawer(), "ReShade", turn_on ? "Effects on" : "Effects off", 0);
+}
+
+void EmulatorWindow::ToggleReShadeOverlay() {
+  if (!reshade_overlay_dialog_) {
+    reshade_overlay_dialog_ =
+        std::make_unique<ReShadeOverlayDialog>(imgui_drawer_.get(), *this);
+  } else {
+    if (reshade_overlay_dialog_->IsClosing()) {
+      reshade_overlay_dialog_.release();
+    } else {
+      reshade_overlay_dialog_.reset();
+    }
+  }
+}
+
+void EmulatorWindow::ReShadeOverlayDialog::OnDraw(ImGuiIO& io) {
+  ui::Presenter* presenter = nullptr;
+  gpu::GraphicsSystem* graphics_system =
+      emulator_window_.emulator_->graphics_system();
+  if (graphics_system) {
+    presenter = graphics_system->presenter();
+  }
+
+  ImGui::SetNextWindowPos(ImVec2(20.0f, 20.0f), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(380.0f, 640.0f), ImGuiCond_FirstUseEver);
+  bool open = true;
+  if (!ImGui::Begin("ReShade", &open, ImGuiWindowFlags_NoSavedSettings)) {
+    ImGui::End();
+    if (!open) {
+      Close();
+    }
+    return;
+  }
+
+  if (!presenter) {
+    ImGui::TextUnformatted("No presenter.");
+    ImGui::End();
+    if (!open) {
+      Close();
+    }
+    return;
+  }
+
+  ImGui::TextDisabled("Home toggles this window");
+  ImGui::Separator();
+
+  // Shader folder: editable path (type or paste, then Set). Persisted to
+  // the config so it is remembered next launch; empty falls back to the
+  // default folder next to content/games.
+  std::string shader_dir = presenter->GetReShadeShaderDirFromUIThread();
+  if (shader_dir.empty()) {
+    shader_dir = emulator_window_.ReShadeDefaultDir("reshade-shaders").string();
+  }
+  if (!shader_dir_buffer_initialized_) {
+    std::snprintf(shader_dir_buffer_, sizeof(shader_dir_buffer_), "%s",
+                  shader_dir.c_str());
+    shader_dir_buffer_initialized_ = true;
+  }
+  ImGui::TextUnformatted("Shader folder:");
+  ImGui::SetNextItemWidth(-70.0f);
+  bool apply_dir = ImGui::InputText(
+      "##rs_dir", shader_dir_buffer_, sizeof(shader_dir_buffer_),
+      ImGuiInputTextFlags_EnterReturnsTrue);
+  ImGui::SameLine();
+  if (ImGui::Button("Set##rs_setdir")) {
+    apply_dir = true;
+  }
+  if (apply_dir) {
+    presenter->SetReShadeShaderDirFromUIThread(shader_dir_buffer_);
+  }
+  // Browse: the GTK folder picker can't run inside the ImGui draw, so defer
+  // it to the UI loop.
+  if (ImGui::Button("Browse...##rs_browse")) {
+    EmulatorWindow& ew = emulator_window_;
+    ew.app_context().CallInUIThreadDeferred(
+        [&ew]() { ew.PickReShadeShaderDir(); });
+  }
+  ImGui::Text("Shaders (%s)",
+              shader_dir.empty() ? "no folder set" : shader_dir.c_str());
+  ImGui::TextDisabled("click to add to the stack");
+  if (ImGui::BeginListBox("##rs_shaders", ImVec2(-FLT_MIN, 120.0f))) {
+    if (!shader_dir.empty()) {
+      std::error_code ec;
+      std::vector<std::filesystem::path> fx_files;
+      for (std::filesystem::directory_iterator it(shader_dir, ec), end;
+           it != end && !ec; it.increment(ec)) {
+        if (it->is_regular_file(ec) && it->path().extension() == ".fx") {
+          fx_files.push_back(it->path());
+        }
+      }
+      std::sort(fx_files.begin(), fx_files.end());
+      for (const auto& fx : fx_files) {
+        const std::string path_str = fx.string();
+        const std::string name = fx.filename().string();
+        if (ImGui::Selectable(name.c_str(), false)) {
+          presenter->AddReShadeEffectFromUIThread(path_str);
+        }
+      }
+    }
+    ImGui::EndListBox();
+  }
+  ImGui::Separator();
+
+  // Named presets: a folder of preset files; clicking one loads it, Save
+  // writes the current configuration under the typed name.
+  std::string preset_dir = presenter->GetReShadePresetDirFromUIThread();
+  if (preset_dir.empty()) {
+    preset_dir = emulator_window_.ReShadeDefaultDir("reshade-presets").string();
+  }
+  if (!preset_dir_buffer_initialized_) {
+    std::snprintf(preset_dir_buffer_, sizeof(preset_dir_buffer_), "%s",
+                  preset_dir.c_str());
+    preset_dir_buffer_initialized_ = true;
+  }
+  ImGui::TextUnformatted("Preset folder:");
+  ImGui::SetNextItemWidth(-70.0f);
+  bool apply_preset_dir = ImGui::InputText(
+      "##rs_presetdir", preset_dir_buffer_, sizeof(preset_dir_buffer_),
+      ImGuiInputTextFlags_EnterReturnsTrue);
+  ImGui::SameLine();
+  if (ImGui::Button("Set##rs_setpresetdir")) {
+    apply_preset_dir = true;
+  }
+  if (apply_preset_dir) {
+    presenter->SetReShadePresetDirFromUIThread(preset_dir_buffer_);
+  }
+  if (ImGui::Button("Browse...##rs_presetbrowse")) {
+    EmulatorWindow& ew = emulator_window_;
+    ew.app_context().CallInUIThreadDeferred(
+        [&ew]() { ew.PickReShadePresetDir(); });
+  }
+  ImGui::TextUnformatted("Presets (click to pick, then Load or Save):");
+  if (ImGui::BeginListBox("##rs_presets", ImVec2(-FLT_MIN, 80.0f))) {
+    std::error_code ec;
+    std::vector<std::filesystem::path> preset_files;
+    for (std::filesystem::directory_iterator it(preset_dir, ec), end;
+         it != end && !ec; it.increment(ec)) {
+      if (it->is_regular_file(ec) && it->path().extension() == ".txt") {
+        preset_files.push_back(it->path());
+      }
+    }
+    std::sort(preset_files.begin(), preset_files.end());
+    for (const auto& preset : preset_files) {
+      const std::string name = preset.stem().string();
+      const bool selected = name == preset_name_buffer_;
+      // Clicking a preset fills the name box (so Load loads it, or Save
+      // overwrites it); a double-click loads it outright.
+      if (ImGui::Selectable((name + "##rs_preset_" + name).c_str(),
+                            selected)) {
+        std::snprintf(preset_name_buffer_, sizeof(preset_name_buffer_), "%s",
+                      name.c_str());
+      }
+      if (ImGui::IsItemHovered() &&
+          ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        presenter->LoadReShadePresetFileFromUIThread(preset.string());
+      }
+    }
+    ImGui::EndListBox();
+  }
+  // Name field (hint shown inside it) + Load + Save. The named preset is
+  // <preset folder>/<name>.txt.
+  ImGui::SetNextItemWidth(-120.0f);
+  bool save_preset = ImGui::InputTextWithHint(
+      "##rs_presetname", "preset name", preset_name_buffer_,
+      sizeof(preset_name_buffer_), ImGuiInputTextFlags_EnterReturnsTrue);
+  auto named_preset_path = [&]() {
+    std::filesystem::path path =
+        std::filesystem::path(preset_dir) / preset_name_buffer_;
+    if (path.extension() != ".txt") {
+      path += ".txt";
+    }
+    return path;
+  };
+  ImGui::SameLine();
+  if (ImGui::Button("Load##rs_loadpreset") && preset_name_buffer_[0]) {
+    presenter->LoadReShadePresetFileFromUIThread(named_preset_path().string());
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Save##rs_savepreset")) {
+    save_preset = true;
+  }
+  if (save_preset && preset_name_buffer_[0]) {
+    presenter->SaveReShadePresetToFileFromUIThread(named_preset_path().string());
+  }
+  ImGui::Separator();
+
+  // Depth feed on/off and orientation (for depth-based effects: AO, DOF,
+  // fog). These mirror --reshade_depth and the depth convention flags and
+  // are persisted to the config.
+  {
+    bool depth_enabled = presenter->GetReShadeDepthEnabledFromUIThread();
+    if (ImGui::Checkbox("Depth feed (for AO / DOF / fog)", &depth_enabled)) {
+      presenter->SetReShadeDepthEnabledFromUIThread(depth_enabled);
+    }
+    ImGui::TextDisabled(
+        "Feeds the guest depth buffer to effects that sample DEPTH.");
+    bool reversed = presenter->GetReShadeDepthReversedFromUIThread();
+    bool upside_down = presenter->GetReShadeDepthUpsideDownFromUIThread();
+    bool orientation_changed = false;
+    if (ImGui::Checkbox("Reversed depth (1 = near)", &reversed)) {
+      orientation_changed = true;
+    }
+    if (ImGui::Checkbox("Flip depth vertically", &upside_down)) {
+      orientation_changed = true;
+    }
+    if (orientation_changed) {
+      presenter->SetReShadeDepthOrientationFromUIThread(reversed, upside_down);
+    }
+  }
+
+  // Depth feed: which guest depth buffer the feed captures. The candidates
+  // are what scene passes wrote last frame; Auto takes the largest.
+  {
+    std::vector<ui::Presenter::ReShadeDepthBufferInfo> depth_buffers =
+        presenter->GetReShadeDepthBuffersFromUIThread();
+    int depth_choice = presenter->GetReShadeDepthBufferChoiceFromUIThread();
+    auto depth_buffer_label = [&](int index) {
+      const ui::Presenter::ReShadeDepthBufferInfo& info =
+          depth_buffers[index];
+      std::string label = std::to_string(index) + ": " +
+                          std::to_string(info.width) + "x" +
+                          std::to_string(info.height);
+      if (info.samples > 1) {
+        label += " " + std::to_string(info.samples) + "x MSAA";
+      }
+      label += ", " + std::to_string(info.passes) +
+               (info.passes == 1 ? " pass" : " passes");
+      if (info.picked) {
+        label += " - captured";
+      }
+      return label;
+    };
+    ImGui::TextUnformatted("Depth buffer:");
+    ImGui::SameLine();
+    std::string preview;
+    if (depth_choice < 0) {
+      preview = "Auto";
+    } else if (depth_choice < int(depth_buffers.size())) {
+      preview = depth_buffer_label(depth_choice);
+    } else {
+      preview = std::to_string(depth_choice) + ": (not seen this frame)";
+    }
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::BeginCombo("##rs_depthbuf", preview.c_str())) {
+      if (ImGui::Selectable("Auto (largest scene depth)", depth_choice < 0)) {
+        presenter->SetReShadeDepthBufferChoiceFromUIThread(-1);
+      }
+      for (int i = 0; i < int(depth_buffers.size()); ++i) {
+        if (ImGui::Selectable(
+                (depth_buffer_label(i) + "##rs_depthbuf_" + std::to_string(i))
+                    .c_str(),
+                depth_choice == i)) {
+          presenter->SetReShadeDepthBufferChoiceFromUIThread(i);
+        }
+      }
+      ImGui::EndCombo();
+    }
+    if (depth_buffers.empty()) {
+      ImGui::TextDisabled(
+          "No depth buffers listed - the depth feed is off or no effect "
+          "samples depth.");
+    }
+  }
+  ImGui::Separator();
+
+  std::vector<ui::Presenter::ReShadeEffectInfo> stack =
+      presenter->GetReShadeStackFromUIThread();
+  if (stack.empty()) {
+    ImGui::TextDisabled("No effects - click a shader above to add one.");
+    ImGui::End();
+    if (!open) {
+      Close();
+    }
+    return;
+  }
+
+  ImGui::TextUnformatted("Active effects (top runs first):");
+  for (int i = 0; i < int(stack.size()); ++i) {
+    ImGui::PushID(i);
+    // Enable checkbox.
+    bool enabled = stack[i].enabled;
+    if (ImGui::Checkbox("##en", &enabled)) {
+      presenter->SetReShadeEffectEnabledFromUIThread(i, enabled);
+    }
+    ImGui::SameLine();
+    // Reorder / remove.
+    if (ImGui::SmallButton("up")) {
+      presenter->MoveReShadeEffectFromUIThread(i, -1);
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("dn")) {
+      presenter->MoveReShadeEffectFromUIThread(i, 1);
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("X")) {
+      presenter->RemoveReShadeEffectFromUIThread(i);
+      ImGui::PopID();
+      break;  // stack changed; redraw next frame
+    }
+    ImGui::SameLine();
+    if (ImGui::CollapsingHeader(stack[i].name.c_str())) {
+      std::vector<ui::Presenter::ReShadeUniformControl> controls =
+          presenter->GetReShadeControlsFromUIThread(i);
+      if (controls.empty()) {
+        ImGui::TextDisabled("  No adjustable settings.");
+      }
+      for (auto& control : controls) {
+        const std::string id = "##rs_" + std::to_string(i) + "_" + control.name;
+        bool changed = false;
+        if (control.ui_type == "color" && control.components >= 3) {
+          changed = ImGui::ColorEdit3((control.label + id).c_str(),
+                                      control.value,
+                                      ImGuiColorEditFlags_NoInputs);
+        } else if (control.ui_type == "bool" || control.components == 0) {
+          bool b = control.value[0] != 0.0f;
+          if (ImGui::Checkbox((control.label + id).c_str(), &b)) {
+            control.value[0] = b ? 1.0f : 0.0f;
+            changed = true;
+          }
+        } else if (control.components == 1) {
+          changed = ImGui::SliderFloat((control.label + id).c_str(),
+                                       &control.value[0], control.min_value,
+                                       control.max_value, "%.3f");
+        } else {
+          changed = ImGui::SliderScalarN(
+              (control.label + id).c_str(), ImGuiDataType_Float, control.value,
+              control.components, &control.min_value, &control.max_value,
+              "%.3f");
+        }
+        if (changed) {
+          presenter->SetReShadeControlFromUIThread(i, control.name,
+                                                   control.value,
+                                                   control.components);
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+          presenter->SaveReShadePresetFromUIThread();
+        }
+      }
+    }
+    ImGui::PopID();
+  }
+
+  ImGui::End();
+  if (!open) {
+    Close();
+  }
+}
+
 void EmulatorWindow::GpuOptionsDialog::OnDraw(ImGuiIO& io) {
   ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver);
   ImGui::SetNextWindowBgAlpha(0.9f);
@@ -3582,6 +4105,9 @@ bool EmulatorWindow::HandleAssignableHotkeys(ui::VirtualKey key,
         case HotkeyAction::kPrevSlot:
           CycleSaveStateSlot(-1);
           break;
+        case HotkeyAction::kToggleReShade:
+          ToggleReShadeEffect();
+          break;
         default:
           break;
       }
@@ -3601,6 +4127,9 @@ void EmulatorWindow::ToggleMute() {
 
 void EmulatorWindow::OnKeyChar(ui::KeyEvent& e) {
   if (!emulator_initialized_ || disable_hotkeys_) {
+    return;
+  }
+  if (imgui_drawer_ && imgui_drawer_->GetIO().WantTextInput) {
     return;
   }
   // On GTK the virtual key of a char event is the Unicode code point.
@@ -3638,6 +4167,13 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
     return;
   }
 
+  // When an ImGui text field is active (e.g. the ReShade overlay's shader
+  // folder box), let the keystrokes go to it instead of firing emulator
+  // hotkeys like '-' (slow motion).
+  if (imgui_drawer_ && imgui_drawer_->GetIO().WantTextInput) {
+    return;
+  }
+
   if (HandleAssignableHotkeys(e.virtual_key(), e)) {
     return;
   }
@@ -3672,6 +4208,9 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
 
     case ui::VirtualKey::kF6: {
       ToggleDisplayConfigDialog();
+    } break;
+    case ui::VirtualKey::kHome: {
+      ToggleReShadeOverlay();
     } break;
     case ui::VirtualKey::kF11: {
       ToggleFullscreen();

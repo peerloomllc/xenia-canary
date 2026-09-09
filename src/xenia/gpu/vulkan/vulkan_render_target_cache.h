@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <deque>
 #include <memory>
 #include <chrono>
 #include <unordered_map>
@@ -202,6 +203,71 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       xenos::ColorRenderTargetFormat format,
       bool* is_integer_out = nullptr) const;
 
+  // ReShade depth feed: describes the scene depth render target chosen for
+  // the feed (its image, current layout/usage and extent/format) so the
+  // command processor can blit its depth out without touching the private
+  // render target type.
+  struct ReShadeSceneDepth {
+    VkImage image = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;  // depth-aspect sampled view
+    uint32_t width = 0;
+    uint32_t height = 0;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkPipelineStageFlags stage_mask = 0;
+    VkAccessFlags access_mask = 0;
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+  };
+  // Picks the most likely "scene" depth render target (largest depth RT,
+  // MSAA allowed) on the host render target path. Returns false if none is
+  // suitable (wrong path, empty cache, undefined layout).
+  bool GetReShadeSceneDepth(ReShadeSceneDepth& out) const;
+  // Records a fullscreen pass resolving the scene depth into an R32F colour
+  // image (single-sampled, left in SHADER_READ_ONLY_OPTIMAL) for the ReShade
+  // depth feed, on the command processor's graphics command buffer. `dst`
+  // must be sized to `out.width` x `out.height`.
+  void RecordReShadeDepthResolve(const ReShadeSceneDepth& src, VkImage dst,
+                                 VkImageView dst_view, uint32_t width,
+                                 uint32_t height);
+  // ReShade depth-buffer detection. During the frame, when a scene pass
+  // ends (one with both colour and depth bound - not a depth-only shadow
+  // pass), copy the largest such depth into a persistent MSAA holding image
+  // while it is still valid, before a later pass reuses the buffer. A plain
+  // image copy (no render pass), safe to record between passes. Returns true
+  // if it copied.
+  bool SnapshotSceneDepthIfScenePass();
+  // Fills `out` from this frame's scene-depth snapshot (the MSAA holding
+  // image, in SHADER_READ), if one was captured; the command processor
+  // resolves it at swap.
+  bool GetReShadeDepthSnapshot(ReShadeSceneDepth& out) const;
+  // Clears the snapshot's per-frame validity and rolls this frame's
+  // candidate list over for the UI; call once per presented frame.
+  void ResetReShadeDepthSnapshot();
+  // One depth buffer that a scene pass used this frame (for the manual
+  // depth-buffer picker). Ordinal = position in the list = first-use order
+  // within the frame.
+  struct ReShadeDepthCandidate {
+    VkImage image = VK_NULL_HANDLE;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t samples = 1;
+    uint32_t passes = 0;
+  };
+  // Last completed frame's candidates and which ordinal the snapshot came
+  // from (-1 if none). Called from the CP thread at swap.
+  const std::vector<ReShadeDepthCandidate>& GetReShadeDepthCandidates() const {
+    return reshade_depth_candidates_last_;
+  }
+  int32_t GetReShadeDepthSnapshotOrdinal() const {
+    return reshade_depth_snapshot_ordinal_last_;
+  }
+  // Manual depth-buffer choice: -1 = auto (largest scene depth), >= 0 = the
+  // candidate at that ordinal. Cached by the CP from the presenter each
+  // frame.
+  void SetReShadeDepthBufferChoice(int32_t choice) {
+    reshade_depth_buffer_choice_ = choice;
+  }
+
  protected:
   bool IsGammaFormatHostStorageSeparate() const override;
 
@@ -303,6 +369,65 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   VkDeviceMemory edram_buffer_memory_ = VK_NULL_HANDLE;
   VkBuffer edram_buffer_ = VK_NULL_HANDLE;
+
+  // ReShade depth resolve (fullscreen depth -> R32F pass). Created lazily.
+  bool EnsureReShadeDepthResolve();
+  void DestroyReShadeDepthResolve();
+  VkRenderPass reshade_depth_resolve_render_pass_ = VK_NULL_HANDLE;
+  VkDescriptorSetLayout reshade_depth_resolve_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout reshade_depth_resolve_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline reshade_depth_resolve_pipeline_ms_ = VK_NULL_HANDLE;
+  VkPipeline reshade_depth_resolve_pipeline_1x_ = VK_NULL_HANDLE;
+  VkSampler reshade_depth_resolve_sampler_ = VK_NULL_HANDLE;
+  VkDescriptorPool reshade_depth_resolve_descriptor_pool_ = VK_NULL_HANDLE;
+  static constexpr uint32_t kReShadeDepthResolveSets = 3;
+  VkDescriptorSet
+      reshade_depth_resolve_sets_[kReShadeDepthResolveSets] = {};
+  uint32_t reshade_depth_resolve_set_index_ = 0;
+  VkFramebuffer reshade_depth_resolve_framebuffer_ = VK_NULL_HANDLE;
+  VkImageView reshade_depth_resolve_fb_view_ = VK_NULL_HANDLE;
+  uint32_t reshade_depth_resolve_fb_width_ = 0;
+  uint32_t reshade_depth_resolve_fb_height_ = 0;
+  // Submission the current framebuffer was last recorded into, and old
+  // framebuffers retired on a destination change, kept until the submission
+  // that last used them completes (destroying one still referenced by an
+  // in-flight command buffer is invalid).
+  uint64_t reshade_depth_resolve_fb_last_submission_ = 0;
+  std::deque<std::pair<uint64_t, VkFramebuffer>>
+      reshade_depth_resolve_retired_fbs_;
+  // Scene depth snapshot (depth-buffer detection): a persistent MSAA holding
+  // image copied from this frame's largest scene pass's depth, resolved at
+  // swap.
+  VkImage reshade_depth_snapshot_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory reshade_depth_snapshot_memory_ = VK_NULL_HANDLE;
+  VkImageView reshade_depth_snapshot_view_ = VK_NULL_HANDLE;
+  uint32_t reshade_depth_snapshot_width_ = 0;
+  uint32_t reshade_depth_snapshot_height_ = 0;
+  VkFormat reshade_depth_snapshot_format_ = VK_FORMAT_UNDEFINED;
+  VkSampleCountFlagBits reshade_depth_snapshot_samples_ =
+      VK_SAMPLE_COUNT_1_BIT;
+  bool reshade_depth_snapshot_valid_ = false;
+  uint64_t reshade_depth_snapshot_best_area_ = 0;
+  // Snapshot holding images retired on a size/format change, kept until the
+  // CP submission that last used them completes.
+  struct ReShadeRetiredSnapshotImage {
+    uint64_t last_submission = 0;
+    VkImage image = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+  };
+  std::deque<ReShadeRetiredSnapshotImage> reshade_depth_snapshot_retired_;
+  uint64_t reshade_depth_snapshot_last_submission_ = 0;
+  // Depth-buffer picker state: this frame's candidates, last frame's for the
+  // UI, the ordinal the snapshot came from and the manual choice.
+  std::vector<ReShadeDepthCandidate> reshade_depth_candidates_;
+  std::vector<ReShadeDepthCandidate> reshade_depth_candidates_last_;
+  int32_t reshade_depth_snapshot_ordinal_ = -1;
+  int32_t reshade_depth_snapshot_ordinal_last_ = -1;
+  int32_t reshade_depth_buffer_choice_ = -1;
+  // Fills ReShadeSceneDepth from a specific depth render target.
+  void FillReShadeSceneDepthFrom(const RenderTarget* rt,
+                                 ReShadeSceneDepth& out) const;
   // Host-visible staging for RestoreEdramSnapshot, kept for reuse.
   VkBuffer edram_snapshot_upload_buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory edram_snapshot_upload_buffer_memory_ = VK_NULL_HANDLE;

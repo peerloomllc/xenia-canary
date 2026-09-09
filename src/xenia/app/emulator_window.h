@@ -64,6 +64,7 @@ class EmulatorWindow {
     kLoadState,
     kNextSlot,
     kPrevSlot,
+    kToggleReShade,
     kCount
   };
 
@@ -274,6 +275,28 @@ class EmulatorWindow {
   };
   void ToggleGpuOptionsDialog();
   std::unique_ptr<GpuOptionsDialog> gpu_options_dialog_;
+
+  // Standalone ReShade overlay (its own window + Home hotkey, like ReShade in
+  // other games), driven by the presenter's ReShade control API.
+  class ReShadeOverlayDialog final : public ui::ImGuiDialog {
+   public:
+    ReShadeOverlayDialog(ui::ImGuiDrawer* imgui_drawer,
+                         EmulatorWindow& emulator_window)
+        : ui::ImGuiDialog(imgui_drawer), emulator_window_(emulator_window) {}
+
+   protected:
+    void OnDraw(ImGuiIO& io) override;
+
+   private:
+    EmulatorWindow& emulator_window_;
+    char shader_dir_buffer_[1024] = {};
+    bool shader_dir_buffer_initialized_ = false;
+    char preset_dir_buffer_[1024] = {};
+    bool preset_dir_buffer_initialized_ = false;
+    char preset_name_buffer_[256] = {};
+  };
+  void ToggleReShadeOverlay();
+  std::unique_ptr<ReShadeOverlayDialog> reshade_overlay_dialog_;
   // Display > Dialog size: cvar ui_scale, applied to the ImGui drawer.
   void SetUIScale(float scale);
 #if XE_PLATFORM_LINUX
@@ -490,6 +513,16 @@ class EmulatorWindow {
   // Folder setting (cvar save_state_dir, "" = <storage root>/savestates).
   void PickSaveStateDir();  // folder picker; call from the UI loop
   void SetSaveStateDir(const std::filesystem::path& dir);
+  void PickReShadeShaderDir();
+  void PickReShadePresetDir();  // folder picker for the ReShade overlay
+  void ToggleReShadeEffect();   // enable/disable the active effect (hotkey)
+  // Default ReShade folder next to the content/games folders (the content
+  // folder's parent), e.g. <.../Xenia>/reshade-shaders. `leaf` is the
+  // folder name.
+  std::filesystem::path ReShadeDefaultDir(const char* leaf) const;
+  // On first run, copy the bundled curated shaders (next to the executable)
+  // into the default shader folder if it has none yet.
+  void SeedReShadeShaders();
   static size_t CountSaveStateFiles(const std::filesystem::path& dir);
   // Deletes a slot's .sav and its .png thumbnail. Reports what happened in a
   // notification; a slot with no file is left alone.

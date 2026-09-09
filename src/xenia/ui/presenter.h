@@ -362,10 +362,113 @@ class Presenter {
       uint32_t frontbuffer_width, uint32_t frontbuffer_height,
       uint32_t display_aspect_ratio_x, uint32_t display_aspect_ratio_y,
       std::function<bool(GuestOutputRefreshContext& context)> refresher);
+
+  // ---- Native ReShade post-process controls (see vulkan_reshade). ----
+  // A UI-facing view of one effect uniform: label, kind, range, current
+  // value(s). `components` is 1..4 floats.
+  struct ReShadeUniformControl {
+    std::string name;
+    std::string label;
+    std::string ui_type;  // "slider"/"drag", "color", "bool", ...
+    float min_value = 0.0f;
+    float max_value = 1.0f;
+    int components = 1;
+    float value[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    // Byte placement of the uniform in the effect's uniform buffer (controls
+    // skip built-in uniforms, so their index does not line up with the
+    // effect's uniform list).
+    uint32_t offset = 0;
+    uint32_t size = 0;
+  };
+  // One entry in the effect stack, as the UI sees it.
+  struct ReShadeEffectInfo {
+    std::string name;
+    std::string path;
+    bool enabled = true;
+  };
+  // True when the ReShade runtime exists (Vulkan build with the compiler).
+  virtual bool IsReShadeAvailable() const { return false; }
+  // The effect stack, in render order (guest output flows through each in
+  // turn). Empty = nothing applied.
+  virtual std::vector<ReShadeEffectInfo> GetReShadeStackFromUIThread() {
+    return {};
+  }
+  // Append a compiled effect to the end of the stack.
+  virtual void AddReShadeEffectFromUIThread(const std::string& path) {}
+  // Remove the stack entry at `index`.
+  virtual void RemoveReShadeEffectFromUIThread(int index) {}
+  // Move the entry at `index` by `delta` positions (earlier/later in the
+  // chain), clamped.
+  virtual void MoveReShadeEffectFromUIThread(int index, int delta) {}
+  // Enable/disable the entry at `index` (kept in the stack, skipped when
+  // rendering).
+  virtual void SetReShadeEffectEnabledFromUIThread(int index, bool enabled) {}
+  // The controls of the stack entry at `index`.
+  virtual std::vector<ReShadeUniformControl> GetReShadeControlsFromUIThread(
+      int index) {
+    return {};
+  }
+  virtual void SetReShadeControlFromUIThread(int index,
+                                             const std::string& name,
+                                             const float* values,
+                                             int components) {}
+  // Shader browser: the directory to list .fx files from. The loaded stack
+  // is read via GetReShadeStackFromUIThread.
+  virtual std::string GetReShadeShaderDirFromUIThread() const { return {}; }
+  virtual void SetReShadeShaderDirFromUIThread(const std::string& dir) {}
+  // Per-game presets: `file` is where the running title's preset lives.
+  // Setting a non-empty path loads and applies it (shader + enabled +
+  // uniform values) if it exists, and later shader/enable changes are saved
+  // back to it. Empty turns persistence off.
+  virtual void SetReShadePresetFileFromUIThread(const std::string& file) {}
+  // Writes the current shader/enabled/values to the preset file now (the
+  // overlay calls this when a slider edit completes).
+  virtual void SaveReShadePresetFromUIThread() {}
+  // Named presets: the folder the overlay lists preset files from (persisted
+  // to the config), loading one applies it (and it becomes the running
+  // title's remembered state), and saving writes the current configuration
+  // to the given file.
+  virtual std::string GetReShadePresetDirFromUIThread() const { return {}; }
+  virtual void SetReShadePresetDirFromUIThread(const std::string& dir) {}
+  virtual void LoadReShadePresetFileFromUIThread(const std::string& file) {}
+  virtual void SaveReShadePresetToFileFromUIThread(const std::string& file) {}
+  // Depth feed (--reshade_depth): one guest depth buffer scene passes wrote
+  // last frame, for the overlay's manual depth-buffer picker.
+  struct ReShadeDepthBufferInfo {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t samples = 1;
+    uint32_t passes = 0;
+    // The buffer the feed actually captured last frame.
+    bool picked = false;
+  };
+  virtual std::vector<ReShadeDepthBufferInfo>
+  GetReShadeDepthBuffersFromUIThread() {
+    return {};
+  }
+  // Manual depth-buffer choice: -1 = auto (largest scene depth), >= 0 = the
+  // listed ordinal. Persisted to the config.
+  virtual int GetReShadeDepthBufferChoiceFromUIThread() const { return -1; }
+  virtual void SetReShadeDepthBufferChoiceFromUIThread(int choice) {}
+  // Depth feed on/off (--reshade_depth). Live; persisted to the config.
+  virtual bool GetReShadeDepthEnabledFromUIThread() const { return false; }
+  virtual void SetReShadeDepthEnabledFromUIThread(bool enabled) {}
+  // Depth orientation (--reshade_depth_reversed / _upside_down). Baked into
+  // the shaders at compile, so a change recompiles the loaded depth effects.
+  // Persisted to the config.
+  virtual bool GetReShadeDepthReversedFromUIThread() const { return true; }
+  virtual bool GetReShadeDepthUpsideDownFromUIThread() const { return false; }
+  virtual void SetReShadeDepthOrientationFromUIThread(bool reversed,
+                                                      bool upside_down) {}
   // The implementation must be callable from any thread, including from
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.
   virtual bool CaptureGuestOutput(RawImage& image_out) = 0;
+  // Captures the guest output after the ReShade effect ran (the raw guest
+  // output when no effect is active). Diagnostic; UI thread.
+  virtual bool CaptureReShadeOutput(RawImage& image_out) {
+    return CaptureGuestOutput(image_out);
+  }
   const GuestOutputPaintConfig& GetGuestOutputPaintConfigFromUIThread() const {
     return guest_output_paint_config_;
   }

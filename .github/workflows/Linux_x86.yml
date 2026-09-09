@@ -119,6 +119,13 @@ jobs:
           # Copy any extra runtime data directories alongside the binary
           find build/bin/Linux/Release -maxdepth 1 -type d ! -name Release -exec cp -r {} ${APPDIR}/usr/bin/ \;
 
+          # Bundle the curated ReShade shader pack next to the binary so the
+          # built-in ReShade runtime works out of the box (seeded into the
+          # user's shader folder on first run).
+          if [ -d assets/reshade-shaders ]; then
+            cp -r assets/reshade-shaders ${APPDIR}/usr/bin/reshade-shaders
+          fi
+
           # BSD-3 asks binary distributions to carry the notice.
           cp ${GITHUB_WORKSPACE}/LICENSE ${APPDIR}/LICENSE
 

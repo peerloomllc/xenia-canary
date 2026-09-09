@@ -2034,10 +2034,100 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
 
+        // ReShade depth feed (experimental, --reshade_depth): blit the guest
+        // scene depth into a presenter-owned image so depth-based effects can
+        // read it. Same submission as the color image, so it rides the same
+        // presenter synchronization.
+        auto* reshade_presenter = static_cast<ui::vulkan::VulkanPresenter*>(
+            graphics_system_->presenter());
+        bool reshade_depth_fed = false;
+        {
+          const bool depth_wanted =
+              reshade_presenter && reshade_presenter->WantsReShadeDepth();
+          // Cache for the NEXT frame's mid-frame snapshot (EndRenderPass).
+          reshade_depth_active_ = depth_wanted;
+          bool depth_fed = false;
+          if (depth_wanted) {
+            VulkanRenderTargetCache::ReShadeSceneDepth scene_depth;
+            // Prefer this frame's scene-depth snapshot (captured mid-frame,
+            // before the shadow pass reused the buffer); fall back to the live
+            // pick at swap.
+            if (render_target_cache_->GetReShadeDepthSnapshot(scene_depth) ||
+                render_target_cache_->GetReShadeSceneDepth(scene_depth)) {
+              // Resolve the scene depth (MSAA or 1x) into a single-sampled
+              // R32F image the ReShade runtime samples. Sized to the depth RT
+              // so the fullscreen pass maps 1:1.
+              // Xbox 360 render targets have no fixed height (only a pitch),
+              // and the depth RT pitch width can differ from the presented
+              // frontbuffer width (the scene renders at its own internal
+              // resolution). Size the resolve to the depth RT's real width with
+              // the frontbuffer's aspect, and sample its top-left 1:1; ReShade
+              // then samples this depth texture with normalised UVs, aligning it
+              // with the colour image.
+              uint32_t depth_w = scene_depth.width ? scene_depth.width
+                                                   : frontbuffer_width_scaled;
+              uint32_t depth_h =
+                  frontbuffer_width_scaled
+                      ? std::max(UINT32_C(1),
+                                 uint32_t(uint64_t(frontbuffer_height_scaled) *
+                                          depth_w / frontbuffer_width_scaled))
+                      : frontbuffer_height_scaled;
+              VkImage depth_dst = reshade_presenter->AcquireReShadeDepthImage(
+                  depth_w, depth_h, VK_FORMAT_R32_SFLOAT);
+              VkImageView depth_dst_view =
+                  reshade_presenter->GetReShadeDepthView();
+              if (depth_dst != VK_NULL_HANDLE &&
+                  depth_dst_view != VK_NULL_HANDLE) {
+                render_target_cache_->RecordReShadeDepthResolve(
+                    scene_depth, depth_dst, depth_dst_view, depth_w, depth_h);
+                depth_fed = true;
+              }
+            }
+          }
+          reshade_depth_fed = depth_fed;
+          if (reshade_presenter && !depth_fed) {
+            reshade_presenter->SetReShadeDepthValid(false);
+          }
+          // The manual depth-buffer choice for next frame's snapshots.
+          render_target_cache_->SetReShadeDepthBufferChoice(
+              depth_wanted && reshade_presenter
+                  ? reshade_presenter->GetReShadeDepthBufferChoice()
+                  : -1);
+          render_target_cache_->ResetReShadeDepthSnapshot();
+          // Publish this frame's depth-buffer candidates for the overlay's
+          // picker.
+          if (reshade_presenter && depth_wanted) {
+            const auto& candidates =
+                render_target_cache_->GetReShadeDepthCandidates();
+            int32_t picked_ordinal =
+                render_target_cache_->GetReShadeDepthSnapshotOrdinal();
+            std::vector<ui::Presenter::ReShadeDepthBufferInfo> buffer_list;
+            buffer_list.reserve(candidates.size());
+            for (size_t i = 0; i < candidates.size(); ++i) {
+              ui::Presenter::ReShadeDepthBufferInfo info;
+              info.width = candidates[i].width;
+              info.height = candidates[i].height;
+              info.samples = candidates[i].samples;
+              info.passes = candidates[i].passes;
+              info.picked = int32_t(i) == picked_ordinal;
+              buffer_list.push_back(info);
+            }
+            reshade_presenter->SetReShadeDepthBufferList(
+                std::move(buffer_list));
+          }
+        }
+
         // Need to submit all the commands before giving the image back to the
         // presenter so it can submit its own commands for displaying it to the
         // queue, and also need to submit the release barrier.
-        EndSubmission(true);
+        bool submitted = EndSubmission(true);
+        // Mark the depth image valid only now that the submission writing it
+        // is in the queue: a paint that observes the flag is then enqueued
+        // after the write (a paint enqueued before it would sample the image
+        // in the wrong layout on its first frame).
+        if (reshade_presenter && reshade_depth_fed && submitted) {
+          reshade_presenter->SetReShadeDepthValid(true);
+        }
         return true;
       });
 
@@ -2282,6 +2372,16 @@ void VulkanCommandProcessor::EndRenderPass() {
   deferred_command_buffer_.CmdVkEndRenderPass();
   current_render_pass_ = VK_NULL_HANDLE;
   current_framebuffer_ = nullptr;
+
+  // ReShade depth-buffer detection: the pass that just ended may be the scene
+  // pass whose depth the depth feed wants. Snapshot it now (a plain image
+  // copy into a holding buffer), while it is still valid, before a later pass
+  // (e.g. the character shadow map) reuses the buffer. Gated on the per-frame
+  // flag so it is a single branch when the feed is off; the copy does not
+  // touch the guest pipeline/descriptor state.
+  if (reshade_depth_active_) {
+    render_target_cache_->SnapshotSceneDepthIfScenePass();
+  }
 }
 
 VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(

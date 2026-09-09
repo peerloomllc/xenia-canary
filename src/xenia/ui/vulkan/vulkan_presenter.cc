@@ -10,12 +10,17 @@
 #include "xenia/ui/vulkan/vulkan_presenter.h"
 
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
+#include "xenia/config.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/platform.h"
+#include "xenia/ui/vulkan/vulkan_reshade.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
 
 #if XE_PLATFORM_ANDROID
@@ -48,6 +53,46 @@ DEFINE_bool(
     "may present with tearing if frames don't meet the host display refresh "
     "rate.",
     "Vulkan");
+DEFINE_string(
+    reshade_effect, "",
+    "Path to a ReShade .fx shader to load in the native post-process runtime "
+    "(experimental, work in progress). Empty to disable.",
+    "Vulkan");
+DEFINE_string(
+    reshade_preset_dir, "",
+    "Folder the ReShade overlay lists preset files from and saves new ones "
+    "into. Empty falls back to <storage root>/reshade_presets.",
+    "GPU");
+DEFINE_string(
+    reshade_shader_dir, "",
+    "Directory the ReShade overlay's shader browser lists .fx files from. "
+    "Empty falls back to the folder of --reshade_effect.",
+    "Vulkan");
+DEFINE_bool(
+    reshade_depth, false,
+    "Feed the guest scene depth buffer to ReShade effects so depth-based "
+    "shaders (DisplayDepth, ambient occlusion, depth of field) work "
+    "(experimental). Off by default; only the host render target path is "
+    "supported.",
+    "GPU");
+DEFINE_bool(
+    reshade_depth_reversed, true,
+    "The guest depth buffer is reversed (1 = near). Xbox 360 titles commonly "
+    "use reversed depth; toggle if a depth shader looks inverted "
+    "(RESHADE_DEPTH_INPUT_IS_REVERSED).",
+    "GPU");
+DEFINE_bool(
+    reshade_depth_upside_down, false,
+    "Flip the guest depth buffer vertically for ReShade "
+    "(RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN).",
+    "GPU");
+DEFINE_int32(
+    reshade_depth_buffer, -1,
+    "Which guest depth buffer the ReShade depth feed captures: -1 picks "
+    "automatically (the largest depth a colour+depth scene pass wrote), 0 "
+    "and up pick the Nth depth buffer scene passes used in the frame (the "
+    "overlay's depth buffer list shows them).",
+    "GPU");
 DEFINE_bool(
     vulkan_semaphore_reuse_workaround, false,
     "Wait for presentation queue idle before each frame to prevent semaphore "
@@ -151,6 +196,49 @@ VulkanPresenter::~VulkanPresenter() {
   ui_completion_timeline_.AwaitAllSubmissions();
   guest_output_image_refresher_completion_timeline_.AwaitAllSubmissions();
 
+  if (reshade_) {
+    for (ReShadeStackEntry& entry : reshade_stack_) {
+      if (entry.effect) {
+        reshade_->DestroyRuntime(*entry.effect);
+      }
+    }
+    reshade_stack_.clear();
+  }
+  reshade_output_image_.reset();
+  reshade_scratch_[0].reset();
+  reshade_scratch_[1].reset();
+  {
+    const ui::vulkan::VulkanDevice::Functions& dfn_reshade =
+        vulkan_device_->functions();
+    const VkDevice device_reshade = vulkan_device_->device();
+    if (reshade_depth_view_ != VK_NULL_HANDLE) {
+      dfn_reshade.vkDestroyImageView(device_reshade, reshade_depth_view_,
+                                     nullptr);
+      reshade_depth_view_ = VK_NULL_HANDLE;
+    }
+    if (reshade_depth_image_ != VK_NULL_HANDLE) {
+      dfn_reshade.vkDestroyImage(device_reshade, reshade_depth_image_, nullptr);
+      reshade_depth_image_ = VK_NULL_HANDLE;
+    }
+    if (reshade_depth_memory_ != VK_NULL_HANDLE) {
+      dfn_reshade.vkFreeMemory(device_reshade, reshade_depth_memory_, nullptr);
+      reshade_depth_memory_ = VK_NULL_HANDLE;
+    }
+    // All submissions were awaited above, so retired depth images can go too.
+    for (const ReShadeRetiredDepthImage& retired : reshade_depth_retired_) {
+      if (retired.view != VK_NULL_HANDLE) {
+        dfn_reshade.vkDestroyImageView(device_reshade, retired.view, nullptr);
+      }
+      if (retired.image != VK_NULL_HANDLE) {
+        dfn_reshade.vkDestroyImage(device_reshade, retired.image, nullptr);
+      }
+      if (retired.memory != VK_NULL_HANDLE) {
+        dfn_reshade.vkFreeMemory(device_reshade, retired.memory, nullptr);
+      }
+    }
+    reshade_depth_retired_.clear();
+  }
+
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
 
@@ -247,8 +335,140 @@ bool VulkanPresenter::CaptureGuestOutput(RawImage& image_out) {
   if (!guest_output_image) {
     return false;
   }
+  return CaptureImage(guest_output_image->image(),
+                      guest_output_image->extent(),
+                      kGuestOutputInternalLayout,
+                      kGuestOutputInternalAccessMask,
+                      kGuestOutputInternalStageMask, image_out);
+}
 
-  VkExtent2D image_extent = guest_output_image->extent();
+bool VulkanPresenter::CaptureReShadeOutput(RawImage& image_out) {
+  // Diagnostic capture of the post-effect image (the picture the paint
+  // effects sample when a ReShade effect is on). Falls back to the raw
+  // guest output when no effect is rendering, so baseline runs of a
+  // comparison land in the same code path. The image is owned by the paint
+  // thread; call this only while no shader load/unload is pending.
+  bool any_enabled = false;
+  for (const ReShadeStackEntry& entry : reshade_stack_) {
+    if (entry.effect && entry.effect->enabled &&
+        entry.effect->runtime_ready) {
+      any_enabled = true;
+      break;
+    }
+  }
+  if (!any_enabled || reshade_failed_ || !reshade_output_image_) {
+    return CaptureGuestOutput(image_out);
+  }
+  return CaptureImage(reshade_output_image_->image(),
+                      reshade_output_image_->extent(),
+                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                      VK_ACCESS_SHADER_READ_BIT,
+                      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, image_out);
+}
+
+bool VulkanPresenter::WantsReShadeDepth() const {
+  if (!cvars::reshade_depth || !reshade_) {
+    return false;
+  }
+  // Only worth feeding depth when a loaded effect actually samples it.
+  for (const ReShadeStackEntry& entry : reshade_stack_) {
+    if (!entry.effect) {
+      continue;
+    }
+    for (const VulkanReShade::Texture& texture :
+         entry.effect->textures) {
+      if (texture.is_depth) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+VkImage VulkanPresenter::AcquireReShadeDepthImage(uint32_t width,
+                                                  uint32_t height,
+                                                  VkFormat format) {
+  if (!width || !height || format == VK_FORMAT_UNDEFINED) {
+    return VK_NULL_HANDLE;
+  }
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  if (reshade_depth_image_ != VK_NULL_HANDLE &&
+      (reshade_depth_extent_.width != width ||
+       reshade_depth_extent_.height != height ||
+       reshade_depth_format_ != format)) {
+    // Size/format changed. The old image may still be sampled by an
+    // in-flight paint submission (and was written by a prior CP submission),
+    // so don't destroy it here: retire it, and the paint thread destroys it
+    // once a paint submission enqueued after this point completes. Also drop
+    // the valid flag so no paint samples the new, not yet written image.
+    std::lock_guard<std::mutex> lock(reshade_depth_mutex_);
+    ReShadeRetiredDepthImage retired;
+    retired.image = reshade_depth_image_;
+    retired.view = reshade_depth_view_;
+    retired.memory = reshade_depth_memory_;
+    reshade_depth_retired_.push_back(retired);
+    reshade_depth_image_ = VK_NULL_HANDLE;
+    reshade_depth_view_ = VK_NULL_HANDLE;
+    reshade_depth_memory_ = VK_NULL_HANDLE;
+    reshade_depth_valid_ = false;
+  }
+  if (reshade_depth_image_ == VK_NULL_HANDLE) {
+    VkImageCreateInfo image_create_info = {};
+    image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    image_create_info.imageType = VK_IMAGE_TYPE_2D;
+    image_create_info.format = format;
+    image_create_info.extent = {width, height, 1};
+    image_create_info.mipLevels = 1;
+    image_create_info.arrayLayers = 1;
+    image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_create_info.usage =
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImage new_image = VK_NULL_HANDLE;
+    VkDeviceMemory new_memory = VK_NULL_HANDLE;
+    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+            vulkan_device_, image_create_info,
+            ui::vulkan::util::MemoryPurpose::kDeviceLocal, new_image,
+            new_memory)) {
+      return VK_NULL_HANDLE;
+    }
+    VkImageViewCreateInfo view_create_info = {};
+    view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_create_info.image = new_image;
+    view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_create_info.format = format;
+    view_create_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    view_create_info.subresourceRange.levelCount = 1;
+    view_create_info.subresourceRange.layerCount = 1;
+    VkImageView new_view = VK_NULL_HANDLE;
+    if (dfn.vkCreateImageView(device, &view_create_info, nullptr, &new_view) !=
+        VK_SUCCESS) {
+      dfn.vkDestroyImage(device, new_image, nullptr);
+      dfn.vkFreeMemory(device, new_memory, nullptr);
+      return VK_NULL_HANDLE;
+    }
+    // Publish under the handoff mutex (the paint thread reads the view). The
+    // new image is UNDEFINED until this frame's resolve submission; the CP
+    // sets the valid flag after submitting it.
+    std::lock_guard<std::mutex> lock(reshade_depth_mutex_);
+    reshade_depth_image_ = new_image;
+    reshade_depth_memory_ = new_memory;
+    reshade_depth_view_ = new_view;
+    reshade_depth_extent_ = {width, height};
+    reshade_depth_format_ = format;
+    reshade_depth_valid_ = false;
+  }
+  return reshade_depth_image_;
+}
+
+bool VulkanPresenter::CaptureImage(VkImage image, VkExtent2D image_extent,
+                                   VkImageLayout image_layout,
+                                   VkAccessFlags image_access_mask,
+                                   VkPipelineStageFlags image_stage_mask,
+                                   RawImage& image_out) {
   size_t pixel_count = size_t(image_extent.width) * image_extent.height;
   VkDeviceSize buffer_size = VkDeviceSize(sizeof(uint32_t) * pixel_count);
   VkBuffer buffer;
@@ -321,15 +541,15 @@ bool VulkanPresenter::CaptureGuestOutput(RawImage& image_out) {
     VkImageMemoryBarrier image_memory_barrier;
     image_memory_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     image_memory_barrier.pNext = nullptr;
-    image_memory_barrier.srcAccessMask = kGuestOutputInternalAccessMask;
+    image_memory_barrier.srcAccessMask = image_access_mask;
     image_memory_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    image_memory_barrier.oldLayout = kGuestOutputInternalLayout;
+    image_memory_barrier.oldLayout = image_layout;
     image_memory_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     image_memory_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     image_memory_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    image_memory_barrier.image = guest_output_image->image();
+    image_memory_barrier.image = image;
     image_memory_barrier.subresourceRange = util::InitializeSubresourceRange();
-    dfn.vkCmdPipelineBarrier(command_buffer, kGuestOutputInternalStageMask,
+    dfn.vkCmdPipelineBarrier(command_buffer, image_stage_mask,
                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
                              nullptr, 1, &image_memory_barrier);
 
@@ -339,7 +559,7 @@ bool VulkanPresenter::CaptureGuestOutput(RawImage& image_out) {
     buffer_image_copy.imageExtent.width = image_extent.width;
     buffer_image_copy.imageExtent.height = image_extent.height;
     buffer_image_copy.imageExtent.depth = 1;
-    dfn.vkCmdCopyImageToBuffer(command_buffer, guest_output_image->image(),
+    dfn.vkCmdCopyImageToBuffer(command_buffer, image,
                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1,
                                &buffer_image_copy);
 
@@ -359,8 +579,8 @@ bool VulkanPresenter::CaptureGuestOutput(RawImage& image_out) {
     std::swap(image_memory_barrier.oldLayout, image_memory_barrier.newLayout);
     dfn.vkCmdPipelineBarrier(
         command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_HOST_BIT | kGuestOutputInternalStageMask, 0, 0,
-        nullptr, 1, &buffer_memory_barrier, 1, &image_memory_barrier);
+        VK_PIPELINE_STAGE_HOST_BIT | image_stage_mask, 0, 0, nullptr, 1,
+        &buffer_memory_barrier, 1, &image_memory_barrier);
 
     if (dfn.vkEndCommandBuffer(command_buffer) != VK_SUCCESS) {
       XELOGE(
@@ -1423,6 +1643,39 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
 
+  // Retired ReShade depth images: destroy the ones whose tagged paint
+  // submission has completed (all queue work referencing them was enqueued
+  // before that submission), and tag fresh ones with this paint submission.
+  {
+    std::lock_guard<std::mutex> lock(reshade_depth_mutex_);
+    if (!reshade_depth_retired_.empty()) {
+      uint64_t completed_paint_submission =
+          paint_context_.completion_timeline
+              .GetCompletedSubmissionFromLastUpdate();
+      auto it = reshade_depth_retired_.begin();
+      while (it != reshade_depth_retired_.end()) {
+        if (it->paint_submission &&
+            completed_paint_submission >= it->paint_submission) {
+          if (it->view != VK_NULL_HANDLE) {
+            dfn.vkDestroyImageView(device, it->view, nullptr);
+          }
+          if (it->image != VK_NULL_HANDLE) {
+            dfn.vkDestroyImage(device, it->image, nullptr);
+          }
+          if (it->memory != VK_NULL_HANDLE) {
+            dfn.vkFreeMemory(device, it->memory, nullptr);
+          }
+          it = reshade_depth_retired_.erase(it);
+        } else {
+          if (!it->paint_submission) {
+            it->paint_submission = current_paint_submission_index;
+          }
+          ++it;
+        }
+      }
+    }
+  }
+
   VkCommandPool draw_command_pool = paint_submission.draw_command_pool();
   if (dfn.vkResetCommandPool(device, draw_command_pool, 0) != VK_SUCCESS) {
     XELOGE(
@@ -1812,6 +2065,165 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
           paint_context_.guest_output_intermediate_image_last_submission =
               current_paint_submission_index;
         }
+
+        // ReShade post-process: run the enabled effects in order on the
+        // guest output, chaining each into the next, the last landing in a
+        // dedicated image the first paint effect samples (notes/72).
+        bool reshade_source = false;
+        {
+          const uint32_t rs_width =
+              guest_output_flow.properties.frontbuffer_width;
+          const uint32_t rs_height =
+              guest_output_flow.properties.frontbuffer_height;
+          ApplyReShadeStack(rs_width, rs_height);
+          int enabled_count = 0;
+          for (const ReShadeStackEntry& entry : reshade_stack_) {
+            if (entry.effect && entry.effect->enabled &&
+                entry.effect->runtime_ready) {
+              ++enabled_count;
+            }
+          }
+          if (reshade_ && enabled_count > 0 && !reshade_failed_) {
+            // (Re)create the output and, for chaining, the scratch images.
+            auto ensure_image = [&](std::unique_ptr<GuestOutputImage>& img) {
+              if (img && (img->extent().width != rs_width ||
+                          img->extent().height != rs_height)) {
+                paint_context_.completion_timeline
+                    .AwaitSubmissionAndUpdateCompleted(
+                        reshade_output_last_submission_);
+                img.reset();
+              }
+              if (!img) {
+                img = GuestOutputImage::Create(vulkan_device_, rs_width,
+                                               rs_height);
+              }
+            };
+            ensure_image(reshade_output_image_);
+            if (reshade_output_image_) {
+              // Point the paint chain's ReShade-sampled slot at the output.
+              VkDescriptorImageInfo image_info;
+              image_info.sampler = VK_NULL_HANDLE;
+              image_info.imageView = reshade_output_image_->view();
+              image_info.imageLayout =
+                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+              VkWriteDescriptorSet write;
+              write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+              write.pNext = nullptr;
+              write.dstSet = paint_context_.guest_output_descriptor_sets
+                                 [PaintContext::
+                                      kGuestOutputDescriptorSetReShadeSampled];
+              write.dstBinding = 0;
+              write.dstArrayElement = 0;
+              write.descriptorCount = 1;
+              write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+              write.pImageInfo = &image_info;
+              write.pBufferInfo = nullptr;
+              write.pTexelBufferView = nullptr;
+              dfn.vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+            }
+            if (enabled_count >= 2) {
+              ensure_image(reshade_scratch_[0]);
+            }
+            if (enabled_count >= 3) {
+              ensure_image(reshade_scratch_[1]);
+            }
+            const bool images_ready =
+                reshade_output_image_ &&
+                (enabled_count < 2 || reshade_scratch_[0]) &&
+                (enabled_count < 3 || reshade_scratch_[1]);
+            if (images_ready) {
+              reshade_output_last_submission_ = current_paint_submission_index;
+              // Apply any pending control edits to each effect's uniforms.
+              {
+                std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+                for (ReShadeStackEntry& entry : reshade_stack_) {
+                  if (!entry.effect || !entry.controls_dirty ||
+                      !entry.effect->uniform_mapped) {
+                    continue;
+                  }
+                  for (const auto& control : entry.controls) {
+                    std::memcpy(
+                        static_cast<uint8_t*>(entry.effect->uniform_mapped) +
+                            control.offset,
+                        control.value,
+                        std::min<size_t>(control.size, sizeof(float) * 4));
+                  }
+                  entry.controls_dirty = false;
+                }
+              }
+              VkExtent2D rs_extent{rs_width, rs_height};
+              // Snapshot the depth handoff for this paint under the mutex:
+              // the CP thread may retire/recreate the image concurrently.
+              VkImage paint_depth_image = VK_NULL_HANDLE;
+              VkImageView paint_depth_view = VK_NULL_HANDLE;
+              {
+                std::lock_guard<std::mutex> lock(reshade_depth_mutex_);
+                if (reshade_depth_valid_) {
+                  paint_depth_image = reshade_depth_image_;
+                  paint_depth_view = reshade_depth_view_;
+                }
+              }
+              // Acquire the ReShade depth image for sampling. The command
+              // processor blitted the scene depth into it in a prior
+              // submission on the same queue and left it in
+              // SHADER_READ_ONLY_OPTIMAL; keep that as oldLayout so the
+              // written content is preserved (UNDEFINED would discard it).
+              // This barrier makes the CP's write visible to the fragment
+              // shader in this submission.
+              if (paint_depth_image != VK_NULL_HANDLE) {
+                VkImageMemoryBarrier depth_acquire = {};
+                depth_acquire.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                depth_acquire.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                depth_acquire.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                depth_acquire.oldLayout =
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                depth_acquire.newLayout =
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                depth_acquire.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                depth_acquire.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                depth_acquire.image = paint_depth_image;
+                depth_acquire.subresourceRange.aspectMask =
+                    VK_IMAGE_ASPECT_COLOR_BIT;
+                depth_acquire.subresourceRange.levelCount = 1;
+                depth_acquire.subresourceRange.layerCount = 1;
+                dfn.vkCmdPipelineBarrier(
+                    draw_command_buffer, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
+                    nullptr, 1, &depth_acquire);
+              }
+              VkImageView input_view = guest_output_image->view();
+              int rendered = 0;
+              bool ok = true;
+              for (ReShadeStackEntry& entry : reshade_stack_) {
+                if (!entry.effect || !entry.effect->enabled ||
+                    !entry.effect->runtime_ready) {
+                  continue;
+                }
+                const bool last = rendered == enabled_count - 1;
+                GuestOutputImage* out =
+                    last ? reshade_output_image_.get()
+                         : reshade_scratch_[rendered % 2].get();
+                reshade_->UpdateSystemUniforms(*entry.effect);
+                VkImageView depth_view = paint_depth_view;
+                if (!reshade_->Render(draw_command_buffer, *entry.effect,
+                                      input_view, out->image(), out->view(),
+                                      rs_extent, depth_view)) {
+                  ok = false;
+                  break;
+                }
+                input_view = out->view();
+                ++rendered;
+              }
+              if (ok) {
+                reshade_source = true;
+              } else {
+                XELOGE("VulkanPresenter: ReShade render failed, disabling it");
+                reshade_failed_ = true;
+              }
+            }
+          }
+        }
+
         for (size_t i = 0; i < guest_output_flow.effect_count; ++i) {
           bool is_final_effect = i + 1 >= guest_output_flow.effect_count;
 
@@ -1984,6 +2396,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
             effect_src_descriptor_set = PaintContext::GuestOutputDescriptorSet(
                 PaintContext::kGuestOutputDescriptorSetIntermediate0Sampled +
                 (i - 1));
+          } else if (reshade_source) {
+            effect_src_descriptor_set =
+                PaintContext::kGuestOutputDescriptorSetReShadeSampled;
           } else {
             effect_src_descriptor_set = PaintContext::GuestOutputDescriptorSet(
                 PaintContext::kGuestOutputDescriptorSetGuestOutput0Sampled +
@@ -2279,6 +2694,21 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
   if (guest_output_format_properties.optimalTilingFeatures &
       VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
     dlss_ = VulkanDlss::TryCreate(vulkan_device_);
+  }
+
+  // The ReShade runtime is always available (the browser can load shaders at
+  // runtime); a shader named on the command line is queued as the first
+  // request, applied on the first paint where the guest size is known.
+  reshade_ = std::make_unique<VulkanReShade>(vulkan_device_);
+  reshade_->SetDepthConvention(cvars::reshade_depth_reversed,
+                               cvars::reshade_depth_upside_down);
+  if (!cvars::reshade_effect.empty()) {
+    std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+    ReShadeDesiredEffect desired;
+    desired.path = cvars::reshade_effect;
+    desired.enabled = true;
+    reshade_desired_.push_back(std::move(desired));
+    reshade_desired_dirty_ = true;
   }
 
   VkDescriptorSetLayoutBinding guest_output_image_sampler_bindings[2];
@@ -2722,6 +3152,522 @@ VkPipeline VulkanPresenter::CreateGuestOutputPaintPipeline(
   }
   return pipeline;
 }
+
+
+std::vector<Presenter::ReShadeEffectInfo>
+VulkanPresenter::GetReShadeStackFromUIThread() {
+  std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+  std::vector<ReShadeEffectInfo> out;
+  out.reserve(reshade_ui_.size());
+  for (const ReShadeUiEffect& e : reshade_ui_) {
+    out.push_back({e.name, e.path, e.enabled});
+  }
+  return out;
+}
+
+void VulkanPresenter::AddReShadeEffectFromUIThread(const std::string& path) {
+  if (path.empty()) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+    // Clicking a shader that is already in the stack is a no-op (don't add a
+    // duplicate on repeated clicks); to run one twice, load a copy of the .fx
+    // under a different name.
+    for (const ReShadeDesiredEffect& existing : reshade_desired_) {
+      if (existing.path == path) {
+        return;
+      }
+    }
+    ReShadeDesiredEffect desired;
+    desired.path = path;
+    desired.enabled = true;
+    reshade_desired_.push_back(std::move(desired));
+    reshade_desired_dirty_ = true;
+  }
+  SaveReShadePresetToCurrentFile();
+}
+
+void VulkanPresenter::RemoveReShadeEffectFromUIThread(int index) {
+  {
+    std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+    if (index < 0 || size_t(index) >= reshade_desired_.size()) {
+      return;
+    }
+    reshade_desired_.erase(reshade_desired_.begin() + index);
+    reshade_desired_dirty_ = true;
+  }
+  SaveReShadePresetToCurrentFile();
+}
+
+void VulkanPresenter::MoveReShadeEffectFromUIThread(int index, int delta) {
+  {
+    std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+    const int count = int(reshade_desired_.size());
+    if (index < 0 || index >= count) {
+      return;
+    }
+    int target = std::max(0, std::min(count - 1, index + delta));
+    if (target == index) {
+      return;
+    }
+    std::swap(reshade_desired_[index], reshade_desired_[target]);
+    reshade_desired_dirty_ = true;
+  }
+  SaveReShadePresetToCurrentFile();
+}
+
+void VulkanPresenter::SetReShadeEffectEnabledFromUIThread(int index,
+                                                          bool enabled) {
+  {
+    std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+    if (index < 0 || size_t(index) >= reshade_desired_.size()) {
+      return;
+    }
+    reshade_desired_[index].enabled = enabled;
+    if (size_t(index) < reshade_ui_.size()) {
+      reshade_ui_[index].enabled = enabled;
+    }
+    reshade_desired_dirty_ = true;
+  }
+  SaveReShadePresetToCurrentFile();
+}
+
+std::vector<Presenter::ReShadeUniformControl>
+VulkanPresenter::GetReShadeControlsFromUIThread(int index) {
+  std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+  if (index < 0 || size_t(index) >= reshade_ui_.size()) {
+    return {};
+  }
+  return reshade_ui_[index].controls;
+}
+
+void VulkanPresenter::SetReShadeControlFromUIThread(int index,
+                                                    const std::string& name,
+                                                    const float* values,
+                                                    int components) {
+  std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+  if (index < 0 || size_t(index) >= reshade_ui_.size() ||
+      size_t(index) >= reshade_desired_.size()) {
+    return;
+  }
+  // Update the UI copy (for display) and the desired copy (for apply/save).
+  for (ReShadeUniformControl& control : reshade_ui_[index].controls) {
+    if (control.name == name) {
+      for (int i = 0; i < components && i < 4; ++i) {
+        control.value[i] = values[i];
+      }
+      break;
+    }
+  }
+  std::array<float, 4> v{};
+  for (int i = 0; i < components && i < 4; ++i) {
+    v[i] = values[i];
+  }
+  auto& dvals = reshade_desired_[index].values;
+  bool found = false;
+  for (auto& kv : dvals) {
+    if (kv.first == name) {
+      kv.second = v;
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    dvals.emplace_back(name, v);
+  }
+  reshade_desired_dirty_ = true;
+}
+
+std::string VulkanPresenter::GetReShadeShaderDirFromUIThread() const {
+  if (!cvars::reshade_shader_dir.empty()) {
+    return cvars::reshade_shader_dir;
+  }
+  if (!cvars::reshade_effect.empty()) {
+    return std::filesystem::path(cvars::reshade_effect).parent_path().string();
+  }
+  return {};
+}
+
+namespace {
+// Persists a cvar to the config file. Assigning cvars::x only updates the
+// live value; the config writer serializes the ConfigVar's config_value_,
+// so a UI change must go through SetConfigValue (which also refreshes the
+// live value) to survive a restart.
+template <typename T>
+void PersistCvar(cvar::IConfigVar* var, const T& value) {
+  auto* typed = dynamic_cast<cvar::ConfigVar<T>*>(var);
+  if (typed) {
+    typed->SetConfigValue(value);
+  }
+}
+}  // namespace
+
+void VulkanPresenter::SetReShadeShaderDirFromUIThread(const std::string& dir) {
+  PersistCvar<std::string>(cv::cv_reshade_shader_dir, dir);
+  config::SaveConfig();
+}
+
+std::string VulkanPresenter::GetReShadePresetDirFromUIThread() const {
+  return cvars::reshade_preset_dir;
+}
+
+void VulkanPresenter::SetReShadePresetDirFromUIThread(const std::string& dir) {
+  PersistCvar<std::string>(cv::cv_reshade_preset_dir, dir);
+  config::SaveConfig();
+}
+
+std::vector<Presenter::ReShadeDepthBufferInfo>
+VulkanPresenter::GetReShadeDepthBuffersFromUIThread() {
+  std::lock_guard<std::mutex> lock(reshade_depth_mutex_);
+  return reshade_depth_buffer_list_;
+}
+
+int VulkanPresenter::GetReShadeDepthBufferChoiceFromUIThread() const {
+  return cvars::reshade_depth_buffer;
+}
+
+void VulkanPresenter::SetReShadeDepthBufferChoiceFromUIThread(int choice) {
+  PersistCvar<int32_t>(cv::cv_reshade_depth_buffer, choice);
+  config::SaveConfig();
+}
+
+bool VulkanPresenter::GetReShadeDepthEnabledFromUIThread() const {
+  return cvars::reshade_depth;
+}
+
+void VulkanPresenter::SetReShadeDepthEnabledFromUIThread(bool enabled) {
+  PersistCvar<bool>(cv::cv_reshade_depth, enabled);
+  config::SaveConfig();
+}
+
+bool VulkanPresenter::GetReShadeDepthReversedFromUIThread() const {
+  return cvars::reshade_depth_reversed;
+}
+
+bool VulkanPresenter::GetReShadeDepthUpsideDownFromUIThread() const {
+  return cvars::reshade_depth_upside_down;
+}
+
+void VulkanPresenter::SetReShadeDepthOrientationFromUIThread(bool reversed,
+                                                             bool upside_down) {
+  PersistCvar<bool>(cv::cv_reshade_depth_reversed, reversed);
+  PersistCvar<bool>(cv::cv_reshade_depth_upside_down, upside_down);
+  config::SaveConfig();
+  // The convention is baked into the depth shaders at compile; ask the paint
+  // thread to reapply it and recompile the loaded depth effects.
+  reshade_convention_dirty_.store(true);
+}
+
+void VulkanPresenter::SetReShadeDepthBufferList(
+    std::vector<ReShadeDepthBufferInfo>&& list) {
+  std::lock_guard<std::mutex> lock(reshade_depth_mutex_);
+  reshade_depth_buffer_list_ = std::move(list);
+}
+
+int VulkanPresenter::GetReShadeDepthBufferChoice() const {
+  return cvars::reshade_depth_buffer;
+}
+
+// Builds the adjustable controls for a compiled effect and applies any preset
+// values by uniform name.
+namespace {
+void BuildReShadeControls(
+    const VulkanReShade::Effect& effect,
+    const std::vector<std::pair<std::string, std::array<float, 4>>>& values,
+    std::vector<Presenter::ReShadeUniformControl>& controls) {
+  controls.clear();
+  for (const auto& u : effect.uniforms) {
+    if (!u.source.empty()) {
+      continue;  // Built-in (timer/frametime/...).
+    }
+    Presenter::ReShadeUniformControl control;
+    control.name = u.name;
+    control.label = u.ui_label;
+    control.ui_type = u.ui_type;
+    control.min_value = u.ui_min;
+    control.max_value = u.ui_max;
+    control.components = std::max(1, std::min(4, int(u.size / sizeof(float))));
+    control.offset = u.offset;
+    control.size = u.size;
+    if (!u.default_value.empty()) {
+      std::memcpy(control.value, u.default_value.data(),
+                  std::min(u.default_value.size(), sizeof(control.value)));
+    }
+    for (const auto& preset_value : values) {
+      if (preset_value.first == control.name) {
+        std::memcpy(control.value, preset_value.second.data(),
+                    sizeof(control.value));
+        break;
+      }
+    }
+    controls.push_back(std::move(control));
+  }
+}
+}  // namespace
+
+void VulkanPresenter::PublishReShadeUi() {
+  reshade_ui_.clear();
+  reshade_ui_.reserve(reshade_stack_.size());
+  for (const ReShadeStackEntry& entry : reshade_stack_) {
+    ReShadeUiEffect ui;
+    ui.path = entry.path;
+    if (entry.effect) {
+      ui.name = entry.effect->name;
+      ui.enabled = entry.effect->enabled;
+    } else {
+      ui.name =
+          std::filesystem::path(entry.path).stem().string() + " (failed)";
+      ui.enabled = false;
+    }
+    ui.controls = entry.controls;
+    reshade_ui_.push_back(std::move(ui));
+  }
+}
+
+void VulkanPresenter::ApplyReShadeStack(uint32_t width, uint32_t height) {
+  if (!reshade_) {
+    return;
+  }
+  // A depth-orientation change reapplies the convention and forces the depth
+  // effects to recompile (the convention is baked in at compile time).
+  bool convention_changed = reshade_convention_dirty_.exchange(false);
+  if (convention_changed) {
+    reshade_->SetDepthConvention(cvars::reshade_depth_reversed,
+                                 cvars::reshade_depth_upside_down);
+  }
+  bool size_mismatch = false;
+  for (const ReShadeStackEntry& entry : reshade_stack_) {
+    if (entry.effect &&
+        (entry.effect->width != width || entry.effect->height != height)) {
+      size_mismatch = true;
+      break;
+    }
+  }
+  std::vector<ReShadeDesiredEffect> desired;
+  {
+    std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+    if (!reshade_desired_dirty_ && !size_mismatch && !convention_changed) {
+      return;
+    }
+    reshade_desired_dirty_ = false;
+    desired = reshade_desired_;
+  }
+
+  // Does the structure (paths, in order) or the output size differ? A
+  // convention change forces a full rebuild so the depth effects recompile.
+  bool structural = size_mismatch || convention_changed ||
+                    desired.size() != reshade_stack_.size();
+  if (!structural) {
+    for (size_t i = 0; i < desired.size(); ++i) {
+      if (desired[i].path != reshade_stack_[i].path) {
+        structural = true;
+        break;
+      }
+    }
+  }
+
+  if (structural) {
+    // GPU objects are about to be created/destroyed; wait for the last use.
+    paint_context_.completion_timeline.AwaitSubmissionAndUpdateCompleted(
+        reshade_output_last_submission_);
+    const VkSampler sampler =
+        ui_samplers_->samplers()[UISamplers::kSamplerIndexLinearClampToEdge];
+    std::vector<ReShadeStackEntry> old = std::move(reshade_stack_);
+    reshade_stack_.clear();
+    std::vector<bool> reused(old.size(), false);
+    for (const ReShadeDesiredEffect& d : desired) {
+      ReShadeStackEntry entry;
+      entry.path = d.path;
+      // Reuse an already-compiled effect for this path at the right size,
+      // unless the depth convention just changed (then recompile so the new
+      // orientation is baked in).
+      for (size_t i = 0; i < old.size() && !convention_changed; ++i) {
+        if (!reused[i] && old[i].effect && old[i].path == d.path &&
+            old[i].effect->width == width &&
+            old[i].effect->height == height) {
+          entry.effect = std::move(old[i].effect);
+          entry.controls = std::move(old[i].controls);
+          reused[i] = true;
+          break;
+        }
+      }
+      if (!entry.effect) {
+        auto compiled = reshade_->CompileEffect(d.path, width, height);
+        if (compiled &&
+            reshade_->CreateRuntime(*compiled, kGuestOutputFormat, sampler)) {
+          entry.effect = std::move(compiled);
+          BuildReShadeControls(*entry.effect, d.values, entry.controls);
+        } else {
+          // Keep a placeholder so indices stay aligned with the desired list.
+          entry.effect.reset();
+        }
+      }
+      reshade_stack_.push_back(std::move(entry));
+    }
+    for (size_t i = 0; i < old.size(); ++i) {
+      if (!reused[i] && old[i].effect) {
+        reshade_->DestroyRuntime(*old[i].effect);
+      }
+    }
+    reshade_failed_ = false;
+  }
+
+  // Apply enabled flags and control values (index-aligned with desired).
+  {
+    std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+    for (size_t i = 0;
+         i < reshade_stack_.size() && i < desired.size(); ++i) {
+      ReShadeStackEntry& entry = reshade_stack_[i];
+      if (!entry.effect) {
+        continue;
+      }
+      entry.effect->enabled = desired[i].enabled;
+      // Rebuild controls from the effect's defaults + preset values only when
+      // they are not populated (a reused effect keeps its live controls).
+      if (entry.controls.empty()) {
+        BuildReShadeControls(*entry.effect, desired[i].values, entry.controls);
+      } else {
+        for (ReShadeUniformControl& control : entry.controls) {
+          for (const auto& kv : desired[i].values) {
+            if (kv.first == control.name) {
+              std::memcpy(control.value, kv.second.data(),
+                          sizeof(control.value));
+              break;
+            }
+          }
+        }
+      }
+      entry.controls_dirty = true;
+    }
+    PublishReShadeUi();
+  }
+}
+
+bool VulkanPresenter::ParseReShadePresetFile(
+    const std::string& file, std::vector<ReShadeDesiredEffect>& effects) {
+  std::ifstream stream(file);
+  if (!stream) {
+    return false;
+  }
+  effects.clear();
+  ReShadeDesiredEffect* current = nullptr;
+  std::string line;
+  while (std::getline(stream, line)) {
+    std::istringstream tokens(line);
+    std::string key;
+    tokens >> key;
+    std::string equals, name;
+    if (key == "effect" || key == "shader") {
+      // "effect <path>" (new) or "shader = <path>" (old single-effect).
+      std::string path;
+      if (key == "shader") {
+        tokens >> equals;
+      }
+      std::getline(tokens, path);
+      const size_t begin = path.find_first_not_of(' ');
+      path = begin == std::string::npos ? "" : path.substr(begin);
+      effects.emplace_back();
+      current = &effects.back();
+      current->path = path;
+    } else if (key == "enabled") {
+      int value = 1;
+      tokens >> equals >> value;
+      if (current) {
+        current->enabled = value != 0;
+      }
+    } else if (key == "uniform") {
+      std::array<float, 4> value = {};
+      tokens >> name >> equals;
+      for (float& component : value) {
+        if (!(tokens >> component)) {
+          break;
+        }
+      }
+      if (current && !name.empty()) {
+        current->values.emplace_back(name, value);
+      }
+    }
+  }
+  return true;
+}
+
+void VulkanPresenter::SetReShadePresetFileFromUIThread(
+    const std::string& file) {
+  reshade_preset_file_ = file;
+  if (file.empty()) {
+    return;
+  }
+  std::vector<ReShadeDesiredEffect> effects;
+  if (!ParseReShadePresetFile(file, effects)) {
+    return;  // No preset yet; the first change writes it.
+  }
+  XELOGI("VulkanPresenter: applying ReShade preset '{}' ({} effect(s))", file,
+         effects.size());
+  std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+  reshade_desired_ = std::move(effects);
+  reshade_desired_dirty_ = true;
+}
+
+void VulkanPresenter::LoadReShadePresetFileFromUIThread(
+    const std::string& file) {
+  std::vector<ReShadeDesiredEffect> effects;
+  if (!ParseReShadePresetFile(file, effects)) {
+    XELOGW("VulkanPresenter: could not read the ReShade preset '{}'", file);
+    return;
+  }
+  XELOGI("VulkanPresenter: loading ReShade preset '{}' ({} effect(s))", file,
+         effects.size());
+  {
+    std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+    reshade_desired_ = std::move(effects);
+    reshade_desired_dirty_ = true;
+  }
+  SaveReShadePresetToCurrentFile();
+}
+
+void VulkanPresenter::SaveReShadePresetToFileFromUIThread(
+    const std::string& file) {
+  WriteReShadePresetFile(file);
+}
+
+void VulkanPresenter::SaveReShadePresetFromUIThread() {
+  SaveReShadePresetToCurrentFile();
+}
+
+void VulkanPresenter::SaveReShadePresetToCurrentFile() {
+  if (!reshade_preset_file_.empty()) {
+    WriteReShadePresetFile(reshade_preset_file_);
+  }
+}
+
+void VulkanPresenter::WriteReShadePresetFile(const std::string& file) {
+  std::vector<ReShadeDesiredEffect> desired;
+  {
+    std::lock_guard<std::mutex> lock(reshade_control_mutex_);
+    desired = reshade_desired_;
+  }
+  std::error_code ec;
+  std::filesystem::create_directories(
+      std::filesystem::path(file).parent_path(), ec);
+  std::ofstream stream(file, std::ios::trunc);
+  if (!stream) {
+    XELOGW("VulkanPresenter: could not write the ReShade preset '{}'", file);
+    return;
+  }
+  for (const ReShadeDesiredEffect& d : desired) {
+    stream << "effect " << d.path << "\n";
+    stream << "enabled " << (d.enabled ? 1 : 0) << "\n";
+    for (const auto& kv : d.values) {
+      stream << "uniform " << kv.first << " =";
+      for (float component : kv.second) {
+        stream << ' ' << component;
+      }
+      stream << "\n";
+    }
+  }
+}
+
 
 }  // namespace vulkan
 }  // namespace ui
