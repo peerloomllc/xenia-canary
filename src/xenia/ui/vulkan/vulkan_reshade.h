@@ -60,10 +60,30 @@ class VulkanReShade {
     uint32_t sampler_count = 0;
     // The texture (unique) name each sampler slot references, in slot order.
     std::vector<std::string> sampler_texture_names;
+    // The sampler state (filter/address/lod) each slot wants, reflected from
+    // the FX sampler declaration, in slot order.
+    struct SamplerState {
+      VkFilter min_filter = VK_FILTER_LINEAR;
+      VkFilter mag_filter = VK_FILTER_LINEAR;
+      VkSamplerMipmapMode mipmap_mode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+      VkSamplerAddressMode address_u = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+      VkSamplerAddressMode address_v = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+      VkSamplerAddressMode address_w = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+      float min_lod = 0.0f;
+      float max_lod = VK_LOD_CLAMP_NONE;
+      float lod_bias = 0.0f;
+    };
+    std::vector<SamplerState> sampler_states;
+    // Runtime VkSampler per slot (created by CreateRuntime, owned by the
+    // effect's owned_samplers).
+    std::vector<VkSampler> slot_samplers;
     // The effect-owned textures this pass renders to, in attachment order.
     // Empty = the pass writes the backbuffer (the effect's output chain).
     std::vector<std::string> render_target_names;
     bool clear_render_targets = false;
+    // Regenerate the render target's mip chain after this pass (FX default
+    // is true); only acts on targets declared with more than one mip level.
+    bool generate_mipmaps = true;
     // Fixed-function state reflected from the FX pass (attachment 0's blend
     // is applied to every attachment slot below).
     bool blend_enable = false;
@@ -106,10 +126,19 @@ class VulkanReShade {
     bool is_render_target = false;
     uint32_t width = 0;
     uint32_t height = 0;
+    // Mip levels (1 = no mips). A render-target texture with more than one
+    // level has its chain regenerated after the producing pass; shaders
+    // sample lower levels with tex2Dlod.
+    uint32_t levels = 1;
     VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
+    // Sampling view (covers all mip levels).
     VkImageView view = VK_NULL_HANDLE;
+    // Framebuffer attachment view (level 0 only). Equals `view` when
+    // levels == 1; a distinct level-0 view otherwise (a colour attachment
+    // must reference exactly one mip level).
+    VkImageView attachment_view = VK_NULL_HANDLE;
   };
 
   struct Effect {
@@ -133,6 +162,9 @@ class VulkanReShade {
     VkBuffer uniform_buffer = VK_NULL_HANDLE;
     VkDeviceMemory uniform_memory = VK_NULL_HANDLE;
     void* uniform_mapped = nullptr;
+    // Distinct VkSamplers this effect created (one per unique FX sampler
+    // state); the passes' slot_samplers point into these.
+    std::vector<VkSampler> owned_samplers;
     VkFormat format = VK_FORMAT_UNDEFINED;
     // Ping-pong partner for the presenter's output image when more than one
     // pass writes the backbuffer: passes alternate between the two so each

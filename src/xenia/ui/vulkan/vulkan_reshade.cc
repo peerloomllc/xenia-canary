@@ -144,6 +144,39 @@ VkPrimitiveTopology TopologyFromReShade(reshadefx::primitive_topology t) {
   }
 }
 
+VkSamplerAddressMode AddressFromReShade(reshadefx::texture_address_mode m) {
+  switch (m) {
+    case reshadefx::texture_address_mode::wrap:
+      return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    case reshadefx::texture_address_mode::mirror:
+      return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+    case reshadefx::texture_address_mode::border:
+      return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    case reshadefx::texture_address_mode::clamp:
+    default:
+      return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  }
+}
+
+// The FX filter_mode packs min (bit 4), mag (bit 2) and mip (bit 0): a set bit
+// is linear, clear is point (anisotropic = all set).
+VulkanReShade::Pass::SamplerState SamplerStateFromReShade(
+    const reshadefx::sampler& s) {
+  VulkanReShade::Pass::SamplerState state;
+  const auto f = static_cast<uint8_t>(s.filter);
+  state.min_filter = (f & 0x10) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+  state.mag_filter = (f & 0x04) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+  state.mipmap_mode = (f & 0x01) ? VK_SAMPLER_MIPMAP_MODE_LINEAR
+                                 : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  state.address_u = AddressFromReShade(s.address_u);
+  state.address_v = AddressFromReShade(s.address_v);
+  state.address_w = AddressFromReShade(s.address_w);
+  state.min_lod = s.min_lod;
+  state.max_lod = (s.max_lod >= 3.402823e+38f) ? VK_LOD_CLAMP_NONE : s.max_lod;
+  state.lod_bias = s.lod_bias;
+  return state;
+}
+
 std::vector<uint32_t> ToWords(const std::string& bytes) {
   std::vector<uint32_t> words(bytes.size() / sizeof(uint32_t));
   if (!words.empty()) {
@@ -252,12 +285,14 @@ std::unique_ptr<VulkanReShade::Effect> VulkanReShade::CompileEffect(
     texture.width = tex.width;
     texture.height = tex.height;
     texture.format = FormatFromReShade(tex.format);
-    if (texture.is_render_target && tex.levels > 1) {
-      XELOGW(
-          "VulkanReShade: render-target texture '{}' asks for {} mip levels; "
-          "only the top level is rendered and sampled",
-          tex.unique_name, tex.levels);
+    // Mip levels: clamp the declared count to what the extent supports.
+    uint32_t max_levels = 1;
+    for (uint32_t dim = std::max(texture.width, texture.height); dim > 1;
+         dim >>= 1) {
+      ++max_levels;
     }
+    texture.levels =
+        std::min<uint32_t>(std::max<uint32_t>(1, tex.levels), max_levels);
     if (const auto* a = FindAnnotationIn(tex.annotations, "source")) {
       const std::string& src = a->value.string_data;
       if (!src.empty()) {
@@ -324,6 +359,7 @@ std::unique_ptr<VulkanReShade::Effect> VulkanReShade::CompileEffect(
         }
       }
       p.clear_render_targets = pass.clear_render_targets;
+      p.generate_mipmaps = pass.generate_mipmaps;
       p.blend_enable = pass.blend_enable[0];
       p.src_color_factor =
           BlendFactorFromReShade(pass.source_color_blend_factor[0]);
@@ -344,10 +380,13 @@ std::unique_ptr<VulkanReShade::Effect> VulkanReShade::CompileEffect(
       p.sampler_count = uint32_t(pass.sampler_bindings.size());
       for (const auto& sb : pass.sampler_bindings) {
         std::string texture_name;
+        Pass::SamplerState sampler_state;
         if (sb.index < module.samplers.size()) {
           texture_name = module.samplers[sb.index].texture_name;
+          sampler_state = SamplerStateFromReShade(module.samplers[sb.index]);
         }
         p.sampler_texture_names.push_back(texture_name);
+        p.sampler_states.push_back(sampler_state);
       }
       if (p.vs_spirv.empty() || p.ps_spirv.empty()) {
         XELOGE("VulkanReShade: '{}' pass '{}' missing SPIR-V, skipping effect",
@@ -447,6 +486,11 @@ void VulkanReShade::DestroyRuntime(Effect& effect) {
     effect.chain_memory = VK_NULL_HANDLE;
   }
   for (Texture& texture : effect.textures) {
+    if (texture.attachment_view != VK_NULL_HANDLE &&
+        texture.attachment_view != texture.view) {
+      dfn.vkDestroyImageView(device, texture.attachment_view, nullptr);
+    }
+    texture.attachment_view = VK_NULL_HANDLE;
     if (texture.view != VK_NULL_HANDLE) {
       dfn.vkDestroyImageView(device, texture.view, nullptr);
       texture.view = VK_NULL_HANDLE;
@@ -460,6 +504,15 @@ void VulkanReShade::DestroyRuntime(Effect& effect) {
       texture.memory = VK_NULL_HANDLE;
     }
   }
+  for (VkSampler smp : effect.owned_samplers) {
+    if (smp != VK_NULL_HANDLE) {
+      dfn.vkDestroySampler(device, smp, nullptr);
+    }
+  }
+  effect.owned_samplers.clear();
+  for (Pass& pass : effect.passes) {
+    pass.slot_samplers.clear();
+  }
   effect.runtime_ready = false;
 }
 
@@ -469,6 +522,57 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
   const VkDevice device = device_->device();
   runtime_sampler_ = sampler;
   effect.format = format;
+
+  // Create a distinct VkSampler per unique FX sampler state and point each
+  // pass slot at it. Honouring the FX filter/address/lod is what lets mipped
+  // textures be sampled (the shared UI sampler clamps maxLod to 0).
+  {
+    std::vector<Pass::SamplerState> unique_states;
+    auto same_state = [](const Pass::SamplerState& a,
+                         const Pass::SamplerState& b) {
+      return a.min_filter == b.min_filter && a.mag_filter == b.mag_filter &&
+             a.mipmap_mode == b.mipmap_mode && a.address_u == b.address_u &&
+             a.address_v == b.address_v && a.address_w == b.address_w &&
+             a.min_lod == b.min_lod && a.max_lod == b.max_lod &&
+             a.lod_bias == b.lod_bias;
+    };
+    for (Pass& pass : effect.passes) {
+      pass.slot_samplers.clear();
+      for (const Pass::SamplerState& st : pass.sampler_states) {
+        int idx = -1;
+        for (size_t i = 0; i < unique_states.size(); ++i) {
+          if (same_state(unique_states[i], st)) {
+            idx = int(i);
+            break;
+          }
+        }
+        if (idx < 0) {
+          VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+          sci.magFilter = st.mag_filter;
+          sci.minFilter = st.min_filter;
+          sci.mipmapMode = st.mipmap_mode;
+          sci.addressModeU = st.address_u;
+          sci.addressModeV = st.address_v;
+          sci.addressModeW = st.address_w;
+          sci.mipLodBias = st.lod_bias;
+          sci.minLod = st.min_lod;
+          sci.maxLod = st.max_lod;
+          sci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+          VkSampler smp = VK_NULL_HANDLE;
+          if (dfn.vkCreateSampler(device, &sci, nullptr, &smp) != VK_SUCCESS) {
+            XELOGE("VulkanReShade: failed to create a sampler for '{}'",
+                   effect.name);
+            DestroyRuntime(effect);
+            return false;
+          }
+          unique_states.push_back(st);
+          effect.owned_samplers.push_back(smp);
+          idx = int(effect.owned_samplers.size() - 1);
+        }
+        pass.slot_samplers.push_back(effect.owned_samplers[idx]);
+      }
+    }
+  }
 
   uint32_t max_samplers = 0;
   for (const Pass& pass : effect.passes) {
@@ -543,12 +647,14 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
     ici.format = texture.format;
     ici.extent = {std::max(1u, texture.width), std::max(1u, texture.height),
                   1};
-    ici.mipLevels = 1;
+    ici.mipLevels = texture.levels;
     ici.arrayLayers = 1;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    // TRANSFER_SRC as well so a mipped target can blit level n into n+1.
     ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (!util::CreateDedicatedAllocationImage(
@@ -559,17 +665,32 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
       DestroyRuntime(effect);
       return false;
     }
+    // Sampling view over all mip levels.
     VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vci.image = texture.image;
     vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
     vci.format = texture.format;
-    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, texture.levels, 0, 1};
     if (dfn.vkCreateImageView(device, &vci, nullptr, &texture.view) !=
         VK_SUCCESS) {
       XELOGE("VulkanReShade: failed to create the view for '{}'",
              texture.name);
       DestroyRuntime(effect);
       return false;
+    }
+    // A colour attachment must reference exactly one level; reuse the sampling
+    // view when there are no mips, else make a level-0-only attachment view.
+    if (texture.levels == 1) {
+      texture.attachment_view = texture.view;
+    } else {
+      vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      if (dfn.vkCreateImageView(device, &vci, nullptr,
+                                &texture.attachment_view) != VK_SUCCESS) {
+        XELOGE("VulkanReShade: failed to create the attachment view for '{}'",
+               texture.name);
+        DestroyRuntime(effect);
+        return false;
+      }
     }
   }
 
@@ -772,7 +893,7 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
       uint32_t fb_width = pass_targets[0]->width;
       uint32_t fb_height = pass_targets[0]->height;
       for (size_t i = 0; i < pass_targets.size(); ++i) {
-        attachment_views[i] = pass_targets[i]->view;
+        attachment_views[i] = pass_targets[i]->attachment_view;
         fb_width = std::min(fb_width, pass_targets[i]->width);
         fb_height = std::min(fb_height, pass_targets[i]->height);
       }
@@ -1047,7 +1168,8 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
       barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
       barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
       barrier.image = texture.image;
-      barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
+                                  texture.levels, 0, 1};
       barriers.push_back(barrier);
     }
     if (!barriers.empty()) {
@@ -1072,12 +1194,10 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
                                0, nullptr, uint32_t(barriers.size()),
                                barriers.data());
       const VkClearColorValue clear_color = {};
-      const VkImageSubresourceRange clear_range = {VK_IMAGE_ASPECT_COLOR_BIT,
-                                                   0, 1, 0, 1};
       for (VkImageMemoryBarrier& barrier : barriers) {
         dfn.vkCmdClearColorImage(cb, barrier.image,
                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                 &clear_color, 1, &clear_range);
+                                 &clear_color, 1, &barrier.subresourceRange);
         barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -1110,6 +1230,83 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
          effect.name, effect.passes.size(), max_samplers);
   return true;
 }
+
+namespace {
+// Regenerate a texture's mip chain by blitting each level down into the next.
+// Level 0 (and levels 1..n-1) are expected in SHADER_READ_ONLY_OPTIMAL on
+// entry; all levels are left in SHADER_READ_ONLY_OPTIMAL.
+void GenerateTextureMips(const VulkanDevice::Functions& dfn,
+                         VkCommandBuffer cb, VkImage image, uint32_t width,
+                         uint32_t height, uint32_t levels) {
+  if (levels <= 1 || image == VK_NULL_HANDLE) {
+    return;
+  }
+  VkImageMemoryBarrier barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.image = image;
+  barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  barrier.subresourceRange.layerCount = 1;
+
+  // Level 0 (just rendered): SHADER_READ -> TRANSFER_SRC.
+  barrier.subresourceRange.baseMipLevel = 0;
+  barrier.subresourceRange.levelCount = 1;
+  barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  barrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  dfn.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                           nullptr, 1, &barrier);
+  // Levels 1..n-1 (stale content): SHADER_READ -> TRANSFER_DST.
+  barrier.subresourceRange.baseMipLevel = 1;
+  barrier.subresourceRange.levelCount = levels - 1;
+  barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  dfn.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                           nullptr, 1, &barrier);
+
+  int32_t mip_w = int32_t(std::max(1u, width));
+  int32_t mip_h = int32_t(std::max(1u, height));
+  for (uint32_t i = 1; i < levels; ++i) {
+    int32_t dst_w = std::max(1, mip_w >> 1);
+    int32_t dst_h = std::max(1, mip_h >> 1);
+    VkImageBlit blit = {};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 0, 1};
+    blit.srcOffsets[1] = {mip_w, mip_h, 1};
+    blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1};
+    blit.dstOffsets[1] = {dst_w, dst_h, 1};
+    dfn.vkCmdBlitImage(cb, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                       VK_FILTER_LINEAR);
+    // This level becomes the source for the next: TRANSFER_DST -> TRANSFER_SRC.
+    barrier.subresourceRange.baseMipLevel = i;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    dfn.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                             nullptr, 1, &barrier);
+    mip_w = dst_w;
+    mip_h = dst_h;
+  }
+  // All levels are TRANSFER_SRC now: hand the whole chain back to sampling.
+  barrier.subresourceRange.baseMipLevel = 0;
+  barrier.subresourceRange.levelCount = levels;
+  barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  dfn.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr,
+                           0, nullptr, 1, &barrier);
+}
+}  // namespace
 
 bool VulkanReShade::Render(VkCommandBuffer command_buffer, Effect& effect,
                            VkImageView input_view, VkImage output_image,
@@ -1200,7 +1397,11 @@ bool VulkanReShade::Render(VkCommandBuffer command_buffer, Effect& effect,
             }
           }
         }
-        image_infos[i].sampler = runtime_sampler_;
+        image_infos[i].sampler =
+            (i < pass.slot_samplers.size() &&
+             pass.slot_samplers[i] != VK_NULL_HANDLE)
+                ? pass.slot_samplers[i]
+                : runtime_sampler_;
         image_infos[i].imageView = slot_view;
         image_infos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -1243,6 +1444,19 @@ bool VulkanReShade::Render(VkCommandBuffer command_buffer, Effect& effect,
                                 nullptr);
     dfn.vkCmdDraw(command_buffer, pass.num_vertices, 1, 0, 0);
     dfn.vkCmdEndRenderPass(command_buffer);
+
+    // Regenerate the mip chain of any mipped render target this pass wrote.
+    if (!is_backbuffer_pass && pass.generate_mipmaps) {
+      for (const std::string& rt_name : pass.render_target_names) {
+        for (Texture& texture : effect.textures) {
+          if (texture.name == rt_name && texture.levels > 1 &&
+              texture.image != VK_NULL_HANDLE) {
+            GenerateTextureMips(dfn, command_buffer, texture.image,
+                                texture.width, texture.height, texture.levels);
+          }
+        }
+      }
+    }
 
     if (is_backbuffer_pass) {
       current_input = written_view;
