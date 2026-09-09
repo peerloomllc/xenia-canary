@@ -8,10 +8,14 @@ endif()
 
 set_target_properties(xenia-app PROPERTIES OUTPUT_NAME "xenia_canary")
 if(XE_HAS_NVIDIA_DLSS AND XE_NVIDIA_DLSS_SNIPPET)
-  # The NGX loader searches for the DLSS runtime next to the executable.
+  # The NGX loader is given <executable folder>/dlss as its feature path. The
+  # subfolder is not cosmetic: linuxdeploy runs patchelf over every ELF file
+  # directly in an AppImage's usr/bin, and NGX rejects a modified snippet, so
+  # a copy next to the executable loses DLSS in the AppImage.
   add_custom_command(TARGET xenia-app POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:xenia-app>/dlss
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-      ${XE_NVIDIA_DLSS_SNIPPET} $<TARGET_FILE_DIR:xenia-app>)
+      ${XE_NVIDIA_DLSS_SNIPPET} $<TARGET_FILE_DIR:xenia-app>/dlss/)
 endif()
 
 # Main source
