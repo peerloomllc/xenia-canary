@@ -9,6 +9,7 @@
 
 #include "xenia/vfs/devices/disc_image_device.h"
 
+#include "xenia/base/filesystem.h"
 #include "xenia/base/literals.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
@@ -98,6 +99,13 @@ DiscImageDevice::Error DiscImageDevice::Verify(ParseState* state) {
   if (state->root_size < 13 || state->root_size > 32_MiB) {
     return Error::kErrorDamagedFile;
   }
+  // The root directory region must lie inside the mapped image. A corrupt
+  // root sector would otherwise put root_offset past the mapping, and the
+  // first ReadEntry would dereference an unmapped pointer (segfault).
+  if (state->root_offset > state->size ||
+      state->root_size > state->size - state->root_offset) {
+    return Error::kErrorDamagedFile;
+  }
 
   return Error::kSuccess;
 }
@@ -127,7 +135,20 @@ DiscImageDevice::Error DiscImageDevice::ReadAllEntries(
 bool DiscImageDevice::ReadEntry(ParseState* state, const uint8_t* buffer,
                                 uint16_t entry_ordinal,
                                 DiscImageEntry* parent) {
+  const uint8_t* const image_begin = state->ptr;
+  const uint8_t* const image_end = state->ptr + state->size;
   const uint8_t* p = buffer + (entry_ordinal * 4);
+
+  // A corrupt or truncated GDFX table can point an ordinal past the mapped
+  // image; the 14-byte fixed record (and, below, the name) must lie inside it
+  // or reading would run off the end of the mapping (segfault). Fail the parse
+  // for a malformed image instead of crashing - the library scanner opens
+  // every disc in the folder, including ones that never get launched.
+  if (p < image_begin || p + 14 > image_end) {
+    XELOGE("DiscImageDevice: entry out of bounds in '{}' (malformed image)",
+           xe::path_to_utf8(host_path_));
+    return false;
+  }
 
   uint16_t node_l = xe::load<uint16_t>(p + 0);
   uint16_t node_r = xe::load<uint16_t>(p + 2);
@@ -136,6 +157,11 @@ bool DiscImageDevice::ReadEntry(ParseState* state, const uint8_t* buffer,
   uint8_t attributes = xe::load<uint8_t>(p + 12);
   uint8_t name_length = xe::load<uint8_t>(p + 13);
   auto name_buffer = reinterpret_cast<const char*>(p + 14);
+  if (p + 14 + name_length > image_end) {
+    XELOGE("DiscImageDevice: entry name out of bounds in '{}' (malformed image)",
+           xe::path_to_utf8(host_path_));
+    return false;
+  }
 
   if (node_l && !ReadEntry(state, buffer, node_l, parent)) {
     return false;
