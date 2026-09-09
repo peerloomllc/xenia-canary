@@ -97,6 +97,17 @@ class VulkanReShade {
         VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
     VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    // Stencil test against the effect's shared stencil buffer (ReShade's
+    // SMAA masks its blend pass this way). Only render-target passes use it.
+    bool stencil_enable = false;
+    bool stencil_clear = false;  // clear the stencil buffer at this pass
+    uint32_t stencil_read_mask = 0xFF;
+    uint32_t stencil_write_mask = 0xFF;
+    uint32_t stencil_reference = 0;
+    VkCompareOp stencil_compare = VK_COMPARE_OP_ALWAYS;
+    VkStencilOp stencil_pass_op = VK_STENCIL_OP_KEEP;
+    VkStencilOp stencil_fail_op = VK_STENCIL_OP_KEEP;
+    VkStencilOp stencil_depth_fail_op = VK_STENCIL_OP_KEEP;
     uint32_t num_vertices = 3;
     // Render area for a render-target pass (the targets' size); 0 = the
     // effect output extent (backbuffer passes).
@@ -173,6 +184,13 @@ class VulkanReShade {
     VkImage chain_image = VK_NULL_HANDLE;
     VkDeviceMemory chain_memory = VK_NULL_HANDLE;
     VkImageView chain_view = VK_NULL_HANDLE;
+    // Shared stencil buffer for passes that use the stencil test (created
+    // only when at least one pass declares StencilEnable). Full effect size,
+    // never sampled - always a depth-stencil attachment.
+    VkImage stencil_image = VK_NULL_HANDLE;
+    VkDeviceMemory stencil_memory = VK_NULL_HANDLE;
+    VkImageView stencil_view = VK_NULL_HANDLE;
+    VkFormat stencil_format = VK_FORMAT_UNDEFINED;
     // Backbuffer-pass framebuffers from the most recent Render; destroyed on
     // the next Render or teardown (the presenter awaits prior submissions
     // before reusing images).

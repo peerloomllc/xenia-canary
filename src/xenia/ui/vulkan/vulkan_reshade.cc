@@ -144,6 +144,50 @@ VkPrimitiveTopology TopologyFromReShade(reshadefx::primitive_topology t) {
   }
 }
 
+VkStencilOp StencilOpFromReShade(reshadefx::stencil_op op) {
+  switch (op) {
+    case reshadefx::stencil_op::zero:
+      return VK_STENCIL_OP_ZERO;
+    case reshadefx::stencil_op::replace:
+      return VK_STENCIL_OP_REPLACE;
+    case reshadefx::stencil_op::increment_saturate:
+      return VK_STENCIL_OP_INCREMENT_AND_CLAMP;
+    case reshadefx::stencil_op::decrement_saturate:
+      return VK_STENCIL_OP_DECREMENT_AND_CLAMP;
+    case reshadefx::stencil_op::invert:
+      return VK_STENCIL_OP_INVERT;
+    case reshadefx::stencil_op::increment:
+      return VK_STENCIL_OP_INCREMENT_AND_WRAP;
+    case reshadefx::stencil_op::decrement:
+      return VK_STENCIL_OP_DECREMENT_AND_WRAP;
+    case reshadefx::stencil_op::keep:
+    default:
+      return VK_STENCIL_OP_KEEP;
+  }
+}
+
+VkCompareOp StencilFuncFromReShade(reshadefx::stencil_func f) {
+  switch (f) {
+    case reshadefx::stencil_func::never:
+      return VK_COMPARE_OP_NEVER;
+    case reshadefx::stencil_func::less:
+      return VK_COMPARE_OP_LESS;
+    case reshadefx::stencil_func::equal:
+      return VK_COMPARE_OP_EQUAL;
+    case reshadefx::stencil_func::less_equal:
+      return VK_COMPARE_OP_LESS_OR_EQUAL;
+    case reshadefx::stencil_func::greater:
+      return VK_COMPARE_OP_GREATER;
+    case reshadefx::stencil_func::not_equal:
+      return VK_COMPARE_OP_NOT_EQUAL;
+    case reshadefx::stencil_func::greater_equal:
+      return VK_COMPARE_OP_GREATER_OR_EQUAL;
+    case reshadefx::stencil_func::always:
+    default:
+      return VK_COMPARE_OP_ALWAYS;
+  }
+}
+
 VkSamplerAddressMode AddressFromReShade(reshadefx::texture_address_mode m) {
   switch (m) {
     case reshadefx::texture_address_mode::wrap:
@@ -374,6 +418,18 @@ std::unique_ptr<VulkanReShade::Effect> VulkanReShade::CompileEffect(
       p.color_write_mask =
           VkColorComponentFlags(pass.render_target_write_mask[0] & 0xF);
       p.topology = TopologyFromReShade(pass.topology);
+      p.stencil_enable = pass.stencil_enable;
+      // A pass that clears its render targets also clears the stencil (this
+      // is how SMAA's edge pass resets the mask each frame).
+      p.stencil_clear = pass.stencil_enable && pass.clear_render_targets;
+      p.stencil_read_mask = pass.stencil_read_mask;
+      p.stencil_write_mask = pass.stencil_write_mask;
+      p.stencil_reference = pass.stencil_reference_value;
+      p.stencil_compare = StencilFuncFromReShade(pass.stencil_comparison_func);
+      p.stencil_pass_op = StencilOpFromReShade(pass.stencil_pass_op);
+      p.stencil_fail_op = StencilOpFromReShade(pass.stencil_fail_op);
+      p.stencil_depth_fail_op =
+          StencilOpFromReShade(pass.stencil_depth_fail_op);
       p.num_vertices = std::max(1u, pass.num_vertices);
       p.viewport_width = pass.viewport_width;
       p.viewport_height = pass.viewport_height;
@@ -481,6 +537,19 @@ void VulkanReShade::DestroyRuntime(Effect& effect) {
     dfn.vkDestroyImage(device, effect.chain_image, nullptr);
     effect.chain_image = VK_NULL_HANDLE;
   }
+  if (effect.stencil_view != VK_NULL_HANDLE) {
+    dfn.vkDestroyImageView(device, effect.stencil_view, nullptr);
+    effect.stencil_view = VK_NULL_HANDLE;
+  }
+  if (effect.stencil_image != VK_NULL_HANDLE) {
+    dfn.vkDestroyImage(device, effect.stencil_image, nullptr);
+    effect.stencil_image = VK_NULL_HANDLE;
+  }
+  if (effect.stencil_memory != VK_NULL_HANDLE) {
+    dfn.vkFreeMemory(device, effect.stencil_memory, nullptr);
+    effect.stencil_memory = VK_NULL_HANDLE;
+  }
+  effect.stencil_format = VK_FORMAT_UNDEFINED;
   if (effect.chain_memory != VK_NULL_HANDLE) {
     dfn.vkFreeMemory(device, effect.chain_memory, nullptr);
     effect.chain_memory = VK_NULL_HANDLE;
@@ -784,6 +853,75 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
     }
   }
 
+  // Shared stencil buffer, if any pass uses the stencil test.
+  bool any_stencil = false;
+  for (const Pass& pass : effect.passes) {
+    if (pass.stencil_enable) {
+      any_stencil = true;
+      break;
+    }
+  }
+  if (any_stencil) {
+    const ui::vulkan::VulkanInstance::Functions& ifn =
+        device_->vulkan_instance()->functions();
+    const VkPhysicalDevice physical_device = device_->physical_device();
+    const VkFormat candidates[] = {VK_FORMAT_S8_UINT,
+                                   VK_FORMAT_D24_UNORM_S8_UINT,
+                                   VK_FORMAT_D32_SFLOAT_S8_UINT};
+    for (VkFormat candidate : candidates) {
+      VkFormatProperties props = {};
+      ifn.vkGetPhysicalDeviceFormatProperties(physical_device, candidate,
+                                              &props);
+      if (props.optimalTilingFeatures &
+          VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) {
+        effect.stencil_format = candidate;
+        break;
+      }
+    }
+    if (effect.stencil_format == VK_FORMAT_UNDEFINED) {
+      XELOGE("VulkanReShade: no stencil format for '{}'", effect.name);
+      DestroyRuntime(effect);
+      return false;
+    }
+    const bool has_depth =
+        effect.stencil_format != VK_FORMAT_S8_UINT;
+    VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = effect.stencil_format;
+    ici.extent = {std::max(1u, effect.width), std::max(1u, effect.height), 1};
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!util::CreateDedicatedAllocationImage(
+            device_, ici, util::MemoryPurpose::kDeviceLocal,
+            effect.stencil_image, effect.stencil_memory)) {
+      XELOGE("VulkanReShade: failed to create the stencil buffer for '{}'",
+             effect.name);
+      DestroyRuntime(effect);
+      return false;
+    }
+    VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = effect.stencil_image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = effect.stencil_format;
+    vci.subresourceRange.aspectMask =
+        VK_IMAGE_ASPECT_STENCIL_BIT |
+        (has_depth ? VK_IMAGE_ASPECT_DEPTH_BIT : 0);
+    vci.subresourceRange.levelCount = 1;
+    vci.subresourceRange.layerCount = 1;
+    if (dfn.vkCreateImageView(device, &vci, nullptr, &effect.stencil_view) !=
+        VK_SUCCESS) {
+      XELOGE("VulkanReShade: failed to create the stencil view for '{}'",
+             effect.name);
+      DestroyRuntime(effect);
+      return false;
+    }
+  }
+
   VkPipelineShaderStageCreateInfo stages[2] = {};
   for (Pass& pass : effect.passes) {
     pass.vs_module = util::CreateShaderModule(device_, pass.vs_spirv.data(),
@@ -822,7 +960,7 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
     // texture's previous contents per the FX pass state, so temporal
     // (ping-pong accumulation) shaders keep their history.
     {
-      VkAttachmentDescription attachments[8] = {};
+      VkAttachmentDescription attachments[9] = {};
       VkAttachmentReference color_refs[8];
       for (uint32_t i = 0; i < attachment_count; ++i) {
         VkAttachmentDescription& attachment = attachments[i];
@@ -851,6 +989,33 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
       subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
       subpass.colorAttachmentCount = attachment_count;
       subpass.pColorAttachments = color_refs;
+      // Stencil: attach the effect's shared stencil buffer. The pass clears
+      // it (SMAA's edge pass) or loads what an earlier pass wrote (the blend
+      // pass masks on it). Depth is unused.
+      uint32_t total_attachments = attachment_count;
+      VkAttachmentReference ds_ref = {};
+      const bool pass_uses_stencil =
+          pass.stencil_enable && effect.stencil_image != VK_NULL_HANDLE;
+      if (pass_uses_stencil) {
+        VkAttachmentDescription& ds = attachments[attachment_count];
+        ds.format = effect.stencil_format;
+        ds.samples = VK_SAMPLE_COUNT_1_BIT;
+        ds.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        ds.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        ds.stencilLoadOp = pass.stencil_clear
+                               ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                               : VK_ATTACHMENT_LOAD_OP_LOAD;
+        ds.stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+        ds.initialLayout =
+            pass.stencil_clear
+                ? VK_IMAGE_LAYOUT_UNDEFINED
+                : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        ds.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        ds_ref.attachment = attachment_count;
+        ds_ref.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        subpass.pDepthStencilAttachment = &ds_ref;
+        total_attachments = attachment_count + 1;
+      }
       // Order this pass's attachment writes against surrounding passes that
       // sample or wrote the same images.
       VkSubpassDependency dependencies[2] = {};
@@ -871,8 +1036,30 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
       dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
       dependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
       dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+      if (pass_uses_stencil) {
+        // The stencil buffer is written this pass and read (as a mask) by a
+        // later pass; order both ways through the fragment-test stages.
+        dependencies[0].srcStageMask |=
+            VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        dependencies[0].srcAccessMask |=
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        dependencies[0].dstStageMask |=
+            VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+        dependencies[0].dstAccessMask |=
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        dependencies[1].srcStageMask |=
+            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        dependencies[1].srcAccessMask |=
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        dependencies[1].dstStageMask |=
+            VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+        dependencies[1].dstAccessMask |=
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+      }
       VkRenderPassCreateInfo rp_ci = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-      rp_ci.attachmentCount = attachment_count;
+      rp_ci.attachmentCount = total_attachments;
       rp_ci.pAttachments = attachments;
       rp_ci.subpassCount = 1;
       rp_ci.pSubpasses = &subpass;
@@ -889,7 +1076,7 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
 
     // Stable framebuffer + render area for a render-target pass.
     if (!pass_targets.empty()) {
-      VkImageView attachment_views[8];
+      VkImageView attachment_views[9];
       uint32_t fb_width = pass_targets[0]->width;
       uint32_t fb_height = pass_targets[0]->height;
       for (size_t i = 0; i < pass_targets.size(); ++i) {
@@ -897,12 +1084,16 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
         fb_width = std::min(fb_width, pass_targets[i]->width);
         fb_height = std::min(fb_height, pass_targets[i]->height);
       }
+      uint32_t fb_attachment_count = uint32_t(pass_targets.size());
+      if (pass.stencil_enable && effect.stencil_view != VK_NULL_HANDLE) {
+        attachment_views[fb_attachment_count++] = effect.stencil_view;
+      }
       pass.viewport_width = fb_width;
       pass.viewport_height = fb_height;
       VkFramebufferCreateInfo fb_ci = {
           VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
       fb_ci.renderPass = pass.render_pass;
-      fb_ci.attachmentCount = uint32_t(pass_targets.size());
+      fb_ci.attachmentCount = fb_attachment_count;
       fb_ci.pAttachments = attachment_views;
       fb_ci.width = fb_width;
       fb_ci.height = fb_height;
@@ -976,6 +1167,23 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
         VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dynamic_state.dynamicStateCount = 2;
     dynamic_state.pDynamicStates = dynamic_states;
+    // Stencil test (no depth): the FX front/back state, applied to both faces
+    // (the fullscreen triangle is single-sided).
+    VkPipelineDepthStencilStateCreateInfo depth_stencil = {
+        VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    if (pass.stencil_enable && effect.stencil_image != VK_NULL_HANDLE) {
+      depth_stencil.stencilTestEnable = VK_TRUE;
+      VkStencilOpState op = {};
+      op.failOp = pass.stencil_fail_op;
+      op.passOp = pass.stencil_pass_op;
+      op.depthFailOp = pass.stencil_depth_fail_op;
+      op.compareOp = pass.stencil_compare;
+      op.compareMask = pass.stencil_read_mask;
+      op.writeMask = pass.stencil_write_mask;
+      op.reference = pass.stencil_reference;
+      depth_stencil.front = op;
+      depth_stencil.back = op;
+    }
     VkGraphicsPipelineCreateInfo ci = {
         VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     ci.stageCount = 2;
@@ -986,6 +1194,9 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
     ci.pRasterizationState = &raster;
     ci.pMultisampleState = &multisample;
     ci.pColorBlendState = &color_blend;
+    if (pass.stencil_enable && effect.stencil_image != VK_NULL_HANDLE) {
+      ci.pDepthStencilState = &depth_stencil;
+    }
     ci.pDynamicState = &dynamic_state;
     ci.layout = effect.pipeline_layout;
     ci.renderPass = pass.render_pass;
@@ -1419,9 +1630,15 @@ bool VulkanReShade::Render(VkCommandBuffer command_buffer, Effect& effect,
     rp_bi.renderPass = pass.render_pass;
     rp_bi.framebuffer = framebuffer;
     rp_bi.renderArea.extent = pass_extent;
-    VkClearValue clear_values[8] = {};
+    VkClearValue clear_values[9] = {};
     if (pass.clear_render_targets && !is_backbuffer_pass) {
-      rp_bi.clearValueCount = uint32_t(pass.render_target_names.size());
+      uint32_t clear_count = uint32_t(pass.render_target_names.size());
+      // The stencil attachment (last) is cleared to 0 so the mask starts empty.
+      if (pass.stencil_clear && effect.stencil_image != VK_NULL_HANDLE) {
+        clear_values[clear_count].depthStencil = {0.0f, 0};
+        ++clear_count;
+      }
+      rp_bi.clearValueCount = clear_count;
       rp_bi.pClearValues = clear_values;
     }
     dfn.vkCmdBeginRenderPass(command_buffer, &rp_bi,
