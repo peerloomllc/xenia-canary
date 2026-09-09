@@ -208,17 +208,26 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // render target type.
   struct ReShadeSceneDepth {
     VkImage image = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;  // depth-aspect sampled view
     uint32_t width = 0;
     uint32_t height = 0;
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkPipelineStageFlags stage_mask = 0;
     VkAccessFlags access_mask = 0;
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
   };
-  // Picks the most likely "scene" depth render target (largest single-sampled
-  // depth RT) on the host render target path. Returns false if none is
-  // suitable (wrong path, MSAA only, empty cache, undefined layout).
+  // Picks the most likely "scene" depth render target (largest depth RT,
+  // MSAA allowed) on the host render target path. Returns false if none is
+  // suitable (wrong path, empty cache, undefined layout).
   bool GetReShadeSceneDepth(ReShadeSceneDepth& out) const;
+  // Records a fullscreen pass resolving the scene depth into an R32F colour
+  // image (single-sampled, left in SHADER_READ_ONLY_OPTIMAL) for the ReShade
+  // depth feed, on the command processor's graphics command buffer. `dst`
+  // must be sized to `out.width` x `out.height`.
+  void RecordReShadeDepthResolve(const ReShadeSceneDepth& src, VkImage dst,
+                                 VkImageView dst_view, uint32_t width,
+                                 uint32_t height);
 
  protected:
   bool IsGammaFormatHostStorageSeparate() const override;
@@ -321,6 +330,25 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   VkDeviceMemory edram_buffer_memory_ = VK_NULL_HANDLE;
   VkBuffer edram_buffer_ = VK_NULL_HANDLE;
+
+  // ReShade depth resolve (fullscreen depth -> R32F pass). Created lazily.
+  bool EnsureReShadeDepthResolve();
+  void DestroyReShadeDepthResolve();
+  VkRenderPass reshade_depth_resolve_render_pass_ = VK_NULL_HANDLE;
+  VkDescriptorSetLayout reshade_depth_resolve_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout reshade_depth_resolve_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline reshade_depth_resolve_pipeline_ms_ = VK_NULL_HANDLE;
+  VkPipeline reshade_depth_resolve_pipeline_1x_ = VK_NULL_HANDLE;
+  VkSampler reshade_depth_resolve_sampler_ = VK_NULL_HANDLE;
+  VkDescriptorPool reshade_depth_resolve_descriptor_pool_ = VK_NULL_HANDLE;
+  static constexpr uint32_t kReShadeDepthResolveSets = 3;
+  VkDescriptorSet
+      reshade_depth_resolve_sets_[kReShadeDepthResolveSets] = {};
+  uint32_t reshade_depth_resolve_set_index_ = 0;
+  VkFramebuffer reshade_depth_resolve_framebuffer_ = VK_NULL_HANDLE;
+  VkImageView reshade_depth_resolve_fb_view_ = VK_NULL_HANDLE;
+  uint32_t reshade_depth_resolve_fb_width_ = 0;
+  uint32_t reshade_depth_resolve_fb_height_ = 0;
   // Host-visible staging for RestoreEdramSnapshot, kept for reuse.
   VkBuffer edram_snapshot_upload_buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory edram_snapshot_upload_buffer_memory_ = VK_NULL_HANDLE;

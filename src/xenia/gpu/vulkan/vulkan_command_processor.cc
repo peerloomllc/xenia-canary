@@ -2046,57 +2046,32 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
           if (reshade_presenter && reshade_presenter->WantsReShadeDepth()) {
             VulkanRenderTargetCache::ReShadeSceneDepth scene_depth;
             if (render_target_cache_->GetReShadeSceneDepth(scene_depth)) {
+              // Resolve the scene depth (MSAA or 1x) into a single-sampled
+              // R32F image the ReShade runtime samples. Sized to the depth RT
+              // so the fullscreen pass maps 1:1.
+              // Xbox 360 render targets have no fixed height (only a pitch),
+              // and the depth RT pitch width can differ from the presented
+              // frontbuffer width (the scene renders at its own internal
+              // resolution). Size the resolve to the depth RT's real width with
+              // the frontbuffer's aspect, and sample its top-left 1:1; ReShade
+              // then samples this depth texture with normalised UVs, aligning it
+              // with the colour image.
+              uint32_t depth_w = scene_depth.width ? scene_depth.width
+                                                   : frontbuffer_width_scaled;
+              uint32_t depth_h =
+                  frontbuffer_width_scaled
+                      ? std::max(UINT32_C(1),
+                                 uint32_t(uint64_t(frontbuffer_height_scaled) *
+                                          depth_w / frontbuffer_width_scaled))
+                      : frontbuffer_height_scaled;
               VkImage depth_dst = reshade_presenter->AcquireReShadeDepthImage(
-                  frontbuffer_width_scaled, frontbuffer_height_scaled,
-                  scene_depth.format);
-              if (depth_dst != VK_NULL_HANDLE) {
-                VkImageSubresourceRange depth_range = {};
-                // Combined depth/stencil formats: barriers must cover both
-                // aspects (VUID-VkImageMemoryBarrier-image-03320).
-                depth_range.aspectMask =
-                    VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-                depth_range.levelCount = 1;
-                depth_range.layerCount = 1;
-                // Source depth RT -> TRANSFER_SRC.
-                PushImageMemoryBarrier(
-                    scene_depth.image, depth_range, scene_depth.stage_mask,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, scene_depth.access_mask,
-                    VK_ACCESS_TRANSFER_READ_BIT, scene_depth.layout,
-                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-                // Destination presenter image -> TRANSFER_DST (discard old).
-                PushImageMemoryBarrier(
-                    depth_dst, depth_range, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-                SubmitBarriers(true);
-                VkImageBlit blit = {};
-                blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-                blit.srcSubresource.layerCount = 1;
-                blit.srcOffsets[1] = {int32_t(scene_depth.width),
-                                      int32_t(scene_depth.height), 1};
-                blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-                blit.dstSubresource.layerCount = 1;
-                blit.dstOffsets[1] = {int32_t(frontbuffer_width_scaled),
-                                      int32_t(frontbuffer_height_scaled), 1};
-                deferred_command_buffer_.CmdVkBlitImage(
-                    scene_depth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    depth_dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
-                    VK_FILTER_NEAREST);
-                // Destination -> SHADER_READ for sampling by ReShade.
-                PushImageMemoryBarrier(
-                    depth_dst, depth_range, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-                // Restore the depth RT to its prior layout/usage.
-                PushImageMemoryBarrier(
-                    scene_depth.image, depth_range,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, scene_depth.stage_mask,
-                    VK_ACCESS_TRANSFER_READ_BIT, scene_depth.access_mask,
-                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, scene_depth.layout);
-                SubmitBarriers(true);
+                  depth_w, depth_h, VK_FORMAT_R32_SFLOAT);
+              VkImageView depth_dst_view =
+                  reshade_presenter->GetReShadeDepthView();
+              if (depth_dst != VK_NULL_HANDLE &&
+                  depth_dst_view != VK_NULL_HANDLE) {
+                render_target_cache_->RecordReShadeDepthResolve(
+                    scene_depth, depth_dst, depth_dst_view, depth_w, depth_h);
                 depth_fed = true;
               }
             }

@@ -402,7 +402,7 @@ VkImage VulkanPresenter::AcquireReShadeDepthImage(uint32_t width,
     image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
     image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
     image_create_info.usage =
-        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (!ui::vulkan::util::CreateDedicatedAllocationImage(
@@ -418,7 +418,7 @@ VkImage VulkanPresenter::AcquireReShadeDepthImage(uint32_t width,
     view_create_info.image = reshade_depth_image_;
     view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
     view_create_info.format = format;
-    view_create_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    view_create_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     view_create_info.subresourceRange.levelCount = 1;
     view_create_info.subresourceRange.layerCount = 1;
     if (dfn.vkCreateImageView(device, &view_create_info, nullptr,
@@ -2111,7 +2111,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
                 depth_acquire.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 depth_acquire.image = reshade_depth_image_;
                 depth_acquire.subresourceRange.aspectMask =
-                    VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+                    VK_IMAGE_ASPECT_COLOR_BIT;
                 depth_acquire.subresourceRange.levelCount = 1;
                 depth_acquire.subresourceRange.layerCount = 1;
                 dfn.vkCmdPipelineBarrier(

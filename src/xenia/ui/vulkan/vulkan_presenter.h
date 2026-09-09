@@ -158,13 +158,15 @@ class VulkanPresenter final : public Presenter {
   // thread). Whether the depth feed is wanted (--reshade_depth on and a
   // ReShade effect is loaded).
   bool WantsReShadeDepth() const;
-  // (Re)creates the depth image at the given size/format on the refresher
-  // timeline if needed and returns it so the CP can blit the scene depth into
-  // it (VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL expected on entry, leave it in
-  // VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL). Returns VK_NULL_HANDLE on
-  // failure.
+  // (Re)creates the depth image (a single-sampled R32_SFLOAT colour image the
+  // scene depth is resolved into) at the given size on the refresher timeline
+  // if needed and returns it, so the CP can render the resolved depth into it
+  // (left in VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL). Returns VK_NULL_HANDLE
+  // on failure. `format` should be VK_FORMAT_R32_SFLOAT.
   VkImage AcquireReShadeDepthImage(uint32_t width, uint32_t height,
                                    VkFormat format);
+  // The view of the depth image (color aspect), for use as a render target.
+  VkImageView GetReShadeDepthView() const { return reshade_depth_view_; }
   // Marks whether the depth image holds valid scene depth for this frame.
   void SetReShadeDepthValid(bool valid) { reshade_depth_valid_ = valid; }
 
