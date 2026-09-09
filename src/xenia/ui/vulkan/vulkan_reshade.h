@@ -56,6 +56,20 @@ class VulkanReShade {
     std::string ps_entry_point;
     std::vector<uint32_t> vs_spirv;
     std::vector<uint32_t> ps_spirv;
+    // Compute pass (writes storage images instead of a render target).
+    bool is_compute = false;
+    std::string cs_entry_point;
+    std::vector<uint32_t> cs_spirv;
+    uint32_t num_threads[3] = {1, 1, 1};
+    uint32_t dispatch_width = 0;   // total threads X (viewport_width)
+    uint32_t dispatch_height = 0;  // total threads Y
+    uint32_t dispatch_depth = 1;
+    // Storage images the compute pass writes, in binding order (unique
+    // texture names).
+    std::vector<std::string> storage_texture_names;
+    VkShaderModule cs_module = VK_NULL_HANDLE;
+    VkPipeline compute_pipeline = VK_NULL_HANDLE;
+    VkDescriptorSet storage_descriptor_set = VK_NULL_HANDLE;
     // Number of combined image samplers this pass's pixel shader references.
     uint32_t sampler_count = 0;
     // The texture (unique) name each sampler slot references, in slot order.
@@ -135,6 +149,8 @@ class VulkanReShade {
     // A pass renders into this texture (created as a color attachment that
     // later passes sample).
     bool is_render_target = false;
+    // A compute pass writes this texture as a storage image (RWTexture2D).
+    bool is_storage = false;
     uint32_t width = 0;
     uint32_t height = 0;
     // Mip levels (1 = no mips). A render-target texture with more than one
@@ -168,6 +184,10 @@ class VulkanReShade {
     // Vulkan runtime objects shared by the passes (created by CreateRuntime).
     VkDescriptorSetLayout set_layout_ubo = VK_NULL_HANDLE;
     VkDescriptorSetLayout set_layout_samplers = VK_NULL_HANDLE;
+    // Storage-image set (set 2), created only when the effect has a compute
+    // pass; the pipeline layout then binds three sets.
+    VkDescriptorSetLayout set_layout_storages = VK_NULL_HANDLE;
+    bool has_compute = false;
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkBuffer uniform_buffer = VK_NULL_HANDLE;

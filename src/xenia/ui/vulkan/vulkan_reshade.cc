@@ -326,6 +326,7 @@ std::unique_ptr<VulkanReShade::Effect> VulkanReShade::CompileEffect(
         tex.semantic == "COLOR" || tex.semantic == "SV_TARGET";
     texture.is_depth = tex.semantic == "DEPTH";
     texture.is_render_target = tex.render_target && !texture.is_backbuffer;
+    texture.is_storage = tex.storage_access;
     texture.width = tex.width;
     texture.height = tex.height;
     texture.format = FormatFromReShade(tex.format);
@@ -388,7 +389,44 @@ std::unique_ptr<VulkanReShade::Effect> VulkanReShade::CompileEffect(
   for (const auto& technique : module.techniques) {
     for (const auto& pass : technique.passes) {
       if (pass.cs_entry_point.size()) {
-        // Compute passes are not handled in this first runtime.
+        // Compute pass: writes storage images, no render target.
+        Pass p;
+        p.name = pass.name.empty() ? technique.name : pass.name;
+        p.is_compute = true;
+        p.cs_entry_point = pass.cs_entry_point;
+        p.cs_spirv = spirv_for(pass.cs_entry_point);
+        if (p.cs_spirv.empty()) {
+          XELOGE("VulkanReShade: '{}' compute pass '{}' missing SPIR-V",
+                 effect->name, p.name);
+          return nullptr;
+        }
+        // The workgroup (numthreads) size is baked into the CS SPIR-V as the
+        // LocalSize execution mode; DispatchSizeX/Y/Z below are the group
+        // counts, dispatched directly, so no host-side numthreads is needed.
+        p.dispatch_width = pass.viewport_width;
+        p.dispatch_height = pass.viewport_height;
+        p.dispatch_depth = std::max(1u, pass.viewport_dispatch_z);
+        // Sampler slots (compute may read textures too).
+        p.sampler_count = uint32_t(pass.sampler_bindings.size());
+        for (const auto& sb : pass.sampler_bindings) {
+          std::string texture_name;
+          Pass::SamplerState sampler_state;
+          if (sb.index < module.samplers.size()) {
+            texture_name = module.samplers[sb.index].texture_name;
+            sampler_state = SamplerStateFromReShade(module.samplers[sb.index]);
+          }
+          p.sampler_texture_names.push_back(texture_name);
+          p.sampler_states.push_back(sampler_state);
+        }
+        // Storage image slots (in binding order).
+        for (const auto& stb : pass.storage_bindings) {
+          std::string texture_name;
+          if (stb.index < module.storages.size()) {
+            texture_name = module.storages[stb.index].texture_name;
+          }
+          p.storage_texture_names.push_back(texture_name);
+        }
+        effect->passes.push_back(std::move(p));
         continue;
       }
       Pass p;
@@ -494,7 +532,16 @@ void VulkanReShade::DestroyRuntime(Effect& effect) {
       dfn.vkDestroyShaderModule(device, pass.ps_module, nullptr);
       pass.ps_module = VK_NULL_HANDLE;
     }
+    if (pass.cs_module != VK_NULL_HANDLE) {
+      dfn.vkDestroyShaderModule(device, pass.cs_module, nullptr);
+      pass.cs_module = VK_NULL_HANDLE;
+    }
+    if (pass.compute_pipeline != VK_NULL_HANDLE) {
+      dfn.vkDestroyPipeline(device, pass.compute_pipeline, nullptr);
+      pass.compute_pipeline = VK_NULL_HANDLE;
+    }
     pass.descriptor_set = VK_NULL_HANDLE;
+    pass.storage_descriptor_set = VK_NULL_HANDLE;
   }
   if (effect.uniform_mapped) {
     dfn.vkUnmapMemory(device, effect.uniform_memory);
@@ -524,6 +571,11 @@ void VulkanReShade::DestroyRuntime(Effect& effect) {
     dfn.vkDestroyDescriptorSetLayout(device, effect.set_layout_samplers,
                                      nullptr);
     effect.set_layout_samplers = VK_NULL_HANDLE;
+  }
+  if (effect.set_layout_storages != VK_NULL_HANDLE) {
+    dfn.vkDestroyDescriptorSetLayout(device, effect.set_layout_storages,
+                                     nullptr);
+    effect.set_layout_storages = VK_NULL_HANDLE;
   }
   for (VkFramebuffer framebuffer : effect.transient_framebuffers) {
     dfn.vkDestroyFramebuffer(device, framebuffer, nullptr);
@@ -644,9 +696,18 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
   }
 
   uint32_t max_samplers = 0;
+  uint32_t max_storages = 0;
+  effect.has_compute = false;
   for (const Pass& pass : effect.passes) {
     max_samplers = std::max(max_samplers, pass.sampler_count);
+    max_storages =
+        std::max(max_storages, uint32_t(pass.storage_texture_names.size()));
+    if (pass.is_compute) {
+      effect.has_compute = true;
+    }
   }
+  const VkShaderStageFlags extra_compute_stage =
+      effect.has_compute ? VK_SHADER_STAGE_COMPUTE_BIT : 0;
 
   // Descriptor set layouts: set 0 = uniform buffer, set 1 = combined image
   // samplers (ReShade's Vulkan SPIR-V uses set 0 binding 0 for the UBO and
@@ -656,8 +717,9 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
     ubo_binding.binding = 0;
     ubo_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     ubo_binding.descriptorCount = 1;
-    ubo_binding.stageFlags =
-        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    ubo_binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT |
+                             VK_SHADER_STAGE_FRAGMENT_BIT |
+                             extra_compute_stage;
     VkDescriptorSetLayoutCreateInfo ci = {
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     ci.bindingCount = 1;
@@ -675,7 +737,8 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
       bindings[i].binding = i;
       bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
       bindings[i].descriptorCount = 1;
-      bindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+      bindings[i].stageFlags =
+          VK_SHADER_STAGE_FRAGMENT_BIT | extra_compute_stage;
     }
     VkDescriptorSetLayoutCreateInfo ci = {
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
@@ -689,12 +752,34 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
       return false;
     }
   }
+  if (effect.has_compute) {
+    // Set 2: storage images (RWTexture2D) a compute pass writes.
+    std::vector<VkDescriptorSetLayoutBinding> bindings(std::max(1u, max_storages));
+    for (uint32_t i = 0; i < bindings.size(); ++i) {
+      bindings[i].binding = i;
+      bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+      bindings[i].descriptorCount = 1;
+      bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo ci = {
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    ci.bindingCount = uint32_t(bindings.size());
+    ci.pBindings = bindings.data();
+    if (dfn.vkCreateDescriptorSetLayout(device, &ci, nullptr,
+                                        &effect.set_layout_storages) !=
+        VK_SUCCESS) {
+      XELOGE("VulkanReShade: failed to create the storage set layout");
+      DestroyRuntime(effect);
+      return false;
+    }
+  }
   {
-    VkDescriptorSetLayout set_layouts[2] = {effect.set_layout_ubo,
-                                            effect.set_layout_samplers};
+    VkDescriptorSetLayout set_layouts[3] = {effect.set_layout_ubo,
+                                            effect.set_layout_samplers,
+                                            effect.set_layout_storages};
     VkPipelineLayoutCreateInfo ci = {
         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    ci.setLayoutCount = 2;
+    ci.setLayoutCount = effect.has_compute ? 3 : 2;
     ci.pSetLayouts = set_layouts;
     if (dfn.vkCreatePipelineLayout(device, &ci, nullptr,
                                    &effect.pipeline_layout) != VK_SUCCESS) {
@@ -708,7 +793,10 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
   // later pass samples. Sized as the shader declared them (BUFFER_WIDTH etc.
   // were substituted at compile time).
   for (Texture& texture : effect.textures) {
-    if (!texture.is_render_target || !texture.source_file.empty()) {
+    // Create effect-owned textures: render targets and compute storage
+    // images (a storage texture need not also be a render target).
+    if ((!texture.is_render_target && !texture.is_storage) ||
+        !texture.source_file.empty()) {
       continue;
     }
     VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -720,10 +808,16 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
     ici.arrayLayers = 1;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-    // TRANSFER_SRC as well so a mipped target can blit level n into n+1.
-    ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+    // COLOR_ATTACHMENT for render targets, STORAGE for compute-written
+    // images, TRANSFER_SRC so a mipped target can blit level n into n+1.
+    ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    if (texture.is_render_target) {
+      ici.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    }
+    if (texture.is_storage) {
+      ici.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    }
     ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (!util::CreateDedicatedAllocationImage(
@@ -767,7 +861,7 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
   // the backbuffer.
   uint32_t backbuffer_pass_count = 0;
   for (const Pass& pass : effect.passes) {
-    if (pass.render_target_names.empty()) {
+    if (!pass.is_compute && pass.render_target_names.empty()) {
       ++backbuffer_pass_count;
     }
   }
@@ -835,15 +929,18 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
   // Descriptor pool and one (ubo, samplers) set pair per pass.
   {
     const uint32_t pass_count = uint32_t(effect.passes.size());
-    VkDescriptorPoolSize sizes[2];
+    VkDescriptorPoolSize sizes[3];
     sizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[0].descriptorCount = std::max(1u, pass_count);
     sizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[1].descriptorCount = std::max(1u, pass_count * std::max(1u, max_samplers));
+    sizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    sizes[2].descriptorCount = std::max(1u, pass_count * std::max(1u, max_storages));
     VkDescriptorPoolCreateInfo ci = {
         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    ci.maxSets = std::max(1u, pass_count * 2);
-    ci.poolSizeCount = 2;
+    // Up to three sets per pass (ubo, samplers, storages).
+    ci.maxSets = std::max(1u, pass_count * 3);
+    ci.poolSizeCount = effect.has_compute ? 3 : 2;
     ci.pPoolSizes = sizes;
     if (dfn.vkCreateDescriptorPool(device, &ci, nullptr,
                                    &effect.descriptor_pool) != VK_SUCCESS) {
@@ -924,6 +1021,96 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
 
   VkPipelineShaderStageCreateInfo stages[2] = {};
   for (Pass& pass : effect.passes) {
+    if (pass.is_compute) {
+      // Compute pass: a CS module + pipeline, and a descriptor set trio (UBO,
+      // samplers, storage images). No render pass or framebuffer.
+      pass.cs_module = util::CreateShaderModule(device_, pass.cs_spirv.data(),
+                                                pass.cs_spirv.size() * 4);
+      if (pass.cs_module == VK_NULL_HANDLE) {
+        XELOGE("VulkanReShade: failed to create the CS module for '{}'",
+               pass.name);
+        DestroyRuntime(effect);
+        return false;
+      }
+      VkDescriptorSetLayout layouts[3] = {effect.set_layout_ubo,
+                                          effect.set_layout_samplers,
+                                          effect.set_layout_storages};
+      VkDescriptorSet sets[3] = {};
+      VkDescriptorSetAllocateInfo ai = {
+          VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+      ai.descriptorPool = effect.descriptor_pool;
+      ai.descriptorSetCount = 3;
+      ai.pSetLayouts = layouts;
+      if (dfn.vkAllocateDescriptorSets(device, &ai, sets) != VK_SUCCESS) {
+        XELOGE("VulkanReShade: failed to allocate compute descriptor sets");
+        DestroyRuntime(effect);
+        return false;
+      }
+      pass.descriptor_set = sets[0];
+      pass.sampler_descriptor_set = sets[1];
+      pass.storage_descriptor_set = sets[2];
+      // UBO (set 0).
+      VkDescriptorBufferInfo buffer_info = {};
+      buffer_info.buffer = effect.uniform_buffer;
+      buffer_info.range = ubo_size;
+      VkWriteDescriptorSet ubo_write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+      ubo_write.dstSet = sets[0];
+      ubo_write.dstBinding = 0;
+      ubo_write.descriptorCount = 1;
+      ubo_write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+      ubo_write.pBufferInfo = &buffer_info;
+      dfn.vkUpdateDescriptorSets(device, 1, &ubo_write, 0, nullptr);
+      // Storage images (set 2) - stable, effect-owned; bound in GENERAL,
+      // which is the layout the render dispatch transitions them into.
+      std::vector<VkDescriptorImageInfo> storage_infos;
+      std::vector<VkWriteDescriptorSet> storage_writes;
+      for (uint32_t i = 0; i < pass.storage_texture_names.size(); ++i) {
+        VkImageView view = VK_NULL_HANDLE;
+        for (const Texture& texture : effect.textures) {
+          if (texture.name == pass.storage_texture_names[i]) {
+            view = texture.attachment_view;
+            break;
+          }
+        }
+        if (view == VK_NULL_HANDLE) {
+          continue;
+        }
+        VkDescriptorImageInfo info = {};
+        info.imageView = view;
+        info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        storage_infos.push_back(info);
+      }
+      for (uint32_t i = 0; i < storage_infos.size(); ++i) {
+        VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstSet = sets[2];
+        w.dstBinding = i;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        w.pImageInfo = &storage_infos[i];
+        storage_writes.push_back(w);
+      }
+      if (!storage_writes.empty()) {
+        dfn.vkUpdateDescriptorSets(device, uint32_t(storage_writes.size()),
+                                   storage_writes.data(), 0, nullptr);
+      }
+      // Compute pipeline.
+      VkComputePipelineCreateInfo cpci = {
+          VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+      cpci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+      cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+      cpci.stage.module = pass.cs_module;
+      cpci.stage.pName = pass.cs_entry_point.c_str();
+      cpci.layout = effect.pipeline_layout;
+      if (dfn.vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci,
+                                       nullptr,
+                                       &pass.compute_pipeline) != VK_SUCCESS) {
+        XELOGE("VulkanReShade: failed to create the compute pipeline for '{}'",
+               pass.name);
+        DestroyRuntime(effect);
+        return false;
+      }
+      continue;
+    }
     pass.vs_module = util::CreateShaderModule(device_, pass.vs_spirv.data(),
                                               pass.vs_spirv.size() * 4);
     pass.ps_module = util::CreateShaderModule(device_, pass.ps_spirv.data(),
@@ -1367,8 +1554,8 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
   {
     std::vector<VkImageMemoryBarrier> barriers;
     for (const Texture& texture : effect.textures) {
-      if (!texture.is_render_target || texture.image == VK_NULL_HANDLE ||
-          !texture.source_file.empty()) {
+      if ((!texture.is_render_target && !texture.is_storage) ||
+          texture.image == VK_NULL_HANDLE || !texture.source_file.empty()) {
         continue;
       }
       VkImageMemoryBarrier barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -1542,7 +1729,7 @@ bool VulkanReShade::Render(VkCommandBuffer command_buffer, Effect& effect,
   // output. Each such pass samples the previous pass's result.
   uint32_t backbuffer_pass_count = 0;
   for (const Pass& pass : effect.passes) {
-    if (pass.render_target_names.empty()) {
+    if (!pass.is_compute && pass.render_target_names.empty()) {
       ++backbuffer_pass_count;
     }
   }
@@ -1553,6 +1740,112 @@ bool VulkanReShade::Render(VkCommandBuffer command_buffer, Effect& effect,
   VkImageView current_input = input_view;
   uint32_t backbuffer_pass_index = 0;
   for (Pass& pass : effect.passes) {
+    if (pass.is_compute) {
+      // Bind the sampler slots (same rule as a graphics pass), move the
+      // storage images to GENERAL, dispatch, then hand them back to sampling.
+      if (pass.sampler_count) {
+        std::vector<VkDescriptorImageInfo> image_infos(pass.sampler_count);
+        std::vector<VkWriteDescriptorSet> writes(pass.sampler_count);
+        for (uint32_t i = 0; i < pass.sampler_count; ++i) {
+          VkImageView slot_view = current_input;
+          if (i < pass.sampler_texture_names.size()) {
+            for (const Texture& texture : effect.textures) {
+              if (texture.name == pass.sampler_texture_names[i]) {
+                if (texture.is_depth) {
+                  if (depth_view != VK_NULL_HANDLE) {
+                    slot_view = depth_view;
+                  }
+                } else if (!texture.is_backbuffer &&
+                           texture.view != VK_NULL_HANDLE) {
+                  slot_view = texture.view;
+                }
+                break;
+              }
+            }
+          }
+          image_infos[i].sampler =
+              (i < pass.slot_samplers.size() &&
+               pass.slot_samplers[i] != VK_NULL_HANDLE)
+                  ? pass.slot_samplers[i]
+                  : runtime_sampler_;
+          image_infos[i].imageView = slot_view;
+          image_infos[i].imageLayout =
+              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+          writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+          writes[i].dstSet = pass.sampler_descriptor_set;
+          writes[i].dstBinding = i;
+          writes[i].descriptorCount = 1;
+          writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+          writes[i].pImageInfo = &image_infos[i];
+        }
+        dfn.vkUpdateDescriptorSets(device, uint32_t(writes.size()),
+                                   writes.data(), 0, nullptr);
+      }
+      // Storage images: SHADER_READ (or UNDEFINED first frame) -> GENERAL.
+      std::vector<VkImageMemoryBarrier> to_general;
+      for (const std::string& st_name : pass.storage_texture_names) {
+        for (const Texture& texture : effect.textures) {
+          if (texture.name == st_name && texture.image != VK_NULL_HANDLE) {
+            VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            b.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            b.dstAccessMask =
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            b.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = texture.image;
+            b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, texture.levels,
+                                  0, 1};
+            to_general.push_back(b);
+            break;
+          }
+        }
+      }
+      if (!to_general.empty()) {
+        dfn.vkCmdPipelineBarrier(
+            command_buffer, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
+            uint32_t(to_general.size()), to_general.data());
+      }
+      dfn.vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            pass.compute_pipeline);
+      VkDescriptorSet bind_sets[3] = {pass.descriptor_set,
+                                      pass.sampler_descriptor_set,
+                                      pass.storage_descriptor_set};
+      dfn.vkCmdBindDescriptorSets(
+          command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+          effect.pipeline_layout, 0, 3, bind_sets, 0, nullptr);
+      // DispatchSizeX/Y/Z are thread-GROUP counts (the numthreads local
+      // size is baked into the CS SPIR-V), so dispatch them directly. Fall
+      // back to covering the frame if a size was somehow left unset.
+      uint32_t groups_x =
+          pass.dispatch_width
+              ? pass.dispatch_width
+              : (extent.width + pass.num_threads[0] - 1) / pass.num_threads[0];
+      uint32_t groups_y =
+          pass.dispatch_height
+              ? pass.dispatch_height
+              : (extent.height + pass.num_threads[1] - 1) /
+                    pass.num_threads[1];
+      uint32_t groups_z = pass.dispatch_depth;
+      dfn.vkCmdDispatch(command_buffer, std::max(1u, groups_x),
+                        std::max(1u, groups_y), std::max(1u, groups_z));
+      // Storage images: GENERAL -> SHADER_READ for the sampling passes.
+      for (VkImageMemoryBarrier& b : to_general) {
+        b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      }
+      if (!to_general.empty()) {
+        dfn.vkCmdPipelineBarrier(
+            command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
+            uint32_t(to_general.size()), to_general.data());
+      }
+      continue;
+    }
     const bool is_backbuffer_pass = pass.render_target_names.empty();
     VkFramebuffer framebuffer = pass.framebuffer;
     VkExtent2D pass_extent = extent;
