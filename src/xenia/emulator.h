@@ -264,7 +264,7 @@ class Emulator {
   };
 
   // Determine the executable signature
-  FileSignatureType GetFileSignature(const std::filesystem::path& path);
+  static FileSignatureType GetFileSignature(const std::filesystem::path& path);
 
   // Launches a game from the given file path.
   // This will attempt to infer the type of the given file (such as an iso, etc)
@@ -421,7 +421,8 @@ class Emulator {
     uint8_t disc_number = 0;
     uint8_t disc_count = 0;
   };
-  bool ReadDiscInfo(const std::filesystem::path& path, DiscInfo* out);
+  // Static: the launcher reads a title's id before an emulator exists.
+  static bool ReadDiscInfo(const std::filesystem::path& path, DiscInfo* out);
 
   // Swaps the running title's disc for the image at path: checks that it is
   // the disc that was asked for, cycles the DVD tray around the change so a
