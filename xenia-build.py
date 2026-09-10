@@ -807,8 +807,9 @@ def run_cmake_configure(build_type="Release", cc=None, build_tests=False,
         else:
             print(f"  WARNING: {target.upper()} cross-compiler not found. Install "
                   f"'MSVC {target.upper()} build tools' in Visual Studio.")
-    if build_tests:
-        args += ["-DXENIA_BUILD_TESTS=ON"]
+    # Always passed, both ways: leaving it out let a cached ON from an earlier
+    # configure keep building the five test binaries on every build.
+    args += ["-DXENIA_BUILD_TESTS=" + ("ON" if build_tests else "OFF")]
     if extra_args:
         args += extra_args
 
