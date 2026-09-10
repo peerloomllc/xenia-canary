@@ -383,6 +383,19 @@ class Emulator {
 
   // The game can request another title to be loaded.
   const std::filesystem::path GetNewDiscPath(std::string window_message = "");
+  // Builds and runs the picker itself. UI thread only.
+  const std::filesystem::path ShowDiscPicker(std::string window_message);
+
+  // The disc image of the title that is running, so a swap can look for the
+  // title's other discs beside it.
+  const std::filesystem::path& disc_image_path() const {
+    return disc_image_path_;
+  }
+
+  // Looks for disc n of the running title in the folder the current disc came
+  // from, so a multi-disc title opened directly (not through a playlist) can
+  // swap without asking. Empty if there is no such file.
+  std::filesystem::path FindSiblingDisc(uint8_t n);
 
   // Title id, discs and media id from a disc image or XEX without launching
   // it. The same header read the game library scan uses.
@@ -451,6 +464,7 @@ class Emulator {
   // Mount point of the running title's disc, so a swap can unregister it
   // instead of leaving it registered behind the new one.
   std::string disc_mount_path_;
+  std::filesystem::path disc_image_path_;
   // Discs swapped out during this title, kept alive for the handles the
   // guest may still hold on them. Freed with the emulator.
   std::vector<std::unique_ptr<vfs::Device>> ejected_discs_;

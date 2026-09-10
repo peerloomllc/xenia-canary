@@ -736,16 +736,22 @@ dword_result_t XamSwapDisc_entry(
   const uint8_t wanted = static_cast<uint8_t>(uint32_t(disc_number));
 
   // A playlist knows which file is which disc, so the title swaps without
-  // asking. Without one, ask for the file, using the title's own message.
+  // asking. Without one, look for the disc beside the one that is running:
+  // the discs of a title normally sit in the same folder. Only if that finds
+  // nothing is the file asked for, using the title's own message.
   std::filesystem::path new_disc_path = emulator->PlaylistDisc(wanted);
-  if (new_disc_path.empty()) {
-    std::u16string text_message = xe::load_and_swap<std::u16string>(
-        kernel_state()->memory()->TranslateVirtual(
-            error_message->stringTextPtr));
-    new_disc_path = emulator->GetNewDiscPath(xe::to_utf8(text_message));
-    XELOGI("GetNewDiscPath returned path {}.", new_disc_path.string().c_str());
-  } else {
+  if (!new_disc_path.empty()) {
     XELOGI("Playlist supplies disc {}: {}", wanted, new_disc_path.string());
+  } else {
+    new_disc_path = emulator->FindSiblingDisc(wanted);
+    if (new_disc_path.empty()) {
+      std::u16string text_message = xe::load_and_swap<std::u16string>(
+          kernel_state()->memory()->TranslateVirtual(
+              error_message->stringTextPtr));
+      new_disc_path = emulator->GetNewDiscPath(xe::to_utf8(text_message));
+      XELOGI("GetNewDiscPath returned path {}.",
+             new_disc_path.string().c_str());
+    }
   }
 
   if (new_disc_path.empty()) {
