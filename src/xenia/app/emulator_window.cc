@@ -3894,6 +3894,22 @@ void EmulatorWindow::SaveStatesDialog::OnDraw(ImGuiIO& io) {
               load_key ? HotkeyName(*load_key).c_str() : "(no key)",
               cvars::next_slot_hotkey.c_str(), cvars::prev_slot_hotkey.c_str());
   ImGui::Separator();
+  {
+    // Resume on exit: not one of the slots, so it is explained where the
+    // slots are rather than hidden in the settings window.
+    bool resume = cvars::resume_on_exit;
+    if (ImGui::Checkbox("Go back to where I left off when a game reopens",
+                        &resume)) {
+      OVERRIDE_bool(resume_on_exit, resume);
+      config::SaveConfig();
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip(
+          "Saves a state when the game closes and restores it the next time\n"
+          "that game runs, once. It does not use one of the nine slots.");
+    }
+  }
+  ImGui::Separator();
   // Folder setting.
   auto dir = w.SaveStateDir();
   ImGui::Text("Folder: %s%s", dir.string().c_str(),
@@ -7755,6 +7771,13 @@ void EmulatorWindow::ToggleSettingsWindow() {
       });
       gtk_grid_attach(GTK_GRID(grid), clear, 1, row++, 1, 1);
     }
+    // A save-state behaviour rather than a folder, but this is the tab where
+    // save states are, and Emulation > Save State Slots... carries it too.
+    gtk_grid_attach(GTK_GRID(grid),
+                    gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), 0, row++, 4,
+                    1);
+    AddCheck(grid, row, "Go back to where I left off when a game reopens",
+             "resume_on_exit", cvars::resume_on_exit);
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), TabScroller(grid),
                              gtk_label_new("Folders"));
   }
