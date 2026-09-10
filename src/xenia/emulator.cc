@@ -147,6 +147,11 @@ DEFINE_int32(disc_swap_experiment_disc, 2,
              "Experiment: which disc number disc_swap_experiment_seconds "
              "asks for.",
              "General");
+DEFINE_bool(disc_swap_experiment_prompt, false,
+            "Experiment: at disc_swap_experiment_seconds, open the disc picker "
+            "from a guest-style thread instead of swapping, to exercise the "
+            "path XamSwapDisc takes when no disc file can be found.",
+            "Other");
 DEFINE_path(disc_swap_experiment_path, "",
             "Experiment: the disc image to swap to when there is no "
             "playlist.",
@@ -712,6 +717,7 @@ X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
     case FileSignatureType::XISO: {
       mount_result = MountPath(path, "\\Device\\Cdrom0");
       disc_mount_path_ = "\\Device\\Cdrom0";
+      disc_image_path_ = path;
       return mount_result ? mount_result : LaunchDiscImage(path);
     } break;
     case FileSignatureType::XBE: {
@@ -721,6 +727,7 @@ X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
     case FileSignatureType::ZAR: {
       mount_result = MountPath(path, "\\Device\\Cdrom0");
       disc_mount_path_ = "\\Device\\Cdrom0";
+      disc_image_path_ = path;
       return mount_result ? mount_result : LaunchDiscArchive(path);
     } break;
     case FileSignatureType::EXE:
@@ -2232,6 +2239,7 @@ bool Emulator::SwapDisc(const std::filesystem::path& path,
     return reason("that disc image could not be mounted");
   }
   disc_mount_path_ = mount_path;
+  disc_image_path_ = path;
   disc_number_ = info.disc_number;
 
   if (smc) {
@@ -2243,7 +2251,81 @@ bool Emulator::SwapDisc(const std::filesystem::path& path,
   return true;
 }
 
+std::filesystem::path Emulator::FindSiblingDisc(uint8_t n) {
+  if (disc_image_path_.empty() || !title_id_.has_value()) {
+    return std::filesystem::path();
+  }
+  std::error_code ec;
+  const std::filesystem::path dir = disc_image_path_.parent_path();
+  const std::string extension = disc_image_path_.extension().string();
+
+  auto matches = [&](const std::filesystem::path& candidate) {
+    DiscInfo info;
+    return ReadDiscInfo(candidate, &info) && info.title_id == title_id_.value() &&
+           info.disc_number == n;
+  };
+
+  // The discs of a title are usually named alike, differing in one digit
+  // ("... (Disc 1).iso"), so try that name before reading any headers.
+  const std::string name = disc_image_path_.filename().string();
+  if (disc_number_ >= 1 && disc_number_ <= 9 && n >= 1 && n <= 9) {
+    const char from = char('0' + disc_number_);
+    const char to = char('0' + n);
+    for (size_t at = name.find(from); at != std::string::npos;
+         at = name.find(from, at + 1)) {
+      std::string guess = name;
+      guess[at] = to;
+      const std::filesystem::path candidate = dir / guess;
+      if (std::filesystem::exists(candidate, ec) && matches(candidate)) {
+        XELOGI("Disc {} found beside the current one: {}", n, guess);
+        return candidate;
+      }
+    }
+  }
+
+  // Otherwise read the headers of the other images in the same folder. Capped:
+  // a games folder can hold hundreds of files and each read opens the image.
+  constexpr size_t kMaxCandidates = 32;
+  size_t read = 0;
+  for (std::filesystem::directory_iterator it(dir, ec), end;
+       it != end && !ec && read < kMaxCandidates; it.increment(ec)) {
+    if (!it->is_regular_file(ec)) {
+      continue;
+    }
+    const std::filesystem::path& candidate = it->path();
+    if (candidate == disc_image_path_ || candidate.extension() != extension) {
+      continue;
+    }
+    ++read;
+    if (matches(candidate)) {
+      XELOGI("Disc {} found beside the current one: {}", n,
+             candidate.filename().string());
+      return candidate;
+    }
+  }
+  return std::filesystem::path();
+}
+
 const std::filesystem::path Emulator::GetNewDiscPath(
+    std::string window_message) {
+  // GTK builds the picker's widgets, and only the UI thread may touch GTK.
+  // XamSwapDisc calls this from a guest thread, where the file chooser
+  // segfaulted the process partway through construction.
+  ui::Window* window = display_window();
+  if (window && !window->app_context().IsInUIThread()) {
+    std::filesystem::path path;
+    if (!window->app_context().CallInUIThreadSynchronous(
+            [this, &window_message, &path]() {
+              path = ShowDiscPicker(window_message);
+            })) {
+      return std::filesystem::path();
+    }
+    return path;
+  }
+  return ShowDiscPicker(window_message);
+}
+
+const std::filesystem::path Emulator::ShowDiscPicker(
     std::string window_message) {
   std::filesystem::path path = "";
 
@@ -2794,12 +2876,28 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
           std::chrono::seconds(cvars::disc_swap_experiment_seconds));
       const uint8_t wanted =
           static_cast<uint8_t>(cvars::disc_swap_experiment_disc);
+      if (cvars::disc_swap_experiment_prompt) {
+        // Runs the picker exactly as XamSwapDisc does, from a thread that is
+        // not the UI thread, which is where GTK used to crash the process.
+        XELOGI("DISC SWAP EXPERIMENT: asking for disc {} through the picker",
+               wanted);
+        const std::filesystem::path picked = GetNewDiscPath(
+            fmt::format("Insert disc {} (experiment)", wanted));
+        XELOGI("DISC SWAP EXPERIMENT: picker returned '{}'", picked.string());
+        return;
+      }
       std::filesystem::path path = PlaylistDisc(wanted);
       if (path.empty()) {
         path = cvars::disc_swap_experiment_path;
       }
       if (path.empty()) {
-        XELOGE("DISC SWAP EXPERIMENT: no playlist and no path given");
+        // The title's other discs normally sit beside the one that is running.
+        path = FindSiblingDisc(wanted);
+      }
+      if (path.empty()) {
+        XELOGE("DISC SWAP EXPERIMENT: no playlist, no path and no disc {} "
+               "beside the current one",
+               wanted);
         return;
       }
       XELOGI("DISC SWAP EXPERIMENT: asking for disc {} from {}", wanted,
