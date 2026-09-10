@@ -1315,6 +1315,21 @@ X_STATUS Emulator::CreateZarchivePackage(
   return X_STATUS_SUCCESS;
 }
 
+void Emulator::FrameAdvanceCheckpoint() {
+  if (!frame_advance_pending_.exchange(false)) {
+    return;
+  }
+  frame_advance_reached_ = true;
+  // Spin rather than wait on a lock: Pause() suspends this thread where it
+  // stands, and a lock held by a suspended thread would strand the release.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (frame_advance_hold_ &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::microseconds(200));
+  }
+}
+
 void Emulator::Pause(bool capture_edram) {
   XELOGI("anchor xe::FlushLog at {}", reinterpret_cast<void*>(&xe::FlushLog));
   if (paused_) {

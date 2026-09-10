@@ -364,6 +364,22 @@ class Emulator {
     restore_warnings_.push_back(std::move(text));
   }
   bool is_paused() const { return paused_; }
+
+  // Frame advance: the guest is held at its next swap, so a single frame is
+  // presented however long pausing takes afterwards. BeginFrameAdvance arms
+  // it, the guest calls FrameAdvanceCheckpoint from VdSwap, and
+  // EndFrameAdvance lets the guest go (it is suspended by then anyway).
+  void BeginFrameAdvance() {
+    frame_advance_reached_ = false;
+    frame_advance_hold_ = true;
+    frame_advance_pending_ = true;
+  }
+  bool frame_advance_reached() const { return frame_advance_reached_; }
+  void EndFrameAdvance() {
+    frame_advance_pending_ = false;
+    frame_advance_hold_ = false;
+  }
+  void FrameAdvanceCheckpoint();
   // Pauses, serialises the state into memory, resumes (calling on_resumed),
   // then compresses and writes the file. The game is stopped only for the
   // serialisation.
@@ -508,6 +524,9 @@ class Emulator {
   std::unique_ptr<kernel::util::GameInfoDatabase> game_info_database_;
 
   bool paused_;
+  std::atomic<bool> frame_advance_pending_{false};
+  std::atomic<bool> frame_advance_hold_{false};
+  std::atomic<bool> frame_advance_reached_{false};
   // The guest clock at Pause(); Resume() sets it back (pause_rewinds_guest_clock).
   uint64_t pause_guest_tick_count_ = 0;
   // Guest threads Pause() suspended, so Resume() undoes exactly that.
