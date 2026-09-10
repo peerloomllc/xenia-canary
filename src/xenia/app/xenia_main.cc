@@ -585,6 +585,19 @@ void EmulatorApp::EmulatorThread() {
   xe::threading::set_name("Emulator");
   Profiler::ThreadEnter("Emulator");
 
+  // A title's own settings are normally read when it launches, which is after
+  // the graphics system has been built from the main config. When the title
+  // is known up front (a command line, the desktop entry, a relaunch), read
+  // them now so the ones consumed while setting up apply as well.
+  if (!cvars::target.empty()) {
+    Emulator::DiscInfo disc_info;
+    if (Emulator::ReadDiscInfo(std::filesystem::absolute(cvars::target),
+                               &disc_info) &&
+        disc_info.title_id) {
+      config::LoadGameConfig(fmt::format("{:08X}", disc_info.title_id));
+    }
+  }
+
   // Setup and initialize all subsystems. If we can't do something
   // (unsupported system, memory issues, etc) this will fail early.
   X_STATUS result = emulator_->Setup(

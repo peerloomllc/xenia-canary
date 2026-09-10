@@ -9,6 +9,9 @@
 
 #include "config.h"
 
+#include <fstream>
+#include <sstream>
+
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
@@ -302,6 +305,112 @@ void SetupConfig(const std::filesystem::path& config_folder) {
     // parameters to the user, if new options were added, descriptions were
     // updated, or default values were changed.
     SaveConfig();
+  }
+}
+
+std::filesystem::path GameConfigPath(const std::string_view title_id) {
+  return config_folder / "config" / (std::string(title_id) + game_config_suffix);
+}
+
+namespace {
+// The file as toml++ sees it, or an empty table when there is none yet.
+toml::table ReadGameConfigTable(const std::filesystem::path& path) {
+  std::error_code ec;
+  if (!std::filesystem::exists(path, ec)) {
+    return toml::table();
+  }
+  try {
+    return toml::parse_file(xe::path_to_utf8(path));
+  } catch (const toml::parse_error& e) {
+    XELOGE("Cannot parse the per-game config {}: {}", path,
+           std::string(e.description()));
+    return toml::table();
+  }
+}
+}  // namespace
+
+void SetGameConfigValue(const std::string_view title_id,
+                        const std::string& category, const std::string& name,
+                        const std::string& toml_value) {
+  const auto path = GameConfigPath(title_id);
+  std::error_code ec;
+  std::filesystem::create_directories(path.parent_path(), ec);
+  toml::table table = ReadGameConfigTable(path);
+
+  // Parse the one line so the value keeps the type it has in the file.
+  toml::table parsed;
+  try {
+    parsed = toml::parse(name + " = " + toml_value);
+  } catch (const toml::parse_error& e) {
+    XELOGE("Per-game config: cannot write {} = {}: {}", name, toml_value,
+           std::string(e.description()));
+    return;
+  }
+  if (!table.contains(category)) {
+    table.insert(category, toml::table());
+  }
+  auto* cat = table.get_as<toml::table>(category);
+  if (!cat) {
+    XELOGE("Per-game config: [{}] is not a table in {}", category, path);
+    return;
+  }
+  if (auto* v = parsed.get_as<bool>(name)) {
+    cat->insert_or_assign(name, v->get());
+  } else if (auto* v = parsed.get_as<int64_t>(name)) {
+    cat->insert_or_assign(name, v->get());
+  } else if (auto* v = parsed.get_as<double>(name)) {
+    cat->insert_or_assign(name, v->get());
+  } else if (auto* v = parsed.get_as<std::string>(name)) {
+    cat->insert_or_assign(name, v->get());
+  } else {
+    XELOGE("Per-game config: {} has a type this cannot write", name);
+    return;
+  }
+
+  std::ofstream out(path, std::ios::trunc);
+  if (!out) {
+    XELOGE("Per-game config: cannot write {}", path);
+    return;
+  }
+  out << "# Settings for this title only. Read when it launches, over the\n"
+         "# main configuration file.\n"
+      << table << "\n";
+  XELOGI("Per-game config: {}.{} = {} in {}", category, name, toml_value, path);
+}
+
+std::map<std::string, std::string> GameConfigValues(
+    const std::string_view title_id) {
+  std::map<std::string, std::string> out;
+  const toml::table table = ReadGameConfigTable(GameConfigPath(title_id));
+  for (const auto& [category, node] : table) {
+    const auto* cat = node.as_table();
+    if (!cat) {
+      continue;
+    }
+    for (const auto& [name, value] : *cat) {
+      std::string text;
+      if (const auto* v = value.as_boolean()) {
+        text = v->get() ? "true" : "false";
+      } else if (const auto* v = value.as_integer()) {
+        text = std::to_string(v->get());
+      } else if (const auto* v = value.as_floating_point()) {
+        text = fmt::format("{}", v->get());
+      } else if (const auto* v = value.as_string()) {
+        text = v->get();
+      } else {
+        continue;
+      }
+      out[std::string(category.str()) + "." + std::string(name.str())] = text;
+    }
+  }
+  return out;
+}
+
+void ClearGameConfig(const std::string_view title_id) {
+  std::error_code ec;
+  const auto path = GameConfigPath(title_id);
+  if (std::filesystem::remove(path, ec)) {
+    XELOGI("Per-game config: removed {}", path);
   }
 }
 

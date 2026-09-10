@@ -3122,6 +3122,34 @@ void EmulatorWindow::ContentFolderDialog::OnDraw(ImGuiIO& io) {
 // Advanced GPU options (Display > Advanced GPU options...).
 
 namespace {
+// While this holds a title id, the settings window writes to that title's own
+// config file instead of the main one, and leaves the running value alone: a
+// per-game setting applies the next time that title starts.
+std::string settings_per_game_title;
+// The title the settings window's per-game bar was built for.
+std::string g_settings_window_title_hex;
+
+// A value as it is written in a config file.
+std::string TomlLiteral(bool v) { return v ? "true" : "false"; }
+std::string TomlLiteral(int32_t v) { return std::to_string(v); }
+std::string TomlLiteral(uint32_t v) { return std::to_string(v); }
+std::string TomlLiteral(int64_t v) { return std::to_string(v); }
+std::string TomlLiteral(uint64_t v) { return std::to_string(v); }
+std::string TomlLiteral(double v) { return fmt::format("{}", v); }
+std::string TomlLiteral(const std::string& v) {
+  std::string out = "\"";
+  for (char c : v) {
+    if (c == '"' || c == '\\') {
+      out += '\\';
+    }
+    out += c;
+  }
+  return out + "\"";
+}
+std::string TomlLiteral(const std::filesystem::path& v) {
+  return TomlLiteral(xe::path_to_utf8(v));
+}
+
 // The GPU cvars are defined in other files, so the OVERRIDE_ macros (which
 // need the defining file's cv_ object) cannot reach them; the registry can.
 template <typename T>
@@ -3137,6 +3165,13 @@ void SetGpuOption(const char* name, const T& value) {
   auto* var = dynamic_cast<cvar::ConfigVar<T>*>(it->second);
   if (!var) {
     XELOGE("GPU options: {} has another type", name);
+    return;
+  }
+  if (!settings_per_game_title.empty()) {
+    // Per-game: the file only. Changing the value in memory would leak into
+    // the main config the next time anything saved it.
+    config::SetGameConfigValue(settings_per_game_title, var->category(), name,
+                               TomlLiteral(value));
     return;
   }
   var->OverrideConfigValue(value);
@@ -6464,6 +6499,11 @@ void SetGpuOptionDeferred(const char* name, const T& value) {
   if (!var) {
     return;
   }
+  if (!settings_per_game_title.empty()) {
+    config::SetGameConfigValue(settings_per_game_title, var->category(), name,
+                               TomlLiteral(value));
+    return;
+  }
   var->OverrideConfigValue(value);
   if (deferred_config_save_source) {
     g_source_remove(deferred_config_save_source);
@@ -7035,8 +7075,81 @@ void EmulatorWindow::ToggleSettingsWindow() {
     settings_refresh_labels_.emplace_back(key, label);
   };
 
+  // Per-game mode. While it is on, every control writes to the running
+  // title's own config file, which is read when that title next starts,
+  // instead of the main config.
+  GtkWidget* outer_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+  gtk_container_add(GTK_CONTAINER(win), outer_box);
+  {
+    const uint32_t title_id = emulator_->title_id();
+    const std::string title_hex = fmt::format("{:08X}", title_id);
+    GtkWidget* bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(bar), 8);
+    const std::string name =
+        emulator_->title_name().empty() ? title_hex : emulator_->title_name();
+    GtkWidget* check = gtk_check_button_new_with_label(
+        title_id ? fmt::format("Settings for {} only", name).c_str()
+                 : "Settings for one game only (no game is running)");
+    gtk_widget_set_sensitive(check, title_id != 0);
+    GtkWidget* status = gtk_label_new("");
+    gtk_widget_set_halign(status, GTK_ALIGN_START);
+    GtkWidget* clear = gtk_button_new_with_label("Remove them");
+    gtk_widget_set_sensitive(clear, FALSE);
+    auto refresh_status = [status, clear, title_hex, title_id]() {
+      if (!title_id) {
+        gtk_label_set_text(GTK_LABEL(status), "");
+        return;
+      }
+      const size_t count = config::GameConfigValues(title_hex).size();
+      gtk_label_set_text(
+          GTK_LABEL(status),
+          count ? fmt::format("{} setting{} saved for this game", count,
+                              count == 1 ? "" : "s")
+                      .c_str()
+                : "No settings saved for this game yet");
+      gtk_widget_set_sensitive(clear, count != 0);
+    };
+    refresh_status();
+    // Also after a setting is written, so the count is current.
+    settings_refresh_hooks_.push_back(refresh_status);
+    auto* refresh_holder =
+        new std::function<void()>(refresh_status);
+    g_signal_connect_data(
+        check, "toggled", G_CALLBACK(+[](GtkWidget* w, gpointer data) {
+          auto* refresh = static_cast<std::function<void()>*>(data);
+          const bool on = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(w));
+          settings_per_game_title =
+              on ? std::string(g_settings_window_title_hex) : std::string();
+          (*refresh)();
+        }),
+        refresh_holder,
+        +[](gpointer data, GClosure*) {
+          delete static_cast<std::function<void()>*>(data);
+        },
+        GConnectFlags(0));
+    g_signal_connect_data(
+        clear, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer data) {
+          auto* refresh = static_cast<std::function<void()>*>(data);
+          config::ClearGameConfig(g_settings_window_title_hex);
+          (*refresh)();
+        }),
+        new std::function<void()>(refresh_status),
+        +[](gpointer data, GClosure*) {
+          delete static_cast<std::function<void()>*>(data);
+        },
+        GConnectFlags(0));
+    g_settings_window_title_hex = title_hex;
+    gtk_box_pack_start(GTK_BOX(bar), check, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(bar), status, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(bar), clear, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(outer_box), bar, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(outer_box),
+                       gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE,
+                       FALSE, 0);
+  }
+
   GtkWidget* notebook = gtk_notebook_new();
-  gtk_container_add(GTK_CONTAINER(win), notebook);
+  gtk_box_pack_start(GTK_BOX(outer_box), notebook, TRUE, TRUE, 0);
 
   // ---- Graphics ----
   {
@@ -7678,6 +7791,9 @@ void EmulatorWindow::ToggleSettingsWindow() {
                    G_CALLBACK(+[](GtkWidget*, gpointer data) {
                      auto* self = static_cast<EmulatorWindow*>(data);
                      self->settings_window_ = nullptr;
+                     // Anything written after this window is gone belongs in
+                     // the main config again.
+                     settings_per_game_title.clear();
                      for (int i = 0; i < kPatchCategoryCount; ++i) {
                        self->patches_status_[i] = nullptr;
                        self->patches_combo_[i] = nullptr;
