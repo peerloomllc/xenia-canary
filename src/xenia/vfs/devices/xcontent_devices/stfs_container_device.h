@@ -67,10 +67,19 @@ class StfsContainerDevice : public XContentContainerDevice {
                                 uint32_t hash_level) const;
   const uint8_t GetAmountOfHashLevelsToCheck(uint32_t total_block_count) const;
 
+  // Size the package's blocks and hash tables need, from its own headers.
+  size_t ExpectedPackageSize() const;
+
+  // True when [offset, offset + length) is inside the mapped package. The
+  // headers can claim more blocks than the file holds, and a hash chain can
+  // walk off the end, and every read here is a raw pointer into the mapping.
+  bool InBounds(size_t offset, size_t length) const;
+
+  // Null when the hash table the block needs is not in the file.
   const StfsHashEntry* GetBlockHash(uint32_t block_index);
-  void UpdateCachedHashTable(uint32_t block_index, uint8_t hash_level,
+  bool UpdateCachedHashTable(uint32_t block_index, uint8_t hash_level,
                              uint32_t& secondary_table_offset);
-  void UpdateCachedHashTables(uint32_t block_index,
+  bool UpdateCachedHashTables(uint32_t block_index,
                               uint8_t highest_hash_level_to_update,
                               uint32_t& secondary_table_offset);
 
