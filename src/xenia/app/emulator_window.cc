@@ -4218,8 +4218,11 @@ void EmulatorWindow::SaveState() {
                    "The previous save state was kept."
                  : fmt::format("Save FAILED: {}.", emu->last_save_error());
     state_op_in_progress_ = false;
-    app_context().CallInUIThread([this, text]() {
+    app_context().CallInUIThread([this, text, ok]() {
       SetStateOverlay(nullptr, nullptr);
+      save_failure_text_ =
+          ok ? std::string()
+             : "SAVE FAILED - nothing was written (Escape hides this)";
       new xe::ui::HostNotificationWindow(imgui_drawer(), "Save state", text, 0);
     });
   }).detach();
@@ -4440,7 +4443,12 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
     } break;
 
     case ui::VirtualKey::kEscape: {
-      // The slot table overlay goes first; then fullscreen.
+      // The failed-save warning goes first, then the slot table, then
+      // fullscreen.
+      if (!save_failure_text_.empty()) {
+        save_failure_text_.clear();
+        return;
+      }
       if (slot_overlay_) {
         HideSlotOverlay();
         return;
@@ -5184,6 +5192,10 @@ void EmulatorWindow::StatusOverlayDialog::OnDraw(ImGuiIO& io) {
     }
     if (cvars::mute) {
       ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", "MUTED");
+    }
+    if (!emulator_window_.save_failure_text_.empty()) {
+      ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "%s",
+                         emulator_window_.save_failure_text_.c_str());
     }
     ImGui::SetWindowFontScale(1.0f);
   }

@@ -742,6 +742,10 @@ class EmulatorWindow {
   ui::ImmediateTexture* SlotThumbnailTexture(int slot);
   std::atomic<bool> state_op_in_progress_{false};
   std::atomic<bool> frame_advancing_{false};
+  // Set when a save is refused, and drawn over the game until a save works or
+  // Escape is pressed: a notification that fades is too easy to play through,
+  // and an hour of play was lost to exactly that.
+  std::string save_failure_text_;
   void GpuTraceFrame();
   void GpuClearCaches();
   void ToggleDisplayConfigDialog();
