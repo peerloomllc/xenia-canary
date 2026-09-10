@@ -2077,9 +2077,20 @@ std::string Emulator::SaveStateMismatch(const SaveStateFileInfo& info) const {
     }
   }
   if (info.media_id && media_id_ && info.media_id != media_id_) {
-    return fmt::format(
-        "saved from a different disc image (media id {:08X}, running {:08X})",
-        info.media_id, media_id_);
+    if (info.disc_count > 1 || disc_count_ > 1) {
+      // The disc number already matched, and the same disc is reached either
+      // by booting it or by swapping into it from an earlier one, which used
+      // to leave the launch disc's media id in the file.
+      XELOGW(
+          "Save state media id {:08X} is not the running {:08X}, but both are "
+          "disc {} of this title; loading it",
+          info.media_id, media_id_, info.disc_number);
+    } else {
+      return fmt::format(
+          "saved from a different disc image (media id {:08X}, running "
+          "{:08X})",
+          info.media_id, media_id_);
+    }
   }
   return "";
 }
@@ -2241,6 +2252,11 @@ bool Emulator::SwapDisc(const std::filesystem::path& path,
   disc_mount_path_ = mount_path;
   disc_image_path_ = path;
   disc_number_ = info.disc_number;
+  // The media id identifies the disc, and each disc of a title has its own,
+  // so it follows the swap. Left at the launch disc's, a state saved after
+  // swapping to disc 2 carried disc 1's id and was refused by a session that
+  // booted disc 2 directly.
+  media_id_ = info.media_id;
 
   if (smc) {
     smc->SetTrayState(X_DVD_TRAY_STATE::CLOSED);
