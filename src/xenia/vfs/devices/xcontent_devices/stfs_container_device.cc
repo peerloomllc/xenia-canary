@@ -42,6 +42,20 @@ XContentContainerDevice::Result StfsContainerDevice::LoadHostFiles(
 }
 
 StfsContainerDevice::Result StfsContainerDevice::Read() {
+  // A package that is shorter than its own headers require is a damaged or
+  // incomplete download. Reading it hands the title truncated files, which it
+  // then walks off the end of: one short Guitar Hero 5 DLC pack (52 MB of 135
+  // missing) crashed the game once its blocks were handed back. Refuse it
+  // here, so the rest of the content still loads.
+  const size_t expected = ExpectedPackageSize();
+  if (data_ && expected && data_->size() < expected) {
+    XELOGE(
+        "STFS: this package holds {} bytes but its headers describe {} ({} "
+        "missing): refusing it as incomplete",
+        data_->size(), expected, expected - data_->size());
+    return Result::kReadError;
+  }
+
   auto root_entry = new StfsContainerEntry(this, nullptr, "", data_.get());
   root_entry->attributes_ = kFileAttributeDirectory;
   root_entry_ = std::unique_ptr<Entry>(root_entry);
@@ -55,6 +69,13 @@ StfsContainerDevice::Result StfsContainerDevice::Read() {
   size_t n = 0;
   for (n = 0; n < descriptor_->file_table_block_count; n++) {
     const size_t offset = BlockToOffset(table_block_index);
+    if (!InBounds(offset, sizeof(StfsDirectoryBlock))) {
+      XELOGE(
+          "STFS: file table block {} is at {:X}, past the end of the {} byte "
+          "package",
+          table_block_index, offset, data_ ? data_->size() : 0);
+      return Result::kReadError;
+    }
     directory = *reinterpret_cast<StfsDirectoryBlock*>(data_->data() + offset);
 
     for (size_t m = 0; m < kEntriesPerDirectoryBlock; m++) {
@@ -77,6 +98,11 @@ StfsContainerDevice::Result StfsContainerDevice::Read() {
     }
 
     const StfsHashEntry* block_hash = GetBlockHash(table_block_index);
+    if (!block_hash) {
+      XELOGE("STFS: the file table chain leaves the package at block {}",
+             table_block_index);
+      return Result::kReadError;
+    }
     table_block_index = block_hash->level0_next_block();
     if (table_block_index == kEndOfChain) {
       break;
@@ -136,6 +162,11 @@ std::unique_ptr<StfsContainerEntry> StfsContainerDevice::ReadEntry(
       entry->block_list_.push_back({0, offset, block_size});
       remaining_size -= block_size;
       auto block_hash = GetBlockHash(block_index);
+      if (!block_hash) {
+        XELOGE("STFS: the block chain of {} leaves the package at block {}",
+               name, block_index);
+        break;
+      }
       block_index = block_hash->level0_next_block();
     }
 
@@ -224,14 +255,50 @@ const uint8_t StfsContainerDevice::GetAmountOfHashLevelsToCheck(
   return 0;
 }
 
-void StfsContainerDevice::UpdateCachedHashTable(
+size_t StfsContainerDevice::ExpectedPackageSize() const {
+  const uint64_t total_blocks = descriptor_->total_block_count;
+  if (!total_blocks) {
+    return 0;
+  }
+  // Every 170 data blocks carry a level 0 hash table, every 170 of those a
+  // level 1 table, and 170 of those a level 2 table. Each table is one block
+  // in a read-only package and two otherwise.
+  uint64_t blocks = total_blocks;
+  for (size_t level = 0; level < kBlocksHashLevelAmount; level++) {
+    if (level && total_blocks <= kBlocksPerHashLevel[level - 1]) {
+      break;
+    }
+    const uint64_t per = kBlocksPerHashLevel[level];
+    blocks += ((total_blocks + per - 1) / per) * blocks_per_hash_table_;
+  }
+  // data_ starts after the content header, so this is its size alone.
+  return size_t(blocks * kBlockSize);
+}
+
+bool StfsContainerDevice::InBounds(size_t offset, size_t length) const {
+  if (!data_) {
+    return false;
+  }
+  const size_t end = offset + length;
+  return end >= offset && end <= data_->size();
+}
+
+bool StfsContainerDevice::UpdateCachedHashTable(
     uint32_t block_index, uint8_t hash_level,
     uint32_t& secondary_table_offset) {
   const size_t hash_offset = BlockToHashBlockOffset(block_index, hash_level);
   // Do nothing. It's already there.
   if (!cached_hash_tables_.count(hash_offset)) {
-    cached_hash_tables_[hash_offset] = *reinterpret_cast<StfsHashTable*>(
-        data_->data() + hash_offset + secondary_table_offset);
+    const size_t at = hash_offset + secondary_table_offset;
+    if (!InBounds(at, sizeof(StfsHashTable))) {
+      XELOGE(
+          "STFS: the hash table for block {} (level {}) is at {:X}, past the "
+          "end of the {} byte package",
+          block_index, hash_level, at, data_ ? data_->size() : 0);
+      return false;
+    }
+    cached_hash_tables_[hash_offset] =
+        *reinterpret_cast<StfsHashTable*>(data_->data() + at);
   }
 
   uint32_t record = block_index % kBlocksPerHashLevel[0];
@@ -242,14 +309,18 @@ void StfsContainerDevice::UpdateCachedHashTable(
   const StfsHashEntry* record_data =
       &cached_hash_tables_[hash_offset].entries[record];
   secondary_table_offset = record_data->levelN_active_index() ? kBlockSize : 0;
+  return true;
 }
 
-void StfsContainerDevice::UpdateCachedHashTables(
+bool StfsContainerDevice::UpdateCachedHashTables(
     uint32_t block_index, uint8_t highest_hash_level_to_update,
     uint32_t& secondary_table_offset) {
   for (int8_t level = highest_hash_level_to_update; level >= 0; level--) {
-    UpdateCachedHashTable(block_index, level, secondary_table_offset);
+    if (!UpdateCachedHashTable(block_index, level, secondary_table_offset)) {
+      return false;
+    }
   }
+  return true;
 }
 
 const StfsHashEntry* StfsContainerDevice::GetBlockHash(uint32_t block_index) {
@@ -266,8 +337,10 @@ const StfsHashEntry* StfsContainerDevice::GetBlockHash(uint32_t block_index) {
     hash_levels_to_process = 0;
   }
 
-  UpdateCachedHashTables(block_index, hash_levels_to_process,
-                         secondary_table_offset);
+  if (!UpdateCachedHashTables(block_index, hash_levels_to_process,
+                              secondary_table_offset)) {
+    return nullptr;
+  }
 
   const size_t hash_offset = BlockToHashBlockOffset(block_index, 0);
   const uint32_t record = block_index % kBlocksPerHashLevel[0];
