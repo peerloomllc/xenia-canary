@@ -7645,6 +7645,21 @@ EmulatorWindow::LibraryTitle* EmulatorWindow::LibraryEntryForLaunch(
   return LibraryEntryFor(disc);
 }
 
+EmulatorWindow::LibraryTitle* EmulatorWindow::LibraryEntryMounted(
+    const std::filesystem::path& path) {
+  // The disc that is mounted now, which is not the one the title was launched
+  // with once it has swapped. A title opened directly rather than through a
+  // playlist still swaps (the next disc is looked for beside the current one),
+  // and the session belongs to the disc it ended on.
+  const std::filesystem::path& mounted = emulator_->disc_image_path();
+  if (!mounted.empty()) {
+    if (LibraryTitle* entry = LibraryEntryFor(mounted)) {
+      return entry;
+    }
+  }
+  return LibraryEntryForLaunch(path);
+}
+
 std::vector<size_t> EmulatorWindow::LibraryDiscGroup(size_t index) const {
   std::vector<size_t> group;
   if (index >= library_titles_.size()) {
@@ -8248,11 +8263,10 @@ void EmulatorWindow::BuildDashboard() {
         gint index = -1;
         gtk_tree_model_get(model, &iter, kColIndex, &index, -1);
         if (index >= 0 && index < int(w->library_titles_.size())) {
-          auto title_path = w->library_titles_[index].path;
-          // Deferred: RunTitle hides the dashboard, and this is running
-          // inside the tree view's own signal handler.
-          w->app_context().CallInUIThreadDeferred(
-              [w, title_path]() { w->RunTitle(title_path); });
+          // Through LaunchLibraryIndex, like the grid view and the Launch
+          // menu item: launching the file itself skips the playlist, so a
+          // multi-disc title started here knew nothing about its other discs.
+          w->LaunchLibraryIndex(index);
         }
       }),
       this);
@@ -8303,9 +8317,7 @@ void EmulatorWindow::BuildDashboard() {
                                return;
                              }
                              if (rating == -2) {
-                               auto p = w->library_titles_[i].path;
-                               w->app_context().CallInUIThreadDeferred(
-                                   [w, p]() { w->RunTitle(p); });
+                               w->LaunchLibraryIndex(i);
                                return;
                              }
                              w->library_titles_[i].rating = rating;
@@ -8605,7 +8617,7 @@ void EmulatorWindow::AddPlayTime() {
   int64_t seconds = std::chrono::duration_cast<std::chrono::seconds>(
                         std::chrono::steady_clock::now() - session_start_)
                         .count();
-  if (LibraryTitle* title = LibraryEntryForLaunch(session_path_)) {
+  if (LibraryTitle* title = LibraryEntryMounted(session_path_)) {
     title->seconds_played += seconds;
     // For a multi-disc title this is the entry for the disc that is mounted
     // now, which is the one the session ended on. Stamping it here is what

@@ -588,6 +588,9 @@ class EmulatorWindow {
   // maps to the disc file currently mounted (or the first disc), so the
   // .m3u itself never becomes a library entry.
   LibraryTitle* LibraryEntryForLaunch(const std::filesystem::path& path);
+  // The entry for the disc mounted right now, falling back to the launch
+  // entry. What a finished session should be credited to.
+  LibraryTitle* LibraryEntryMounted(const std::filesystem::path& path);
   // Indices of every library entry that belongs to the same multi-disc
   // title as entry `index` (same title id and folder), including itself,
   // in disc order. A single-disc title yields just itself.
