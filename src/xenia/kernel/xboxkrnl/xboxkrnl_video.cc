@@ -548,6 +548,9 @@ void VdSwap_entry(
   for (uint32_t i = offset; i < 64; i++) {
     dwords[i] = xenos::MakePacketType2();
   }
+
+  // Frame advance holds the title here, one frame after it was let go.
+  kernel_state()->emulator()->FrameAdvanceCheckpoint();
 }
 DECLARE_XBOXKRNL_EXPORT3(VdSwap, kVideo, kImplemented, kHighFrequency,
                          kImportant);

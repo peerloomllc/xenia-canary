@@ -166,6 +166,15 @@ DEFINE_string(screenshot_burst_dir, "",
 DEFINE_int32(ui_experiment_seconds, 30,
              "Experiment: delay before --ui_experiment_dialog opens.",
              "General");
+DEFINE_string(frame_advance_hotkey, "F7",
+              "Key that runs one frame and pauses again: same key names as "
+              "pause_hotkey, or empty to disable.",
+              "General");
+DEFINE_bool(resume_on_exit, false,
+            "Save a state when a game closes, and go back to it the next time "
+            "that game is opened. The state is used once and then removed; it "
+            "is not one of the numbered slots.",
+            "General");
 DEFINE_string(pause_hotkey, "Space",
               "Key that pauses/resumes emulation (Emulator::Pause/Resume): "
               "F1-F24, A-Z, 0-9, Space, Delete, Insert, Home, End, PageUp, "
@@ -388,6 +397,7 @@ std::unique_ptr<EmulatorWindow> EmulatorWindow::Create(
 
 EmulatorWindow::~EmulatorWindow() {
 #if XE_PLATFORM_LINUX
+  SaveResumeState();
   AddPlayTime();
   if (!library_titles_.empty()) {
     SaveLibrary();
@@ -471,8 +481,9 @@ void EmulatorWindow::OnEmulatorInitialized() {
 
 void EmulatorWindow::EmulatorWindowListener::OnClosing(ui::UIEvent& e) {
 #if XE_PLATFORM_LINUX
-  // The process exits without destructors ("Cheap-skate exit"): book the
-  // session's play time now.
+  // The process exits without destructors ("Cheap-skate exit"): write the
+  // resume state and book the session's play time now.
+  emulator_window_.SaveResumeState();
   emulator_window_.AddPlayTime();
   if (!emulator_window_.library_titles_.empty()) {
     emulator_window_.SaveLibrary();
@@ -1032,6 +1043,8 @@ bool EmulatorWindow::Initialize() {
       ParseHotkeyName(cvars::prev_slot_hotkey);
   action_keys_[int(HotkeyAction::kToggleReShade)] =
       ParseHotkeyName(cvars::reshade_toggle_hotkey);
+  action_keys_[int(HotkeyAction::kFrameAdvance)] =
+      ParseHotkeyName(cvars::frame_advance_hotkey);
   auto hotkey_of = [this](HotkeyAction action, const std::string& name) {
     return action_key(action).has_value() ? name : std::string();
   };
@@ -1101,6 +1114,10 @@ bool EmulatorWindow::Initialize() {
         MenuItem::Type::kString, "&Pause/Resume",
         hotkey_of(HotkeyAction::kPauseResume, cvars::pause_hotkey),
         std::bind(&EmulatorWindow::TogglePauseEmulation, this)));
+    emulation_menu->AddChild(MenuItem::Create(
+        MenuItem::Type::kString, "Frame &Advance",
+        hotkey_of(HotkeyAction::kFrameAdvance, cvars::frame_advance_hotkey),
+        std::bind(&EmulatorWindow::FrameAdvance, this)));
     emulation_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
     emulation_menu->AddChild(MenuItem::Create(
         MenuItem::Type::kString, "&Normal Speed", "Numpad *",
@@ -1691,6 +1708,8 @@ const char* HotkeyActionLabel(EmulatorWindow::HotkeyAction action) {
       return "Previous save state slot";
     case EmulatorWindow::HotkeyAction::kToggleReShade:
       return "Toggle ReShade effect";
+    case EmulatorWindow::HotkeyAction::kFrameAdvance:
+      return "Frame advance";
     default:
       return "?";
   }
@@ -1713,6 +1732,8 @@ const char* HotkeyActionCvar(EmulatorWindow::HotkeyAction action) {
       return "prev_slot_hotkey";
     case EmulatorWindow::HotkeyAction::kToggleReShade:
       return "reshade_toggle_hotkey";
+    case EmulatorWindow::HotkeyAction::kFrameAdvance:
+      return "frame_advance_hotkey";
     default:
       return "";
   }
@@ -1764,6 +1785,9 @@ bool EmulatorWindow::SetActionHotkey(HotkeyAction action,
     case HotkeyAction::kToggleReShade:
       OVERRIDE_string(reshade_toggle_hotkey, name);
       break;
+    case HotkeyAction::kFrameAdvance:
+      OVERRIDE_string(frame_advance_hotkey, name);
+      break;
     default:
       break;
   }
@@ -1797,6 +1821,9 @@ void EmulatorWindow::ClearActionHotkey(HotkeyAction action) {
       break;
     case HotkeyAction::kToggleReShade:
       OVERRIDE_string(reshade_toggle_hotkey, "");
+      break;
+    case HotkeyAction::kFrameAdvance:
+      OVERRIDE_string(frame_advance_hotkey, "");
       break;
     default:
       break;
@@ -2055,6 +2082,145 @@ void EmulatorWindow::TogglePauseEmulation() {
     } else {
       emu->Resume();
     }
+  }).detach();
+}
+
+void EmulatorWindow::FrameAdvance() {
+  auto* emu = emulator();
+  if (!emu->is_title_open()) {
+    return;
+  }
+  auto* graphics_system = emu->graphics_system();
+  auto* command_processor =
+      graphics_system ? graphics_system->command_processor() : nullptr;
+  if (!command_processor) {
+    return;
+  }
+  // One at a time: the key repeats faster than a frame takes.
+  if (frame_advancing_.exchange(true)) {
+    return;
+  }
+  // Off the UI thread, like the pause toggle: Pause() parks every guest
+  // thread and waits for the GPU and audio workers.
+  std::thread([this, emu, command_processor]() {
+    xe::threading::set_name("Frame Advance");
+    if (!emu->is_paused()) {
+      emu->Pause();
+    }
+    // The title is held at its next swap, so pausing afterwards costs no
+    // further frames however long it takes to park every thread.
+    emu->BeginFrameAdvance();
+    const uint64_t before = command_processor->swap_count();
+    emu->Resume();
+    // A title that is not drawing (a load, a stall) never swaps, so give up
+    // after a moment and leave it paused again.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!emu->frame_advance_reached() &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    emu->Pause();
+    emu->EndFrameAdvance();
+    XELOGI("Frame advance: {} frame(s) presented",
+           command_processor->swap_count() - before);
+    frame_advancing_ = false;
+  }).detach();
+}
+
+std::filesystem::path EmulatorWindow::ResumeStatePath() {
+  auto dir = SaveStateDir();
+  const uint32_t title_id = emulator_->title_id();
+  if (!emulator_->is_multi_disc()) {
+    return dir / fmt::format("{:08X}_resume.sav", title_id);
+  }
+  return dir / fmt::format("{:08X}_disc{}_resume.sav", title_id,
+                           emulator_->disc_number());
+}
+
+void EmulatorWindow::SaveResumeState() {
+  if (!cvars::resume_on_exit || !emulator_->is_title_open()) {
+    return;
+  }
+  // The window is closing, so this is done here and now rather than on a
+  // thread that the process would outrun.
+  const auto path = ResumeStatePath();
+  std::error_code ec;
+  std::filesystem::create_directories(path.parent_path(), ec);
+  const auto t0 = std::chrono::steady_clock::now();
+  const bool ok = emulator_->SaveToFile(path);
+  XELOGI("Resume state: {} to {} in {} ms", ok ? "saved" : "FAILED",
+         path.string(),
+         std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now() - t0)
+             .count());
+}
+
+void EmulatorWindow::ScheduleResumeFromState() {
+  if (!cvars::resume_on_exit || !emulator_->is_title_open()) {
+    return;
+  }
+  const auto path = ResumeStatePath();
+  std::error_code ec;
+  if (!std::filesystem::exists(path, ec)) {
+    return;
+  }
+  SaveStateFileInfo info;
+  const std::string mismatch = Emulator::ReadSaveStateInfo(path, &info)
+                                   ? emulator_->SaveStateMismatch(info)
+                                   : "not a save state";
+  if (!mismatch.empty()) {
+    XELOGW("Resume state: {} left in place, {}", path.string(), mismatch);
+    return;
+  }
+  auto* graphics_system = emulator_->graphics_system();
+  auto* command_processor =
+      graphics_system ? graphics_system->command_processor() : nullptr;
+  if (!command_processor) {
+    return;
+  }
+  std::thread([this, path, command_processor]() {
+    xe::threading::set_name("Resume State");
+    // Let the title get going first: restoring into a process that is still
+    // opening its files replaces memory the loader is in the middle of.
+    // Sixty presented frames, or five seconds if it draws slowly.
+    const uint64_t start = command_processor->swap_count();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (command_processor->swap_count() - start < 60 &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (!emulator_->is_title_open() || state_op_in_progress_.exchange(true)) {
+      return;
+    }
+    app_context().CallInUIThread(
+        [this]() { SetStateOverlay("RESUMING...", ""); });
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = emulator_->RestoreFromFile(path);
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    XELOGI("Resume state: {} from {} in {} ms", ok ? "resumed" : "FAILED",
+           path.string(), ms);
+    std::error_code ec;
+    if (ok) {
+      // A resume point is used once. Leaving it would send every later
+      // launch back to the same moment.
+      std::filesystem::remove(path, ec);
+      std::filesystem::remove(path.parent_path() /
+                                  (path.stem().string() + ".png"),
+                              ec);
+    }
+    state_op_in_progress_ = false;
+    app_context().CallInUIThread([this, ok, ms]() {
+      SetStateOverlay(nullptr, nullptr);
+      new xe::ui::HostNotificationWindow(
+          imgui_drawer(), "Resume",
+          ok ? fmt::format("Back where you left off ({:.1f} s)", ms / 1000.0)
+             : "Could not read the state; starting fresh",
+          0);
+    });
   }).detach();
 }
 
@@ -4108,6 +4274,9 @@ bool EmulatorWindow::HandleAssignableHotkeys(ui::VirtualKey key,
         case HotkeyAction::kToggleReShade:
           ToggleReShadeEffect();
           break;
+        case HotkeyAction::kFrameAdvance:
+          FrameAdvance();
+          break;
         default:
           break;
       }
@@ -4547,6 +4716,7 @@ bool EmulatorWindow::RelaunchProcess(const std::filesystem::path& path) {
     _exit(127);
   }
   XELOGI("Relaunch: new process {}, closing this one", child);
+  SaveResumeState();
   AddPlayTime();
   SaveLibrary();
   window_->RequestClose();
@@ -5836,6 +6006,7 @@ xe::X_STATUS EmulatorWindow::RunTitle(
   } else {
     AddRecentlyLaunchedTitle(path_to_file, emulator_->title_name());
     last_launched_path_ = path_to_file;
+    ScheduleResumeFromState();
 #if XE_PLATFORM_LINUX
     SaveTitleIcon();
     OnDashboardTitleLaunched();

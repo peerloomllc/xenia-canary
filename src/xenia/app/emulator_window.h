@@ -65,6 +65,7 @@ class EmulatorWindow {
     kNextSlot,
     kPrevSlot,
     kToggleReShade,
+    kFrameAdvance,
     kCount
   };
 
@@ -495,6 +496,13 @@ class EmulatorWindow {
   void CpuBreakIntoDebugger();
   void CpuBreakIntoHostDebugger();
   void TogglePauseEmulation();
+  // Runs one presented frame and pauses again.
+  void FrameAdvance();
+  // The state written when a title closes with resume_on_exit on, offered
+  // once the next time that title runs. Not one of the numbered slots.
+  std::filesystem::path ResumeStatePath();
+  void SaveResumeState();
+  void ScheduleResumeFromState();
   // Save states (experimental): one slot per title under --save_state_dir.
   // Both run off the UI thread and report through a notification.
   void SaveState();
@@ -733,6 +741,7 @@ class EmulatorWindow {
   std::map<int, SlotThumbnail> slot_thumbnails_;
   ui::ImmediateTexture* SlotThumbnailTexture(int slot);
   std::atomic<bool> state_op_in_progress_{false};
+  std::atomic<bool> frame_advancing_{false};
   void GpuTraceFrame();
   void GpuClearCaches();
   void ToggleDisplayConfigDialog();
