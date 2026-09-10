@@ -303,8 +303,10 @@ else()
     # redoes only the modules that changed.
     add_link_options(
       $<$<CONFIG:Release>:-Wl,--thinlto-cache-dir=${CMAKE_BINARY_DIR}/thinlto-cache>)
+    set(XENIA_THINLTO_CACHE_SIZE "12g" CACHE STRING
+        "How large the ThinLTO cache may grow (lld cache_size_bytes syntax)")
     add_link_options(
-      $<$<CONFIG:Release>:-Wl,--thinlto-cache-policy=cache_size_bytes=12g:prune_after=168h>)
+      $<$<CONFIG:Release>:-Wl,--thinlto-cache-policy=cache_size_bytes=${XENIA_THINLTO_CACHE_SIZE}:prune_after=168h>)
   endif()
   add_link_options($<$<CONFIG:Release>:-fuse-ld=lld>)
   find_program(LLVM_AR NAMES llvm-ar)
