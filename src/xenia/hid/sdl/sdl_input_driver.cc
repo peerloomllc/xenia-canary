@@ -33,6 +33,16 @@ DEFINE_uint32(
     "Clamped to at least 1.",
     "HID");
 
+DEFINE_string(
+    controller_subtypes, "",
+    "What kind of controller each slot is told to be, when the kind SDL "
+    "reports is not what the title wants: a comma separated list of "
+    "slot:kind, e.g. \"0:guitar\". Kinds: gamepad, guitar, guitar_bass, "
+    "guitar_alternate, drums, wheel, arcade_stick, flight_stick, dance_pad, "
+    "arcade_pad. Guitar Hero and Rock Band read this to decide whether they "
+    "are being played on an instrument or on a pad. Empty leaves every slot "
+    "as SDL reports it.",
+    "HID");
 DEFINE_bool(log_input_latency, false,
             "Log a warning when over 150 ms pass between SDL event pumps.",
             "SDL");
@@ -245,7 +255,7 @@ X_RESULT SDLInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
 
   // Unfortunately drivers can't present all information immediately (e.g.
   // battery information) so this needs to be refreshed every time.
-  UpdateXCapabilities(*controller);
+  UpdateXCapabilities(*controller, user_index);
 
   std::memcpy(out_caps, &controller->caps, sizeof(*out_caps));
 
@@ -539,7 +549,7 @@ void SDLInputDriver::OnControllerDeviceAdded(const SDL_Event& event) {
     state = {controller, {}};
     // XInput seems to start with packet_number = 1 .
     state.state_changed = true;
-    UpdateXCapabilities(state);
+    UpdateXCapabilities(state, size_t(user_id));
 
     XELOGI("SDL OnControllerDeviceAdded: Added at index {}.", user_id);
     XELOGI("SDL Controller {}: {}", user_id,
@@ -708,7 +718,47 @@ bool SDLInputDriver::TestSDLVersion() const {
   return true;
 }
 
-void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
+std::optional<uint8_t> SDLInputDriver::ForcedSubtypeForSlot(size_t user_index) {
+  if (cvars::controller_subtypes.empty()) {
+    return std::nullopt;
+  }
+  static const std::unordered_map<std::string, uint8_t> kinds = {
+      {"gamepad", XINPUT_DEVSUBTYPE_GAMEPAD},
+      {"guitar", XINPUT_DEVSUBTYPE_GUITAR},
+      {"guitar_alternate", XINPUT_DEVSUBTYPE_GUITAR_ALTERNATE},
+      {"guitar_bass", XINPUT_DEVSUBTYPE_GUITAR_BASS},
+      {"drums", XINPUT_DEVSUBTYPE_DRUM_KIT},
+      {"wheel", XINPUT_DEVSUBTYPE_WHEEL},
+      {"arcade_stick", XINPUT_DEVSUBTYPE_ARCADE_STICK},
+      {"arcade_pad", XINPUT_DEVSUBTYPE_ARCADE_PAD},
+      {"flight_stick", XINPUT_DEVSUBTYPE_FLIGHT_STICK},
+      {"dance_pad", XINPUT_DEVSUBTYPE_DANCE_PAD},
+  };
+  for (const auto& entry : xe::utf8::split(cvars::controller_subtypes, ",")) {
+    const size_t colon = entry.find(':');
+    if (colon == std::string_view::npos) {
+      continue;
+    }
+    std::string slot(entry.substr(0, colon));
+    std::string kind(entry.substr(colon + 1));
+    slot.erase(0, slot.find_first_not_of(" "));
+    kind.erase(0, kind.find_first_not_of(" "));
+    if (slot.empty() || kind.empty() ||
+        size_t(std::atoi(slot.c_str())) != user_index) {
+      continue;
+    }
+    const auto it = kinds.find(xe::utf8::lower_ascii(kind));
+    if (it == kinds.end()) {
+      XELOGW("SDL HID: controller_subtypes: '{}' is not a kind I know", kind);
+      return std::nullopt;
+    }
+    return it->second;
+  }
+  return std::nullopt;
+}
+
+void SDLInputDriver::UpdateXCapabilities(ControllerState& state,
+                                         size_t user_index) {
   assert(state.sdl);
   uint16_t cap_flags = 0x0;
 
@@ -743,8 +793,15 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
 
   auto& c = state.caps;
   c.type = 0x01;  // XINPUT_DEVTYPE_GAMEPAD
+  // SDL's joystick type is passed through as the Xbox subtype. SDL calls a
+  // guitar it does not recognise a plain game controller, and a title that
+  // asks (Guitar Hero does) then plays as if a pad were plugged in, with the
+  // frets on the wrong notes. --controller_subtypes says otherwise.
   c.sub_type = static_cast<uint8_t>(SDL_JoystickGetType(
       SDL_GameControllerGetJoystick(state.sdl)));  // XINPUT_DEVSUBTYPE_GAMEPAD
+  if (auto forced = ForcedSubtypeForSlot(user_index)) {
+    c.sub_type = *forced;
+  }
   c.flags = cap_flags;
   c.gamepad.buttons =
       0xF3FF | (cvars::guide_button ? X_INPUT_GAMEPAD_GUIDE : 0x0);

@@ -83,7 +83,9 @@ class SDLInputDriver final : public InputDriver {
       SDL_JoystickID instance_id);
   ControllerState* GetControllerState(uint32_t user_index);
   bool TestSDLVersion() const;
-  void UpdateXCapabilities(ControllerState& state);
+  void UpdateXCapabilities(ControllerState& state, size_t user_index);
+  // The kind --controller_subtypes says this slot is, if it says anything.
+  static std::optional<uint8_t> ForcedSubtypeForSlot(size_t user_index);
 
   // Owns SDL init, the event pump and teardown. SDL_PumpEvents is bound to
   // the thread that initialized SDL_INIT_EVENTS, which used to be the UI
