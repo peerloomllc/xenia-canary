@@ -7683,9 +7683,33 @@ std::filesystem::path EmulatorWindow::WriteLibraryPlaylist(size_t index) {
     XELOGE("Library: cannot write the playlist {}", playlist.string());
     return {};
   }
-  out << "# Written by the game library; the discs of this title in order.\n";
+  // The title boots the first entry, and swaps look entries up by disc
+  // number, so put the disc that was played most recently first: launching a
+  // multi-disc title from the library otherwise always started at disc 1,
+  // whichever disc the last session ended on (and the save state slots shown
+  // are the booted disc's).
+  size_t first = group.front();
+  int64_t newest = 0;
   for (size_t i : group) {
-    out << xe::path_to_utf8(library_titles_[i].path) << '\n';
+    if (library_titles_[i].last_played > newest) {
+      newest = library_titles_[i].last_played;
+      first = i;
+    }
+  }
+  out << "# Written by the game library; the discs of this title in order,\n";
+  out << "# starting with the one played most recently.\n";
+  out << xe::path_to_utf8(library_titles_[first].path) << '\n';
+  for (size_t i : group) {
+    if (i != first) {
+      out << xe::path_to_utf8(library_titles_[i].path) << '\n';
+    }
+  }
+  if (first != group.front()) {
+    XELOGI("Library: starting {} at disc {}, played most recently",
+           library_titles_[first].title_name.empty()
+               ? library_titles_[first].path.filename().string()
+               : library_titles_[first].title_name,
+           library_titles_[first].disc_number);
   }
   return playlist;
 }
@@ -8583,8 +8607,14 @@ void EmulatorWindow::AddPlayTime() {
                         .count();
   if (LibraryTitle* title = LibraryEntryForLaunch(session_path_)) {
     title->seconds_played += seconds;
-    XELOGI("Library: {} played {} s this session, {} s in total",
-           title->title_name, seconds, title->seconds_played);
+    // For a multi-disc title this is the entry for the disc that is mounted
+    // now, which is the one the session ended on. Stamping it here is what
+    // makes the next launch from the library start on that disc rather than
+    // going back to disc 1.
+    title->last_played = int64_t(time(nullptr));
+    XELOGI("Library: {} played {} s this session, {} s in total (disc {})",
+           title->title_name, seconds, title->seconds_played,
+           title->disc_number);
   }
 }
 
