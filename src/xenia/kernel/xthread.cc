@@ -83,7 +83,7 @@ XThread::~XThread() {
   kernel_state_->UnregisterThread(this);
 
   // Notify processor of our impending destruction.
-  emulator()->processor()->OnThreadDestroyed(thread_id_);
+  emulator()->processor()->OnThreadDestroyed(thread_id_, handle());
 
   thread_.reset();
 
@@ -1097,7 +1097,19 @@ bool XThread::Save(ByteStream* stream) {
           thread_id_, false, std::max<uint32_t>(suspend_count(), 1), &parked);
     }
     saved_in_self_suspend_ = parked;
-    if (!pc) {
+    if (!pc && !emulator()->processor()->QueryThreadDebugInfo(thread_id_)) {
+      // The processor has no record of this thread: its host side is gone,
+      // which a restore can leave behind for a thread that never re-entered
+      // guest code (both of the ones seen carried a user APC at restore).
+      // There is nothing to step, and refusing here refused every save for
+      // the rest of the session, silently, for an hour.
+      XELOGW(
+          "XThread {:08X} '{}' has no host thread any more; saving it as "
+          "stopped rather than refusing the save",
+          handle(), name());
+      running_ = false;
+      pc = 0;
+    } else if (!pc) {
       XELOGE("XThread {:08X} failed to save: could not step to a safe point!",
              handle());
       assert_always();
@@ -1213,6 +1225,19 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state,
          thread->handle(), state.thread_id, thread->thread_name_,
          state.is_running, state.context.pc, state.stack_base);
   thread->thread_id_ = state.thread_id;
+  // New threads take ++next_xthread_id_, and a restore hands its threads the
+  // ids they were saved with. Without this the counter carries on from where
+  // the fresh session had got to and eventually hands a new thread the id of
+  // a restored one that is still alive: when the new thread is destroyed it
+  // erases the restored thread's debug info, that thread can never be stepped
+  // again, and every save from then on is refused. An hour of play was lost
+  // to that on 2026-09-10 (the state's ids reached 309, the session was at
+  // 255 and counting).
+  if (state.thread_id > next_xthread_id_) {
+    next_xthread_id_ = state.thread_id;
+    XELOGI("XThread::Restore: new threads will take ids above {}",
+           next_xthread_id_);
+  }
   thread->main_thread_ = state.is_main_thread;
   thread->running_ = state.is_running;
   thread->tls_static_address_ = state.tls_static_address;

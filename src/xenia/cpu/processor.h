@@ -226,7 +226,9 @@ class Processor {
   void OnThreadCreated(uint32_t handle, ThreadState* thread_state,
                        Thread* thread);
   void OnThreadExit(uint32_t thread_id);
-  void OnThreadDestroyed(uint32_t thread_id);
+  // thread_handle guards against a second thread that has taken the same
+  // id erasing the entry of one that is still alive.
+  void OnThreadDestroyed(uint32_t thread_id, uint32_t thread_handle = 0);
   void OnThreadEnteringWait(uint32_t thread_id);
   void OnThreadLeavingWait(uint32_t thread_id);
 

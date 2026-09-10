@@ -584,10 +584,24 @@ void Processor::OnThreadExit(uint32_t thread_id) {
   thread_info->state = ThreadDebugInfo::State::kExited;
 }
 
-void Processor::OnThreadDestroyed(uint32_t thread_id) {
+void Processor::OnThreadDestroyed(uint32_t thread_id, uint32_t thread_handle) {
   auto global_lock = global_critical_region_.Acquire();
   auto it = thread_debug_infos_.find(thread_id);
-  assert_true(it != thread_debug_infos_.end());
+  if (it == thread_debug_infos_.end()) {
+    return;
+  }
+  if (thread_handle && it->second->thread_handle &&
+      it->second->thread_handle != thread_handle) {
+    // This id belongs to another thread that is still alive - a restored
+    // thread keeps the id it was saved with, and a thread created later can
+    // be handed the same one. Erasing here left that thread unsteppable and
+    // every save refused for the rest of the session.
+    XELOGW(
+        "Thread {} destroyed, but its debug info belongs to thread {:08X}; "
+        "leaving it",
+        thread_id, it->second->thread_handle);
+    return;
+  }
   it->second->thread_handle = 0;
   thread_debug_infos_.erase(it);
 }
