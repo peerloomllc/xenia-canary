@@ -41,6 +41,26 @@ jobs:
           path: ~/linuxdeploy
           key: ${{ runner.os }}-linuxdeploy-tools
 
+      # The job compiles every source file from scratch otherwise, which is
+      # most of its wall time. ccache carries the objects between runs and
+      # the ThinLTO cache carries the link's per-module work; both fall back
+      # to the newest cache of the same kind when this commit has none.
+      - name: Cache the compiler output
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ccache
+          key: ${{ runner.os }}-ccache-${{ inputs.llvm_version }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-${{ inputs.llvm_version }}-
+
+      - name: Cache the ThinLTO work
+        uses: actions/cache@v6
+        with:
+          path: build/thinlto-cache
+          key: ${{ runner.os }}-thinlto-${{ inputs.llvm_version }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-thinlto-${{ inputs.llvm_version }}-
+
       - name: Setup build environment
         run: |-
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
@@ -49,7 +69,7 @@ jobs:
           # No libc++-dev: the Linux build links libstdc++, and Ubuntu's
           # libc++-dev depends on LLVM's libunwind-NN-dev, which conflicts
           # with the nongnu libunwind-dev the POSIX stack walker links.
-          sudo apt-get -y install mesa-vulkan-drivers valgrind libgtk-3-dev libsdl2-dev libvulkan-dev libx11-xcb-dev clang-${{ inputs.llvm_version }} lld-${{ inputs.llvm_version }} spirv-tools libfuse2 libunwind-dev
+          sudo apt-get -y install ccache mesa-vulkan-drivers valgrind libgtk-3-dev libsdl2-dev libvulkan-dev libx11-xcb-dev clang-${{ inputs.llvm_version }} lld-${{ inputs.llvm_version }} spirv-tools libfuse2 libunwind-dev
 
           # Pin LLVM tools to the correct version so system ar/ranlib/lld
           # don't use the older LLVM 17 gold plugin with clang-20 LTO bitcode
@@ -95,7 +115,16 @@ jobs:
         env:
           CC: clang-${{ inputs.llvm_version }}
           CXX: clang++-${{ inputs.llvm_version }}
-        run: ./xenia-build.py build --config=Release
+        run: |-
+          # 2 GiB each: a repository gets 10 GiB of cache in total, and both
+          # of these are uploaded on every run of this job.
+          ccache -M 2G
+          ccache -z
+          ./xenia-build.py build --config=Release \
+            --cmake-define CMAKE_C_COMPILER_LAUNCHER=ccache \
+            --cmake-define CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            --cmake-define XENIA_THINLTO_CACHE_SIZE=2g
+          ccache -s | head -n 8
 
       - name: Prepare AppImage
         id: prepare_artifacts
