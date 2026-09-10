@@ -291,9 +291,21 @@ else()
   )
   add_compile_options($<$<CONFIG:Release>:-O3>)
   # Link-time optimization (use lld and llvm-ar/ranlib to avoid system
-  # linker/archiver LTO plugin version mismatch with clang's bitcode)
-  add_compile_options($<$<CONFIG:Release>:-flto=thin>)
-  add_link_options($<$<CONFIG:Release>:-flto=thin>)
+  # linker/archiver LTO plugin version mismatch with clang's bitcode).
+  # -DXENIA_ENABLE_LTO=OFF drops it, which is minutes off a Release link when
+  # iterating; leave it on for anything that ships.
+  option(XENIA_ENABLE_LTO "Optimize Release builds at link time (ThinLTO)" ON)
+  if(XENIA_ENABLE_LTO)
+    add_compile_options($<$<CONFIG:Release>:-flto=thin>)
+    add_link_options($<$<CONFIG:Release>:-flto=thin>)
+    # Without a cache ThinLTO re-optimizes the whole program on every link, so
+    # a one line change costs the same as a clean build. With one, a relink
+    # redoes only the modules that changed.
+    add_link_options(
+      $<$<CONFIG:Release>:-Wl,--thinlto-cache-dir=${CMAKE_BINARY_DIR}/thinlto-cache>)
+    add_link_options(
+      $<$<CONFIG:Release>:-Wl,--thinlto-cache-policy=cache_size_bytes=12g:prune_after=168h>)
+  endif()
   add_link_options($<$<CONFIG:Release>:-fuse-ld=lld>)
   find_program(LLVM_AR NAMES llvm-ar)
   find_program(LLVM_RANLIB NAMES llvm-ranlib)
