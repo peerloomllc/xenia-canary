@@ -92,10 +92,19 @@ DECLARE_XAM_EXPORT1(XamInputGetCapabilitiesEx, kInput, kSketchy);
 
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputgetcapabilities(v=vs.85).aspx
 dword_result_t XamInputGetCapabilities_entry(
-    dword_t user_index, dword_t flags, pointer_t<X_INPUT_CAPABILITIES> caps) {
+    dword_t user_index, dword_t flags, pointer_t<X_INPUT_CAPABILITIES> caps,
+    const ppc_context_t& ctx) {
   // chrispy: actually, it appears that caps is never checked for null, it is
   // memset at the start regardless
-  return XamInputGetCapabilitiesEx_entry(1, user_index, flags, caps);
+  auto result = XamInputGetCapabilitiesEx_entry(1, user_index, flags, caps);
+  // Which kind a title is told about is worth seeing when an instrument does
+  // not behave: Guitar Hero III sorts on it and puts subtype 6 in with pads.
+  XELOGD(
+      "XamInputGetCapabilities(user {}, flags {:08X}) from lr={:08X} -> {} "
+      "type {} subtype {}",
+      uint32_t(user_index), uint32_t(flags), uint32_t(ctx->lr), uint32_t(result),
+      caps ? caps->type : 0, caps ? caps->sub_type : 0);
+  return result;
 }
 DECLARE_XAM_EXPORT1(XamInputGetCapabilities, kInput, kSketchy);
 
