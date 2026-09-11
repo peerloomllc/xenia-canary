@@ -304,6 +304,22 @@ X_RESULT SDLInputDriver::GetState(uint32_t user_index,
     controller->state.packet_number++;
     controller->state_changed = false;
   }
+  if (guitar_slot_[user_index]) {
+    // Diagnostic: what a title actually receives from a guitar, once a
+    // second, so a note that bends on its own can be traced to the axis
+    // doing it.
+    static auto last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last > std::chrono::seconds(1)) {
+      last = now;
+      const auto& g = controller->state.gamepad;
+      XELOGD(
+          "GUITAR slot {}: buttons {:04X} lt {} rt {} lx {} ly {} rx {} ry {}",
+          user_index, uint16_t(g.buttons), g.left_trigger, g.right_trigger,
+          int16_t(g.thumb_lx), int16_t(g.thumb_ly), int16_t(g.thumb_rx),
+          int16_t(g.thumb_ry));
+    }
+  }
   std::memcpy(out_state, &controller->state, sizeof(*out_state));
   return X_ERROR_SUCCESS;
 }
@@ -613,6 +629,12 @@ void SDLInputDriver::OnControllerDeviceAxisMotion(const SDL_Event& event) {
       pad.thumb_ly = ~event.caxis.value;
       break;
     case SDL_CONTROLLER_AXIS_RIGHTX:
+      if (guitar_slot_[*idx] && cvars::guitar_whammy_on_stick) {
+        // The whammy owns the right stick's X on a guitar. This guitar's
+        // tilt sensor sits on the right stick, and a title reading X as the
+        // whammy bends every held note while the guitar is simply held.
+        break;
+      }
       pad.thumb_rx = event.caxis.value;
       break;
     case SDL_CONTROLLER_AXIS_RIGHTY:
