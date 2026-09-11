@@ -17,7 +17,6 @@
 #include "xenia/kernel/xenumerator.h"
 #include "xenia/kernel/xevent.h"
 #include "xenia/kernel/xfile.h"
-#include "xenia/kernel/xtimer.h"
 #include "xenia/kernel/xiocompletion.h"
 #include "xenia/kernel/xmodule.h"
 #include "xenia/kernel/xmutant.h"
@@ -25,6 +24,7 @@
 #include "xenia/kernel/xsemaphore.h"
 #include "xenia/kernel/xsymboliclink.h"
 #include "xenia/kernel/xthread.h"
+#include "xenia/kernel/xtimer.h"
 #include "xenia/xbox.h"
 
 namespace xe {
@@ -53,6 +53,20 @@ XObject::XObject(KernelState* kernel_state, Type type, bool host_object)
 XObject::~XObject() {
   assert_true(handles_.empty());
   assert_zero(pointer_ref_count_);
+
+  // The signature stamped into guest memory names this object's handle, and
+  // the object table hands that handle out again as soon as this object is
+  // gone. Anything reading that memory afterwards follows the handle to
+  // whatever owns it by then. Take the marker back.
+  if (guest_object_ptr_ && stashed_handle_) {
+    auto* stashed_header =
+        memory()->TranslateVirtual<X_DISPATCH_HEADER*>(guest_object_ptr_);
+    if (stashed_header->wait_list.flink_ptr == kXObjSignature &&
+        stashed_header->wait_list.blink_ptr == stashed_handle_) {
+      stashed_header->wait_list.flink_ptr = 0;
+      stashed_header->wait_list.blink_ptr = 0;
+    }
+  }
 
   if (allocated_guest_object_) {
     uint32_t ptr = guest_object_ptr_ - sizeof(X_OBJECT_HEADER);
@@ -418,6 +432,7 @@ void XObject::SetNativePointer(uint32_t native_ptr, bool uninitialized) {
   // Stash pointer in struct.
   // FIXME: This assumes the object has a dispatch header (some don't!)
   StashHandle(header, handle());
+  stashed_handle_ = handle();
 
   guest_object_ptr_ = native_ptr;
 }
@@ -527,6 +542,7 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state,
     // FIXME: This assumes the object contains a dispatch header (some don't!)
     if (result) {
       StashHandle(header, result->handle());
+      result->stashed_handle_ = result->handle();
       // Record where the object lives so a later lookup can tell this
       // signature apart from one left behind in memory that has since been
       // handed out for something else. InitializeNative does not set it, and

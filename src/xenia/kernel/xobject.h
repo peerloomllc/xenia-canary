@@ -130,21 +130,36 @@ class XObject {
 
   static const char* TypeName(Type type) {
     switch (type) {
-      case Type::Undefined: return "Undefined";
-      case Type::Enumerator: return "Enumerator";
-      case Type::Event: return "Event";
-      case Type::File: return "File";
-      case Type::IOCompletion: return "IOCompletion";
-      case Type::Module: return "Module";
-      case Type::Mutant: return "Mutant";
-      case Type::NotifyListener: return "NotifyListener";
-      case Type::Semaphore: return "Semaphore";
-      case Type::Session: return "Session";
-      case Type::Socket: return "Socket";
-      case Type::SymbolicLink: return "SymbolicLink";
-      case Type::Thread: return "Thread";
-      case Type::Timer: return "Timer";
-      case Type::Device: return "Device";
+      case Type::Undefined:
+        return "Undefined";
+      case Type::Enumerator:
+        return "Enumerator";
+      case Type::Event:
+        return "Event";
+      case Type::File:
+        return "File";
+      case Type::IOCompletion:
+        return "IOCompletion";
+      case Type::Module:
+        return "Module";
+      case Type::Mutant:
+        return "Mutant";
+      case Type::NotifyListener:
+        return "NotifyListener";
+      case Type::Semaphore:
+        return "Semaphore";
+      case Type::Session:
+        return "Session";
+      case Type::Socket:
+        return "Socket";
+      case Type::SymbolicLink:
+        return "SymbolicLink";
+      case Type::Thread:
+        return "Thread";
+      case Type::Timer:
+        return "Timer";
+      case Type::Device:
+        return "Device";
     }
     return "?";
   }
@@ -298,6 +313,10 @@ class XObject {
   // Guest pointer for kernel object. Remember: X_OBJECT_HEADER precedes this
   // if we allocated it!
   uint32_t guest_object_ptr_ = 0;
+  // The handle this object wrote into guest memory, so its destructor can
+  // take that marker back rather than leave it naming a handle the object
+  // table has since handed to something else.
+  uint32_t stashed_handle_ = 0;
   bool allocated_guest_object_ = false;
 };
 
