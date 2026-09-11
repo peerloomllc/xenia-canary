@@ -588,6 +588,13 @@ class EmulatorWindow {
   void BuildDashboard();
   void RefreshDashboard();
   void ShowDashboard(bool show);
+  // Gamescope, the compositor a Steam Deck runs games under, presents the
+  // application's Vulkan swapchain as the whole fullscreen window, so the
+  // GTK overlay the library is drawn in never appears there: the screen is
+  // black but for the ImGui overlay. Leave fullscreen while the library is
+  // up and take it back when a title has the screen.
+  void UpdateDashboardFullscreen(bool dashboard_shown);
+  bool DashboardShown() const;
   void ToggleDashboard();
   void OnDashboardTitleLaunched();
   void AddPlayTime();
@@ -635,6 +642,8 @@ class EmulatorWindow {
   void* dashboard_banner_ = nullptr;  // GtkBox* holding it, with the notice
   void* dashboard_banner_label_ = nullptr;  // GtkLabel*
   int dashboard_menu_index_ = -1;
+  // Fullscreen was turned off to show the library and is owed back.
+  bool dashboard_suspended_fullscreen_ = false;
   std::chrono::steady_clock::time_point session_start_;
   bool session_running_ = false;
   std::filesystem::path session_path_;
