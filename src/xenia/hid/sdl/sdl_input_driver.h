@@ -94,6 +94,8 @@ class SDLInputDriver final : public InputDriver {
   std::array<bool, HID_SDL_USER_COUNT> guitar_slot_ = {};
   // Slots whose triggers report the whole stick range rather than 0 upwards.
   std::array<bool, HID_SDL_USER_COUNT> trigger_full_range_ = {};
+  // Slots whose whammy has moved at least once, so its resting value is real.
+  std::array<bool, HID_SDL_USER_COUNT> whammy_seen_ = {};
 
   // Owns SDL init, the event pump and teardown. SDL_PumpEvents is bound to
   // the thread that initialized SDL_INIT_EVENTS, which used to be the UI

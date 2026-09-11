@@ -630,6 +630,7 @@ void SDLInputDriver::OnControllerDeviceAxisMotion(const SDL_Event& event) {
       break;
     case SDL_CONTROLLER_AXIS_RIGHTX:
       if (guitar_slot_[*idx] && cvars::guitar_whammy_on_stick) {
+        whammy_seen_[*idx] = true;
         // The whammy owns the right stick's X on a guitar. This guitar's
         // tilt sensor sits on the right stick, and a title reading X as the
         // whammy bends every held note while the guitar is simply held.
@@ -651,10 +652,12 @@ void SDLInputDriver::OnControllerDeviceAxisMotion(const SDL_Event& event) {
       if (guitar_slot_[*idx] && cvars::guitar_whammy_on_stick) {
         // An Xbox guitar's whammy is the right stick's X, and titles read it
         // there. This guitar sends it as a trigger, where nothing looks.
-        pad.thumb_rx = static_cast<int16_t>(
-            trigger_full_range_[*idx]
-                ? (int32_t(event.caxis.value) + 32768) / 2
-                : int32_t(event.caxis.value));
+        //
+        // Passed through as it is, rest included: a guitar's whammy rests at
+        // one end of the stick's range rather than in the middle, and a title
+        // reads the middle as the bar held half down - every sustain bends on
+        // its own, which is what centring it did.
+        pad.thumb_rx = static_cast<int16_t>(event.caxis.value);
         break;
       }
       pad.left_trigger = static_cast<uint8_t>(
@@ -939,6 +942,15 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state,
     c.sub_type = *forced;
   }
   guitar_slot_[user_index] = IsGuitarSubtype(c.sub_type);
+  if (guitar_slot_[user_index] && cvars::guitar_whammy_on_stick &&
+      !whammy_seen_[user_index]) {
+    // A whammy bar rests at the bottom of the stick's range, and an axis
+    // nothing has touched yet reads as the middle - which a title takes for
+    // the bar held half down, bending every sustained note from the first
+    // one. Start it where the bar actually sits.
+    state.state.gamepad.thumb_rx = int16_t(-32767);
+    state.state_changed = true;
+  }
   c.flags = cap_flags;
   c.gamepad.buttons =
       0xF3FF | (cvars::guide_button ? X_INPUT_GAMEPAD_GUIDE : 0x0);
