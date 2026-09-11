@@ -619,16 +619,35 @@ void SDLInputDriver::OnControllerDeviceAxisMotion(const SDL_Event& event) {
       pad.thumb_ry = ~event.caxis.value;
       break;
     case SDL_CONTROLLER_AXIS_TRIGGERLEFT:
+      // A trigger is meant to read 0 at rest and 32767 held, but a guitar
+      // whose whammy is wired to one can report the full stick range instead,
+      // resting at -32768. Left alone that reads as the whammy held down for
+      // ever: held notes bend on their own and the frets' audio is wrong.
+      if (event.caxis.value < 0) {
+        trigger_full_range_[*idx] = true;
+      }
       if (guitar_slot_[*idx] && cvars::guitar_whammy_on_stick) {
         // An Xbox guitar's whammy is the right stick's X, and titles read it
         // there. This guitar sends it as a trigger, where nothing looks.
-        pad.thumb_rx = static_cast<int16_t>(event.caxis.value);
+        pad.thumb_rx = static_cast<int16_t>(
+            trigger_full_range_[*idx]
+                ? (int32_t(event.caxis.value) + 32768) / 2
+                : int32_t(event.caxis.value));
         break;
       }
-      pad.left_trigger = static_cast<uint8_t>(event.caxis.value >> 7);
+      pad.left_trigger = static_cast<uint8_t>(
+          (trigger_full_range_[*idx] ? (int32_t(event.caxis.value) + 32768) / 2
+                                     : int32_t(event.caxis.value)) >>
+          7);
       break;
     case SDL_CONTROLLER_AXIS_TRIGGERRIGHT:
-      pad.right_trigger = static_cast<uint8_t>(event.caxis.value >> 7);
+      if (event.caxis.value < 0) {
+        trigger_full_range_[*idx] = true;
+      }
+      pad.right_trigger = static_cast<uint8_t>(
+          (trigger_full_range_[*idx] ? (int32_t(event.caxis.value) + 32768) / 2
+                                     : int32_t(event.caxis.value)) >>
+          7);
       break;
     default:
       assert_always();
