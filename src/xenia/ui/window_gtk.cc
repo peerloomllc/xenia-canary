@@ -13,11 +13,19 @@
 #include <xcb/xcb.h>
 
 #include "xenia/base/assert.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/platform_linux.h"
 #include "xenia/ui/surface_gnulinux.h"
 #include "xenia/ui/virtual_key.h"
 #include "xenia/ui/window_gtk.h"
+
+DEFINE_int32(
+    display_index, -1,
+    "Which display to open the window on, counting from 1, or -1 to let the "
+    "system decide. Settings > Preferences > Display lists the displays this "
+    "machine has.",
+    "Display");
 
 namespace xe {
 namespace ui {
@@ -128,13 +136,42 @@ bool GTKWindow::OpenImpl() {
   // it impossible to make the window smaller.
   gtk_widget_set_size_request(drawing_area_, -1, -1);
 
+  // The display to open on. Without this the window lands wherever the window
+  // manager puts it, which is usually the screen the pointer was last on -
+  // not much use when the emulator is started by something else, a remote
+  // streaming host for instance, that captures one particular screen.
+  GdkDisplay* gdk_display = gtk_widget_get_display(window_);
+  const int monitor_index = cvars::display_index - 1;
+  const bool monitor_chosen =
+      gdk_display && monitor_index >= 0 &&
+      monitor_index < gdk_display_get_n_monitors(gdk_display);
+  if (monitor_chosen) {
+    GdkRectangle geometry;
+    gdk_monitor_get_geometry(gdk_display_get_monitor(gdk_display,
+                                                     monitor_index),
+                             &geometry);
+    int window_width = 0, window_height = 0;
+    gtk_window_get_size(GTK_WINDOW(window_), &window_width, &window_height);
+    gtk_window_move(GTK_WINDOW(window_),
+                    geometry.x + (geometry.width - window_width) / 2,
+                    geometry.y + (geometry.height - window_height) / 2);
+  }
+
   // After setting up the initial layout for non-fullscreen, enter fullscreen if
   // requested.
   if (IsFullscreen()) {
     if (main_menu_widget) {
       gtk_container_remove(GTK_CONTAINER(box_), main_menu_widget);
     }
-    gtk_window_fullscreen(GTK_WINDOW(window_));
+    if (monitor_chosen) {
+      // Moving the window is not enough for a fullscreen open: the window
+      // manager picks the monitor itself unless it is named here.
+      gtk_window_fullscreen_on_monitor(
+          GTK_WINDOW(window_), gtk_window_get_screen(GTK_WINDOW(window_)),
+          monitor_index);
+    } else {
+      gtk_window_fullscreen(GTK_WINDOW(window_));
+    }
   }
 
   // Make sure the initial state after opening is reported to the common Window

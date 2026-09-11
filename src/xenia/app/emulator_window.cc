@@ -119,6 +119,7 @@ DECLARE_uint32(texture_cache_memory_limit_hard);
 DECLARE_uint32(texture_cache_memory_limit_soft_lifetime);
 DECLARE_double(ui_scale);
 DECLARE_bool(apply_patches);
+DECLARE_int32(display_index);
 
 DEFINE_bool(fullscreen, false, "Whether to launch the emulator in fullscreen.",
             "Display");
@@ -7247,25 +7248,7 @@ void EmulatorWindow::ToggleSettingsWindow() {
                   "relaunch)");
       }
     });
-    {
-      GtkWidget* fps = gtk_check_button_new_with_label("Show FPS overlay");
-      gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(fps), cvars::show_fps);
-      SetTooltipFromCvar(fps, "show_fps");
-      AttachSettingsCallback(fps, "toggled", [this](GtkWidget* w) {
-        bool on = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(w));
-        if (on != cvars::show_fps) {
-          ToggleFpsOverlay();
-        }
-      });
-      AttachCheckWithHelp(grid, row, fps, "show_fps");
-    }
-    {
-      // The frame rate limit's meaning depends on this, so its label is
-      // rebuilt when this changes.
-      GtkWidget* vsync_row =
-          AddCheck(grid, row, "VSync", "vsync", cvars::vsync);
-      (void)vsync_row;
-    }
+    // Show FPS overlay and VSync are on the Display tab.
 
     grid = NewSection(box, "Filters (take effect now)", true);
     row = 0;
@@ -7589,6 +7572,64 @@ void EmulatorWindow::ToggleSettingsWindow() {
 
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), TabScroller(box),
                              gtk_label_new("GPU"));
+  }
+  // ---- Display ----
+  {
+    GtkWidget* box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_container_set_border_width(GTK_CONTAINER(box), 8);
+    GtkWidget* grid = NewSection(box, "Window (takes effect on the next run)",
+                                 true);
+    int row = 0;
+
+    // The displays this machine has, by the name the system gives them, so a
+    // machine with two identical monitors can still be told which is which.
+    std::vector<std::pair<std::string, std::string>> displays = {
+        {"-1", "Automatic (wherever the system puts the window)"}};
+    if (GdkDisplay* gdk_display = gdk_display_get_default()) {
+      const int count = gdk_display_get_n_monitors(gdk_display);
+      for (int i = 0; i < count; ++i) {
+        GdkMonitor* monitor = gdk_display_get_monitor(gdk_display, i);
+        GdkRectangle geometry;
+        gdk_monitor_get_geometry(monitor, &geometry);
+        const char* model = gdk_monitor_get_model(monitor);
+        std::string label = fmt::format("Display {}", i + 1);
+        if (model && *model) {
+          label += fmt::format(" - {}", model);
+        }
+        label += fmt::format(" ({}x{})", geometry.width, geometry.height);
+        if (gdk_monitor_is_primary(monitor)) {
+          label += ", primary";
+        }
+        displays.emplace_back(std::to_string(i + 1), label);
+      }
+    }
+    AddCombo(grid, row, "Open on display", "display_index", displays,
+             std::to_string(cvars::display_index),
+             [](const std::string& v) {
+               SetGpuOption<int32_t>("display_index", int32_t(std::atoi(v.c_str())));
+             });
+    AddCheck(grid, row, "Start in fullscreen", "fullscreen", cvars::fullscreen);
+
+    grid = NewSection(box, "While a game runs", true);
+    row = 0;
+    {
+      GtkWidget* fps = gtk_check_button_new_with_label("Show FPS overlay");
+      gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(fps), cvars::show_fps);
+      SetTooltipFromCvar(fps, "show_fps");
+      AttachSettingsCallback(fps, "toggled", [this](GtkWidget* w) {
+        bool on = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(w));
+        if (on != cvars::show_fps) {
+          ToggleFpsOverlay();
+        }
+      });
+      AttachCheckWithHelp(grid, row, fps, "show_fps");
+    }
+    // The frame rate limit on the GPU tab means different things with this on
+    // and off, and its label follows this one; it is rebuilt on any change.
+    AddCheck(grid, row, "VSync", "vsync", cvars::vsync);
+
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), TabScroller(box),
+                             gtk_label_new("Display"));
   }
   // ---- CPU ----
   {
