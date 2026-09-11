@@ -163,7 +163,11 @@ void ReadGameConfig(const std::filesystem::path& file_path) {
 
     const auto config_key_node = config.at_path(config_key);
     if (config_key_node) {
-      config_var->LoadConfigValue(config_key_node.node());
+      // LoadConfigValue would overwrite the value the main config holds, and
+      // that is what SaveConfig writes back out, so this title's settings
+      // would become everyone's on the way out. The game config value is a
+      // separate slot that takes priority while the title runs.
+      config_var->LoadGameConfigValue(config_key_node.node());
     }
   }
   XELOGI("Loaded game config: {}", file_path);
