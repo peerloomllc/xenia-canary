@@ -45,6 +45,14 @@ DEFINE_string(
     "are being played on an instrument or on a pad. Empty leaves every slot "
     "as SDL reports it.",
     "HID");
+DEFINE_bool(
+    guitar_stick_click_as_back, true,
+    "On a slot reported as a guitar, send a right stick click as Back, which "
+    "is what Guitar Hero reads to activate star power. A guitar has no "
+    "sticks, so the click is free: a guitar whose tilt sensor can be remapped "
+    "in its own software (the CRKD Les Paul, for one) can point tilt at it "
+    "and get star power by tilting, the way the console guitars did.",
+    "HID");
 DEFINE_bool(guitar_whammy_on_stick, true,
             "For a slot set to a guitar, send a whammy bar that arrives as a "
             "trigger to the right stick instead, where titles look for it.",
@@ -711,6 +719,20 @@ void SDLInputDriver::OnControllerDeviceButtonChanged(const SDL_Event& event) {
   auto idx = GetControllerIndexFromInstanceID(event.cbutton.which);
   assert(idx);
   auto& controller = controllers_.at(*idx);
+
+  if (guitar_slot_[*idx] && cvars::guitar_stick_click_as_back &&
+      event.cbutton.button == SDL_CONTROLLER_BUTTON_RIGHTSTICK) {
+    // Star power is Back on these titles, and the button itself is awkward to
+    // reach mid-song. A guitar has no right stick to click, so the click is
+    // free for whatever the guitar's own software points at it.
+    const uint16_t buttons = controller.state.gamepad.buttons;
+    controller.state.gamepad.buttons =
+        event.cbutton.state == SDL_PRESSED
+            ? (buttons | X_INPUT_GAMEPAD_BACK)
+            : (buttons & ~uint16_t(X_INPUT_GAMEPAD_BACK));
+    controller.state_changed = true;
+    return;
+  }
 
   if (guitar_slot_[*idx] && cvars::guitar_translate &&
       TranslateGuitarButton(controller, event.cbutton.button,
