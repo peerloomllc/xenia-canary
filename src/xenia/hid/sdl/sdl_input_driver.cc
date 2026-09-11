@@ -9,6 +9,8 @@
 
 #include "xenia/hid/sdl/sdl_input_driver.h"
 
+#include <limits>
+
 #if XE_PLATFORM_WIN32
 #include "xenia/base/platform_win.h"
 #endif  // XE_PLATFORM_WIN32
@@ -92,9 +94,8 @@ X_STATUS SDLInputDriver::Setup() {
 
   std::promise<X_STATUS> init_promise;
   auto init_future = init_promise.get_future();
-  sdl_thread_ =
-      std::thread(&SDLInputDriver::SDLEventThread, this,
-                  std::move(init_promise));
+  sdl_thread_ = std::thread(&SDLInputDriver::SDLEventThread, this,
+                            std::move(init_promise));
   const X_STATUS result = init_future.get();
   if (result != X_STATUS_SUCCESS && sdl_thread_.joinable()) {
     sdl_thread_.join();
@@ -272,7 +273,6 @@ X_RESULT SDLInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
   // Unfortunately drivers can't present all information immediately (e.g.
   // battery information) so this needs to be refreshed every time.
   UpdateXCapabilities(*controller, user_index);
-
 
   std::memcpy(out_caps, &controller->caps, sizeof(*out_caps));
 
@@ -629,12 +629,15 @@ void SDLInputDriver::OnControllerDeviceAxisMotion(const SDL_Event& event) {
       pad.thumb_ly = ~event.caxis.value;
       break;
     case SDL_CONTROLLER_AXIS_RIGHTX:
-      if (guitar_slot_[*idx] && cvars::guitar_whammy_on_stick) {
-        whammy_seen_[*idx] = true;
-        // The whammy owns the right stick's X on a guitar. This guitar's
-        // tilt sensor sits on the right stick, and a title reading X as the
-        // whammy bends every held note while the guitar is simply held.
+      if (WhammyOnStick(*idx)) {
+        // The whammy owns the right stick's X on a guitar, and on this one it
+        // arrives as a trigger. What is left on the stick is the tilt sensor,
+        // and a title reading X as the whammy bends every held note while the
+        // guitar is simply held.
         break;
+      }
+      if (guitar_slot_[*idx]) {
+        whammy_seen_[*idx] = true;
       }
       pad.thumb_rx = event.caxis.value;
       break;
@@ -642,37 +645,24 @@ void SDLInputDriver::OnControllerDeviceAxisMotion(const SDL_Event& event) {
       pad.thumb_ry = ~event.caxis.value;
       break;
     case SDL_CONTROLLER_AXIS_TRIGGERLEFT:
-      // A trigger is meant to read 0 at rest and 32767 held, but a guitar
-      // whose whammy is wired to one can report the full stick range instead,
-      // resting at -32768. Left alone that reads as the whammy held down for
-      // ever: held notes bend on their own and the frets' audio is wrong.
-      if (event.caxis.value < 0) {
-        trigger_full_range_[*idx] = true;
-      }
-      if (guitar_slot_[*idx] && cvars::guitar_whammy_on_stick) {
+      if (WhammyOnStick(*idx)) {
         // An Xbox guitar's whammy is the right stick's X, and titles read it
         // there. This guitar sends it as a trigger, where nothing looks.
         //
-        // Passed through as it is, rest included: a guitar's whammy rests at
-        // one end of the stick's range rather than in the middle, and a title
-        // reads the middle as the bar held half down - every sustain bends on
-        // its own, which is what centring it did.
-        pad.thumb_rx = static_cast<int16_t>(event.caxis.value);
+        // SDL reports a trigger as 0 at rest through 32767 held, whatever
+        // range the device itself uses. Copied onto the stick as it is, rest
+        // lands in the middle, which a title reads as the bar held half down
+        // and every sustained note bends on its own. Spread it over the
+        // whole stick instead.
+        pad.thumb_rx =
+            static_cast<int16_t>(int32_t(event.caxis.value) * 2 - 32768);
+        whammy_seen_[*idx] = true;
         break;
       }
-      pad.left_trigger = static_cast<uint8_t>(
-          (trigger_full_range_[*idx] ? (int32_t(event.caxis.value) + 32768) / 2
-                                     : int32_t(event.caxis.value)) >>
-          7);
+      pad.left_trigger = static_cast<uint8_t>(event.caxis.value >> 7);
       break;
     case SDL_CONTROLLER_AXIS_TRIGGERRIGHT:
-      if (event.caxis.value < 0) {
-        trigger_full_range_[*idx] = true;
-      }
-      pad.right_trigger = static_cast<uint8_t>(
-          (trigger_full_range_[*idx] ? (int32_t(event.caxis.value) + 32768) / 2
-                                     : int32_t(event.caxis.value)) >>
-          7);
+      pad.right_trigger = static_cast<uint8_t>(event.caxis.value >> 7);
       break;
     default:
       assert_always();
@@ -851,6 +841,11 @@ bool SDLInputDriver::TranslateGuitarButton(ControllerState& controller,
   }
 }
 
+bool SDLInputDriver::WhammyOnStick(size_t user_index) const {
+  return cvars::guitar_whammy_on_stick && guitar_slot_[user_index] &&
+         whammy_on_trigger_[user_index];
+}
+
 bool SDLInputDriver::IsGuitarSubtype(uint8_t sub_type) {
   return sub_type == XINPUT_DEVSUBTYPE_GUITAR ||
          sub_type == XINPUT_DEVSUBTYPE_GUITAR_ALTERNATE ||
@@ -942,14 +937,23 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state,
     c.sub_type = *forced;
   }
   guitar_slot_[user_index] = IsGuitarSubtype(c.sub_type);
-  if (guitar_slot_[user_index] && cvars::guitar_whammy_on_stick &&
-      !whammy_seen_[user_index]) {
+  // A guitar built for the newer consoles sends its whammy as a trigger,
+  // where nothing looks for it; one built for the 360 sends it on the right
+  // stick, where it belongs and must be left alone.
+  whammy_on_trigger_[user_index] =
+      SDL_GameControllerGetBindForAxis(state.sdl,
+                                       SDL_CONTROLLER_AXIS_TRIGGERLEFT)
+          .bindType != SDL_CONTROLLER_BINDTYPE_NONE;
+  if (guitar_slot_[user_index] && !whammy_seen_[user_index]) {
     // A whammy bar rests at the bottom of the stick's range, and an axis
     // nothing has touched yet reads as the middle - which a title takes for
     // the bar held half down, bending every sustained note from the first
     // one. Start it where the bar actually sits.
-    state.state.gamepad.thumb_rx = int16_t(-32767);
-    state.state_changed = true;
+    const int16_t resting = std::numeric_limits<int16_t>::min();
+    if (state.state.gamepad.thumb_rx != resting) {
+      state.state.gamepad.thumb_rx = resting;
+      state.state_changed = true;
+    }
   }
   c.flags = cap_flags;
   c.gamepad.buttons =
@@ -970,11 +974,11 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state,
     // guitar has the five frets (A B X Y and the left shoulder), the strum on
     // the d-pad, start and back, and the whammy on the right stick.
     c.gamepad.buttons = X_INPUT_GAMEPAD_DPAD_UP | X_INPUT_GAMEPAD_DPAD_DOWN |
-                        X_INPUT_GAMEPAD_DPAD_LEFT |
-                        X_INPUT_GAMEPAD_DPAD_RIGHT | X_INPUT_GAMEPAD_START |
-                        X_INPUT_GAMEPAD_BACK | X_INPUT_GAMEPAD_LEFT_SHOULDER |
-                        X_INPUT_GAMEPAD_A | X_INPUT_GAMEPAD_B |
-                        X_INPUT_GAMEPAD_X | X_INPUT_GAMEPAD_Y;
+                        X_INPUT_GAMEPAD_DPAD_LEFT | X_INPUT_GAMEPAD_DPAD_RIGHT |
+                        X_INPUT_GAMEPAD_START | X_INPUT_GAMEPAD_BACK |
+                        X_INPUT_GAMEPAD_LEFT_SHOULDER | X_INPUT_GAMEPAD_A |
+                        X_INPUT_GAMEPAD_B | X_INPUT_GAMEPAD_X |
+                        X_INPUT_GAMEPAD_Y;
     c.gamepad.left_trigger = 0;
     c.gamepad.right_trigger = 0;
     c.gamepad.thumb_lx = 0;

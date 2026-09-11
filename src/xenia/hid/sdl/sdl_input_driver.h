@@ -12,9 +12,9 @@
 
 #include <array>
 #include <atomic>
-#include <future>
 #include <chrono>
 #include <cstdint>
+#include <future>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -87,13 +87,15 @@ class SDLInputDriver final : public InputDriver {
   // The kind --controller_subtypes says this slot is, if it says anything.
   static std::optional<uint8_t> ForcedSubtypeForSlot(size_t user_index);
   static bool IsGuitarSubtype(uint8_t sub_type);
+  // True when this slot's whammy bar is routed to the right stick.
+  bool WhammyOnStick(size_t user_index) const;
   // True when the button was handled as a guitar's.
   static bool TranslateGuitarButton(ControllerState& controller,
                                     uint8_t sdl_button, bool pressed);
   // Slots a guitar kind was asked for, so the state translation can match.
   std::array<bool, HID_SDL_USER_COUNT> guitar_slot_ = {};
-  // Slots whose triggers report the whole stick range rather than 0 upwards.
-  std::array<bool, HID_SDL_USER_COUNT> trigger_full_range_ = {};
+  // Slots whose whammy bar arrives as a trigger rather than on the stick.
+  std::array<bool, HID_SDL_USER_COUNT> whammy_on_trigger_ = {};
   // Slots whose whammy has moved at least once, so its resting value is real.
   std::array<bool, HID_SDL_USER_COUNT> whammy_seen_ = {};
 
