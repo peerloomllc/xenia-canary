@@ -86,6 +86,12 @@ class SDLInputDriver final : public InputDriver {
   void UpdateXCapabilities(ControllerState& state, size_t user_index);
   // The kind --controller_subtypes says this slot is, if it says anything.
   static std::optional<uint8_t> ForcedSubtypeForSlot(size_t user_index);
+  static bool IsGuitarSubtype(uint8_t sub_type);
+  // True when the button was handled as a guitar's.
+  static bool TranslateGuitarButton(ControllerState& controller,
+                                    uint8_t sdl_button, bool pressed);
+  // Slots a guitar kind was asked for, so the state translation can match.
+  std::array<bool, HID_SDL_USER_COUNT> guitar_slot_ = {};
 
   // Owns SDL init, the event pump and teardown. SDL_PumpEvents is bound to
   // the thread that initialized SDL_INIT_EVENTS, which used to be the UI

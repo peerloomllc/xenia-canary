@@ -43,6 +43,22 @@ DEFINE_string(
     "are being played on an instrument or on a pad. Empty leaves every slot "
     "as SDL reports it.",
     "HID");
+DEFINE_bool(guitar_whammy_on_stick, true,
+            "For a slot set to a guitar, send a whammy bar that arrives as a "
+            "trigger to the right stick instead, where titles look for it.",
+            "HID");
+DEFINE_bool(
+    guitar_translate, false,
+    "For a slot set to a guitar in controller_subtypes, put the frets where a "
+    "title written for an Xbox 360 guitar looks for them: green on the left "
+    "trigger, red on the left shoulder, yellow on the right shoulder, blue on "
+    "the right trigger, orange on A, and the whammy on the right stick. "
+    "Guitars for the newer consoles send the face buttons instead. Turn this "
+    "off, the default, to pass the guitar through as it is: Guitar Hero 5 and "
+    "the other later titles recognise a guitar and read its own layout, and "
+    "translating shifts their frets. Guitar Hero 3 never recognises one and "
+    "plays its pad scheme, which is what this is for.",
+    "HID");
 DEFINE_bool(log_input_latency, false,
             "Log a warning when over 150 ms pass between SDL event pumps.",
             "SDL");
@@ -257,7 +273,17 @@ X_RESULT SDLInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
   // battery information) so this needs to be refreshed every time.
   UpdateXCapabilities(*controller, user_index);
 
+
   std::memcpy(out_caps, &controller->caps, sizeof(*out_caps));
+
+  // Titles ask this to decide what they are being played on; Guitar Hero
+  // picks its instrument or its pad control scheme by it.
+  static std::array<uint8_t, HID_SDL_USER_COUNT> logged_subtype = {};
+  if (logged_subtype[user_index] != controller->caps.sub_type) {
+    logged_subtype[user_index] = controller->caps.sub_type;
+    XELOGI("SDL HID: slot {} answers GetCapabilities with type {} subtype {}",
+           user_index, controller->caps.type, controller->caps.sub_type);
+  }
 
   return X_ERROR_SUCCESS;
 }
@@ -593,6 +619,12 @@ void SDLInputDriver::OnControllerDeviceAxisMotion(const SDL_Event& event) {
       pad.thumb_ry = ~event.caxis.value;
       break;
     case SDL_CONTROLLER_AXIS_TRIGGERLEFT:
+      if (guitar_slot_[*idx] && cvars::guitar_whammy_on_stick) {
+        // An Xbox guitar's whammy is the right stick's X, and titles read it
+        // there. This guitar sends it as a trigger, where nothing looks.
+        pad.thumb_rx = static_cast<int16_t>(event.caxis.value);
+        break;
+      }
       pad.left_trigger = static_cast<uint8_t>(event.caxis.value >> 7);
       break;
     case SDL_CONTROLLER_AXIS_TRIGGERRIGHT:
@@ -645,6 +677,13 @@ void SDLInputDriver::OnControllerDeviceButtonChanged(const SDL_Event& event) {
   auto idx = GetControllerIndexFromInstanceID(event.cbutton.which);
   assert(idx);
   auto& controller = controllers_.at(*idx);
+
+  if (guitar_slot_[*idx] && cvars::guitar_translate &&
+      TranslateGuitarButton(controller, event.cbutton.button,
+                            event.cbutton.state == SDL_PRESSED)) {
+    controller.state_changed = true;
+    return;
+  }
 
   uint16_t xbuttons = controller.state.gamepad.buttons;
   // Lookup the XInput button code.
@@ -716,6 +755,62 @@ bool SDLInputDriver::TestSDLVersion() const {
     return false;
   }
   return true;
+}
+
+// An Xbox 360 guitar puts its frets on the triggers and shoulders, and that
+// is what the titles written for it read: green is the left trigger, red the
+// left shoulder, yellow the right shoulder, blue the right trigger and orange
+// the A button. Guitars built for the newer consoles use the face buttons
+// instead (green A, red B, yellow Y, blue X, orange left shoulder), so a
+// title from 2007 reads them as if a pad were plugged in - green lands on
+// orange, orange on red, and the strum on nothing. This puts them back.
+bool SDLInputDriver::TranslateGuitarButton(ControllerState& controller,
+                                           uint8_t sdl_button, bool pressed) {
+  auto& pad = controller.state.gamepad;
+  auto set = [&pad, pressed](uint16_t bit) {
+    if (pressed) {
+      pad.buttons = pad.buttons | bit;
+    } else {
+      pad.buttons = pad.buttons & ~bit;
+    }
+  };
+  switch (sdl_button) {
+    case SDL_CONTROLLER_BUTTON_A:  // green fret
+      pad.left_trigger = pressed ? 0xFF : 0;
+      return true;
+    case SDL_CONTROLLER_BUTTON_B:  // red fret
+      set(X_INPUT_GAMEPAD_LEFT_SHOULDER);
+      return true;
+    case SDL_CONTROLLER_BUTTON_Y:  // yellow fret
+      set(X_INPUT_GAMEPAD_RIGHT_SHOULDER);
+      return true;
+    case SDL_CONTROLLER_BUTTON_X:  // blue fret
+      pad.right_trigger = pressed ? 0xFF : 0;
+      return true;
+    case SDL_CONTROLLER_BUTTON_LEFTSHOULDER:  // orange fret
+      set(X_INPUT_GAMEPAD_A);
+      return true;
+    case SDL_CONTROLLER_BUTTON_DPAD_UP:
+      // Strum: the d-pad, and the left stick with it, since guitars of that
+      // era reported the strum bar on both.
+      set(X_INPUT_GAMEPAD_DPAD_UP);
+      pad.thumb_ly = pressed ? int16_t(32767) : int16_t(0);
+      return true;
+    case SDL_CONTROLLER_BUTTON_DPAD_DOWN:
+      set(X_INPUT_GAMEPAD_DPAD_DOWN);
+      pad.thumb_ly = pressed ? int16_t(-32767) : int16_t(0);
+      return true;
+    default:
+      // Start, Back (star power), the guide and the rest are the same on
+      // both, so they go through the ordinary path.
+      return false;
+  }
+}
+
+bool SDLInputDriver::IsGuitarSubtype(uint8_t sub_type) {
+  return sub_type == XINPUT_DEVSUBTYPE_GUITAR ||
+         sub_type == XINPUT_DEVSUBTYPE_GUITAR_ALTERNATE ||
+         sub_type == XINPUT_DEVSUBTYPE_GUITAR_BASS;
 }
 
 std::optional<uint8_t> SDLInputDriver::ForcedSubtypeForSlot(size_t user_index) {
@@ -802,6 +897,7 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state,
   if (auto forced = ForcedSubtypeForSlot(user_index)) {
     c.sub_type = *forced;
   }
+  guitar_slot_[user_index] = IsGuitarSubtype(c.sub_type);
   c.flags = cap_flags;
   c.gamepad.buttons =
       0xF3FF | (cvars::guide_button ? X_INPUT_GAMEPAD_GUIDE : 0x0);
@@ -813,6 +909,26 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state,
   c.gamepad.thumb_ry = static_cast<int16_t>(0xFFFFu);
   c.vibration.left_motor_speed = 0xFFFFu;
   c.vibration.right_motor_speed = 0xFFFFu;
+
+  if (IsGuitarSubtype(c.sub_type)) {
+    // What the capabilities say a device has is the other half of how a title
+    // decides what it is holding: saying "guitar" while claiming a pad's full
+    // set of sticks and triggers is not what an Xbox guitar looks like. A
+    // guitar has the five frets (A B X Y and the left shoulder), the strum on
+    // the d-pad, start and back, and the whammy on the right stick.
+    c.gamepad.buttons = X_INPUT_GAMEPAD_DPAD_UP | X_INPUT_GAMEPAD_DPAD_DOWN |
+                        X_INPUT_GAMEPAD_DPAD_LEFT |
+                        X_INPUT_GAMEPAD_DPAD_RIGHT | X_INPUT_GAMEPAD_START |
+                        X_INPUT_GAMEPAD_BACK | X_INPUT_GAMEPAD_LEFT_SHOULDER |
+                        X_INPUT_GAMEPAD_A | X_INPUT_GAMEPAD_B |
+                        X_INPUT_GAMEPAD_X | X_INPUT_GAMEPAD_Y;
+    c.gamepad.left_trigger = 0;
+    c.gamepad.right_trigger = 0;
+    c.gamepad.thumb_lx = 0;
+    c.gamepad.thumb_ly = 0;
+    c.gamepad.thumb_rx = static_cast<int16_t>(0xFFFFu);
+    c.gamepad.thumb_ry = static_cast<int16_t>(0xFFFFu);
+  }
 }
 
 // Check if the analog inputs exceed their thresholds to become a button press
