@@ -75,3 +75,19 @@ jobs:
           zsyncmake -u "$name" "$name"
           gh release upload "${{ github.ref_name }}" "$name" "$name.sha256" \
             "$name.zsync" --repo "${{ github.repository }}" --clobber
+
+      - name: Attach the Steam Deck installer
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: packaging/steam-deck
+      - name: Upload the Steam Deck installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # A Deck user downloads this one file, marks it executable and
+        # double-clicks it. It fetches deck-setup.sh and runs it in a
+        # terminal, so nothing has to be typed.
+        run: |-
+          set -e
+          gh release upload "${{ github.ref_name }}" \
+            packaging/steam-deck/Install-Xenia-on-Steam-Deck.desktop \
+            --repo "${{ github.repository }}" --clobber

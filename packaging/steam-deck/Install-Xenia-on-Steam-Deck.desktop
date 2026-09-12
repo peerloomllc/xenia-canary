@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Install Xenia Canary on this Steam Deck
+GenericName=Xbox 360 emulator setup
+Comment=Downloads the newest build, adds it to Steam with artwork, and sets up a USB guitar
+Icon=system-software-install
+Terminal=true
+Categories=Game;Emulator;
+Keywords=xenia;xbox;emulator;steamdeck;
+Exec=bash -c "curl -fsSL https://raw.githubusercontent.com/peerloomllc/xenia-canary/linux-native-work/packaging/steam-deck/deck-setup.sh | bash; echo; echo Press Enter to close this window.; read done"

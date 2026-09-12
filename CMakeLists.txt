@@ -260,7 +260,7 @@ else()
     # std::filesystem lived in a separate library until GCC 9 and clang 9.
     # Toolchains since then carry it in the standard library and no longer
     # ship the stub at all, so asking for it unconditionally fails the link
-    # on a newer compiler (it does inside the Flatpak SDK).
+    # on a newer compiler, as clang 22 does.
     find_library(XENIA_STDCXXFS_LIBRARY stdc++fs)
     if(XENIA_STDCXXFS_LIBRARY)
       link_libraries(stdc++fs)
