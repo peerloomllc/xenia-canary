@@ -8928,6 +8928,17 @@ void EmulatorWindow::ShowDashboard(bool show) {
     RefreshDashboard();
   }
   gtk_main->ShowIdleWidget(show);
+  if (show && dashboard_stack_) {
+    // GTK ignores a stack's visible child while that child is not visible
+    // itself, and the children are only shown on the line above, so the view
+    // chosen at build time never took and the list always won. Apply it here.
+    const bool grid = cvars::library_view == "grid";
+    gtk_stack_set_visible_child_name(GTK_STACK(dashboard_stack_),
+                                     grid ? "grid" : "list");
+    if (grid) {
+      RefreshDashboardGrid();
+    }
+  }
   if (dashboard_banner_) {
     bool running = show && emulator_->is_title_open();
     if (running) {
