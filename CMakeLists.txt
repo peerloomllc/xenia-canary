@@ -256,7 +256,16 @@ else()
     add_compile_options(${GTK3_CFLAGS_OTHER})
 
     # Global Linux libraries
-    link_libraries(stdc++fs dl lz4 pthread rt)
+    #
+    # std::filesystem lived in a separate library until GCC 9 and clang 9.
+    # Toolchains since then carry it in the standard library and no longer
+    # ship the stub at all, so asking for it unconditionally fails the link
+    # on a newer compiler (it does inside the Flatpak SDK).
+    find_library(XENIA_STDCXXFS_LIBRARY stdc++fs)
+    if(XENIA_STDCXXFS_LIBRARY)
+      link_libraries(stdc++fs)
+    endif()
+    link_libraries(dl lz4 pthread rt)
 
     # Link groups for executables (resolves circular deps)
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--start-group")
