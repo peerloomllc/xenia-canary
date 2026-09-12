@@ -1,0 +1,25 @@
+# CRKD Gibson Les Paul guitar controller (0351:4161), firmware v3.
+#
+# xpad matches Xbox One (GIP) devices by vendor id and does not list CRKD's,
+# so nothing binds this guitar and it appears as no controller at all. Hand
+# the id to the driver whenever the guitar is plugged in.
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0351", ATTR{idProduct}=="4161", \
+  RUN+="/bin/sh -c 'echo 0351 4161 > /sys/bus/usb/drivers/xpad/new_id 2>/dev/null || true'"
+
+# On a Steam Deck the same guitar enumerates as 0351:1300 and presents Xbox
+# One interfaces (class ff, subclass 47, protocol d0), which xpad does not
+# list either. SteamOS also does not load xpad at boot at all, so
+# /etc/modules-load.d/xpad.conf holding the single line "xpad" belongs next
+# to this rule there.
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0351", ATTR{idProduct}=="1300", \
+  RUN+="/bin/sh -c 'echo 0351 1300 > /sys/bus/usb/drivers/xpad/new_id 2>/dev/null || true'"
+
+# Let an ordinary program reach the guitar, which is what scripts/gip-guitar.py
+# needs on a Steam Deck: there the kernel driver binds it and never completes
+# the GIP start-up conversation, so the guitar is driven from userspace instead
+# (notes/81). uaccess covers the user logged in at the machine; the mode covers
+# a helper started from a service or over ssh.
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0351", ATTR{idProduct}=="4161", \
+  TAG+="uaccess", MODE="0660", GROUP="input"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0351", ATTR{idProduct}=="1300", \
+  TAG+="uaccess", MODE="0660", GROUP="input"
