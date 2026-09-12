@@ -59,8 +59,13 @@ std::vector<uint8_t> ReadPngFromFile(const std::filesystem::path& file_path) {
 
   const auto file_size = std::filesystem::file_size(file_path);
   std::vector<uint8_t> data(file_size);
-  fread(data.data(), 1, file_size, file);
+  const size_t read = fread(data.data(), 1, file_size, file);
   fclose(file);
+  if (read != file_size) {
+    // Hand back nothing rather than an image that is half zeroes, which is
+    // what a short read leaves behind.
+    return {};
+  }
 
   return data;
 }
