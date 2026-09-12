@@ -7863,11 +7863,31 @@ void EmulatorWindow::ToggleSettingsWindow() {
   BuildProfilesTab(notebook);
   BuildConsoleTab(notebook);
 
+  // This window has to carry its own way out. On a Steam Deck gamescope
+  // fullscreens it over the emulator and draws no title bar, so there is no
+  // close button anywhere and the only way back was to kill the emulator.
+  {
+    GtkWidget* footer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(footer), 8);
+    GtkWidget* close_button = gtk_button_new_with_label("Close");
+    g_signal_connect_swapped(close_button, "clicked",
+                             G_CALLBACK(gtk_widget_destroy), win);
+    gtk_box_pack_end(GTK_BOX(footer), close_button, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(outer_box), footer, FALSE, FALSE, 0);
+  }
+
   g_signal_connect(
       win, "key-press-event",
-      G_CALLBACK(+[](GtkWidget*, GdkEventKey* event, gpointer data) -> gboolean {
+      G_CALLBACK(+[](GtkWidget* w, GdkEventKey* event,
+                     gpointer data) -> gboolean {
         auto* self = static_cast<EmulatorWindow*>(data);
         if (self->settings_capture_action_ < 0) {
+          // Escape closes the window, for the same reason the Close button
+          // exists: there may be no title bar to close it from.
+          if (event->keyval == GDK_KEY_Escape) {
+            gtk_widget_destroy(w);
+            return TRUE;
+          }
           return FALSE;
         }
         if (event->keyval == GDK_KEY_Escape) {
