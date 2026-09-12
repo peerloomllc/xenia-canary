@@ -37,9 +37,11 @@ fetch() { # fetch <name> <destination>
   fi
 }
 
-[ -r /etc/os-release ] && . /etc/os-release || true
-if [ "${ID:-}" != "steamos" ]; then
-  note "This is written for SteamOS; ${ID:-this system} may differ."
+# In a subshell: /etc/os-release sets NAME, and sourcing it here would rename
+# the Steam entry after the operating system. It did exactly that once.
+os_id="$(. /etc/os-release 2>/dev/null && printf '%s' "${ID:-}")"
+if [ "$os_id" != "steamos" ]; then
+  note "This is written for SteamOS; ${os_id:-this system} may differ."
 fi
 command -v curl >/dev/null || die "curl is needed"
 command -v python3 >/dev/null || die "python3 is needed"
@@ -47,15 +49,21 @@ command -v python3 >/dev/null || die "python3 is needed"
 # ---------------------------------------------------------------- 1. the build
 say "Fetching the newest build"
 mkdir -p "$APP" "$BIN"
-api="https://api.github.com/repos/$REPO/releases/latest"
+# The newest release that actually carries one, not simply the newest: a
+# release whose build failed (a dependency host returning 504, say) has no
+# assets at all, and stopping there would be an odd thing to do to someone
+# who just wants it installed.
+api="https://api.github.com/repos/$REPO/releases?per_page=10"
 url="$(curl -fsSL "$api" | python3 -c '
 import json,sys
-r=json.load(sys.stdin)
-for a in r.get("assets", []):
-    if a["name"].endswith(".AppImage"):
-        print(a["browser_download_url"]); break
+for r in json.load(sys.stdin):
+    if r.get("draft"):
+        continue
+    for a in r.get("assets", []):
+        if a["name"].endswith(".AppImage"):
+            print(a["browser_download_url"]); sys.exit()
 ')"
-[ -n "$url" ] || die "no AppImage in the latest release of $REPO"
+[ -n "$url" ] || die "no release of $REPO carries an AppImage"
 note "$(basename "$url")"
 curl -fL --progress-bar "$url" -o "$APP/xenia_canary.AppImage"
 chmod +x "$APP/xenia_canary.AppImage"
