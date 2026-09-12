@@ -11,10 +11,21 @@ five steps that were, and `deck-setup.sh` does all of them:
 5. **Install the userspace guitar driver**, because the kernel one binds this
    guitar and then never completes the start-up conversation it needs.
 
-None of those can be done from inside a Flatpak, which is why this exists
-alongside one.
+## Running it, without typing anything
 
-## Running it
+A Deck has no keyboard, and the on-screen one makes any typed command
+unpleasant. So the script is started from a file instead:
+
+1. On the releases page, download **`Install-Xenia-on-Steam-Deck.desktop`**.
+2. In the file manager, right-click it, choose **Properties**, then
+   **Permissions**, and tick **Is executable**.
+3. Double-click it. A terminal opens, the script runs, and it waits for you
+   at the end.
+
+Step 2 is there because a file that arrives from the internet is never
+allowed to run on its own, which is a rule worth keeping.
+
+From a terminal, the same thing is:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/peerloomllc/xenia-canary/linux-native-work/packaging/steam-deck/deck-setup.sh | bash
@@ -40,6 +51,7 @@ than duplicated.
 
 | File | What |
 | --- | --- |
+| `Install-Xenia-on-Steam-Deck.desktop` | what a user downloads and double-clicks; it runs the script below in a terminal |
 | `deck-setup.sh` | the five steps |
 | `steam-shortcut.py` | writes Steam's binary shortcut list and names the artwork by the app id Steam derives from the command and the name |
 | `gip-guitar.py` | the userspace guitar driver |
