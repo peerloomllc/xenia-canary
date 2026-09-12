@@ -1,0 +1,11 @@
+# CRKD Gibson Les Paul guitar controller (0351:4161), firmware v3.
+#
+# The whammy bar reports a 16-bit value on ABS_Z, 0 at rest to 65280 fully
+# pressed in steps of 256, while xpad declares the axis as a 10-bit trigger
+# (0..1023). Anything past 1.5% of the bar's travel therefore reads as fully
+# pressed. Measured with evtest on 2026-09-11.
+#
+# The tilt sensor shares the axis, sending a fixed 255 while tilted, which is
+# 0.4% of the corrected range and so no longer reads as the whammy held.
+evdev:input:b0003v0351p4161*
+ EVDEV_ABS_02=0:65280:0:0:0
