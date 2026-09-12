@@ -8283,6 +8283,26 @@ bool EmulatorWindow::ReadTitleInfo(LibraryTitle& title) {
   return title.title_id != 0;
 }
 
+// What to call a title the emulator has never run. A disc in its own folder
+// takes the folder's name, which is how a multi-disc set is usually kept;
+// anything else takes its file name. Empty when there is nothing useful.
+static std::string NameFromPath(const std::filesystem::path& path) {
+  std::error_code ec;
+  const std::filesystem::path root = cvars::games_dir;
+  if (!root.empty()) {
+    std::filesystem::path rel =
+        std::filesystem::relative(path.parent_path(), root, ec);
+    if (!ec && !rel.empty() && rel != "." &&
+        rel.string().find("..") == std::string::npos) {
+      std::string folder = rel.filename().string();
+      if (!folder.empty()) {
+        return folder;
+      }
+    }
+  }
+  return path.stem().string();
+}
+
 void EmulatorWindow::ScanLibrary() {
   std::filesystem::path root = cvars::games_dir;
   std::error_code ec;
@@ -8788,7 +8808,13 @@ void EmulatorWindow::RefreshDashboard() {
       }
     }
     if (name.empty()) {
-      name = t.title_id ? "(not played yet)" : "(unreadable)";
+      // Every unplayed row used to read "(not played yet)", so a shelf of
+      // them was a column of identical labels. The folder a disc sits in
+      // names a multi-disc set, and a loose file names itself.
+      name = NameFromPath(t.path);
+      if (name.empty()) {
+        name = t.title_id ? "(not played yet)" : "(unreadable)";
+      }
     }
     std::string discs;
     if (t.disc_count > 1) {
