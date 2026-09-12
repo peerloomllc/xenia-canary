@@ -32,6 +32,8 @@
 #include <system_error>
 #include <array>
 #include <chrono>
+#include <cstdlib>
+#include <string_view>
 
 #include "third_party/imgui/imgui.h"
 #include "third_party/stb/stb_image_write.h"
@@ -226,6 +228,17 @@ namespace xe {
 namespace app {
 namespace {
 std::optional<ui::VirtualKey> ParseHotkeyName(const std::string& name);
+
+// Gamescope, the compositor a Steam Deck runs games under, presents the
+// application's Vulkan swapchain as the whole fullscreen window, so the GTK
+// overlay the game library is drawn in never appears there: the screen is
+// black but for the ImGui overlay on top of it. Its gaming mode sets this
+// variable; its desktop mode does not.
+bool RunningUnderGamescope() {
+  const char* desktop = std::getenv("XDG_CURRENT_DESKTOP");
+  return desktop && std::string_view(desktop).find("gamescope") !=
+                        std::string_view::npos;
+}
 }  // namespace
 }  // namespace app
 }  // namespace xe
@@ -463,7 +476,14 @@ void EmulatorWindow::OnEmulatorInitialized() {
   // When the user can see that the emulator isn't initializing anymore (the
   // menu isn't disabled), enter fullscreen if requested.
   if (cvars::fullscreen) {
-    SetFullscreen(true);
+    // Under gamescope the library is invisible in fullscreen, and this runs
+    // after it has been shown. Owe the fullscreen instead and take it when a
+    // title has the screen, rather than entering and leaving it in a flash.
+    if (DashboardShown() && RunningUnderGamescope()) {
+      dashboard_suspended_fullscreen_ = true;
+    } else {
+      SetFullscreen(true);
+    }
   }
 
   if (IsUseNexusForGameBarEnabled()) {
@@ -5232,6 +5252,9 @@ void EmulatorWindow::GpuClearCaches() {
 }
 
 void EmulatorWindow::SetFullscreen(bool fullscreen_) {
+  // The user asking for a fullscreen state of their own settles it, so stop
+  // owing the one UpdateDashboardFullscreen turned off.
+  dashboard_suspended_fullscreen_ = false;
   if (window_->IsFullscreen() == fullscreen_) {
     return;
   }
@@ -7840,11 +7863,31 @@ void EmulatorWindow::ToggleSettingsWindow() {
   BuildProfilesTab(notebook);
   BuildConsoleTab(notebook);
 
+  // This window has to carry its own way out. On a Steam Deck gamescope
+  // fullscreens it over the emulator and draws no title bar, so there is no
+  // close button anywhere and the only way back was to kill the emulator.
+  {
+    GtkWidget* footer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(footer), 8);
+    GtkWidget* close_button = gtk_button_new_with_label("Close");
+    g_signal_connect_swapped(close_button, "clicked",
+                             G_CALLBACK(gtk_widget_destroy), win);
+    gtk_box_pack_end(GTK_BOX(footer), close_button, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(outer_box), footer, FALSE, FALSE, 0);
+  }
+
   g_signal_connect(
       win, "key-press-event",
-      G_CALLBACK(+[](GtkWidget*, GdkEventKey* event, gpointer data) -> gboolean {
+      G_CALLBACK(+[](GtkWidget* w, GdkEventKey* event,
+                     gpointer data) -> gboolean {
         auto* self = static_cast<EmulatorWindow*>(data);
         if (self->settings_capture_action_ < 0) {
+          // Escape closes the window, for the same reason the Close button
+          // exists: there may be no title bar to close it from.
+          if (event->keyval == GDK_KEY_Escape) {
+            gtk_widget_destroy(w);
+            return TRUE;
+          }
           return FALSE;
         }
         if (event->keyval == GDK_KEY_Escape) {
@@ -8905,6 +8948,17 @@ void EmulatorWindow::ShowDashboard(bool show) {
     RefreshDashboard();
   }
   gtk_main->ShowIdleWidget(show);
+  if (show && dashboard_stack_) {
+    // GTK ignores a stack's visible child while that child is not visible
+    // itself, and the children are only shown on the line above, so the view
+    // chosen at build time never took and the list always won. Apply it here.
+    const bool grid = cvars::library_view == "grid";
+    gtk_stack_set_visible_child_name(GTK_STACK(dashboard_stack_),
+                                     grid ? "grid" : "list");
+    if (grid) {
+      RefreshDashboardGrid();
+    }
+  }
   if (dashboard_banner_) {
     bool running = show && emulator_->is_title_open();
     if (running) {
@@ -8924,6 +8978,34 @@ void EmulatorWindow::ShowDashboard(bool show) {
     }
     gtk_widget_set_visible(GTK_WIDGET(dashboard_banner_), running);
   }
+  UpdateDashboardFullscreen(show);
+}
+
+void EmulatorWindow::UpdateDashboardFullscreen(bool dashboard_shown) {
+  // Everywhere else the overlay draws over the presented frame correctly, so
+  // leave fullscreen alone: only gamescope hides it.
+  static const bool under_gamescope = RunningUnderGamescope();
+  if (!under_gamescope || !window_) {
+    return;
+  }
+  if (dashboard_shown) {
+    if (window_->IsFullscreen()) {
+      dashboard_suspended_fullscreen_ = true;
+      // Not EmulatorWindow::SetFullscreen: that writes the fullscreen cvar,
+      // which is the user's "start in fullscreen" setting.
+      window_->SetFullscreen(false);
+      window_->SetCursorVisibility(ui::Window::CursorVisibility::kVisible);
+      XELOGI(
+          "Gamescope: left fullscreen to show the game library, which is "
+          "drawn over the frame and is invisible there in fullscreen");
+    }
+    return;
+  }
+  if (dashboard_suspended_fullscreen_) {
+    dashboard_suspended_fullscreen_ = false;
+    window_->SetFullscreen(true);
+    window_->SetCursorVisibility(ui::Window::CursorVisibility::kAutoHidden);
+  }
 }
 
 void EmulatorWindow::ToggleDashboard() {
@@ -8932,6 +9014,11 @@ void EmulatorWindow::ToggleDashboard() {
     return;
   }
   ShowDashboard(!gtk_main->idle_widget_shown());
+}
+
+bool EmulatorWindow::DashboardShown() const {
+  auto* gtk_main = dynamic_cast<ui::GTKWindow*>(window_.get());
+  return gtk_main && gtk_main->idle_widget_shown();
 }
 
 void EmulatorWindow::OnDashboardTitleLaunched() {
