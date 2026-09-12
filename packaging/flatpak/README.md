@@ -14,6 +14,28 @@ flatpak run io.github.peerloomllc.XeniaCanary
 
 Updating means installing the next bundle over it.
 
+### What it downloads
+
+The emulator itself is about **38 MB**. The first install also pulls the
+runtime it sits on: roughly **1.3 GB** to download, **2.8 GB** installed.
+Measured on a Steam Deck that had no other Flatpaks on it:
+
+| | Installed |
+| --- | --- |
+| Xenia Canary | 303 MB |
+| GNOME runtime | 1.1 GB |
+| Graphics drivers | 457 MB |
+| Video codecs | 43 MB |
+
+Most of that is **shared with every other Flatpak**, so it is paid once
+rather than per app: anyone who already has one installed pays far less, and
+updates to Xenia after the first install are tens of megabytes. `flatpak
+install` prints these sizes and asks before downloading anything.
+
+The AppImage is 49 MB because it carries only itself and borrows the rest
+from the system, which is also why a system update can break it. On an
+immutable system that is the problem the Flatpak solves.
+
 ## Building it yourself
 
 ```sh
