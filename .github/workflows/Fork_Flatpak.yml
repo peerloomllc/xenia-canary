@@ -1,0 +1,86 @@
+name: Fork Flatpak
+
+# peerloomllc fork: build a Flatpak of the native-Linux branch and attach it to
+# the release of a linux-native-* tag as a single installable file.
+#
+# A bundle rather than a hosted repository: it needs no extra infrastructure
+# and installs with one command. See notes/82 in the xenia-linux notes for why
+# this targets the GNOME runtime and what it has to build for itself.
+
+on:
+  push:
+    tags: ['linux-native-*']
+    paths-ignore:
+      - '*.md'
+      - 'docs/**'
+      - 'LICENSE'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  flatpak:
+    name: Flatpak bundle
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download submodules
+        run: |-
+          # The same exclusions the AppImage build uses: this tree never
+          # compiles them, and DirectXShaderCompiler alone is an LLVM fork.
+          SUBMODULES=$(grep -oP '(?<=path = )(?!third_party\/(?:DirectX(?:-Headers|ShaderCompiler)|xbyak_aarch64)).+' .gitmodules)
+          git submodule update --init --depth=1 -j$(getconf _NPROCESSORS_ONLN) $SUBMODULES
+
+      - name: Install Flatpak and the runtime
+        run: |-
+          sudo apt-get -y update
+          sudo apt-get -y install flatpak flatpak-builder
+          flatpak remote-add --if-not-exists --user \
+            flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          # The GNOME runtime, because the build hard-requires GTK 3 which the
+          # freedesktop one does not carry. The LLVM extension version tracks
+          # the freedesktop base GNOME 49 is built on.
+          flatpak install -y --user --noninteractive flathub \
+            org.gnome.Platform//49 org.gnome.Sdk//49 \
+            org.freedesktop.Sdk.Extension.llvm22//25.08
+
+      - name: Build
+        run: |-
+          flatpak-builder --user --force-clean --disable-rofiles-fuse \
+            --repo=fp-repo fp-build \
+            packaging/flatpak/io.github.peerloomllc.XeniaCanary.yaml
+
+      - name: Make the bundle
+        id: bundle
+        run: |-
+          name="xenia_canary_${{ github.ref_name }}.flatpak"
+          flatpak build-bundle fp-repo "$name" \
+            io.github.peerloomllc.XeniaCanary master
+          test "$(stat -c%s "$name")" -gt 10000000
+          sha256sum "$name" > "$name.sha256"
+          echo "name=$name" >> $GITHUB_OUTPUT
+
+      - name: Attach it to the release
+        if: ${{ startsWith(github.ref, 'refs/tags/linux-native-') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |-
+          gh release upload "${{ github.ref_name }}" \
+            "${{ steps.bundle.outputs.name }}" \
+            "${{ steps.bundle.outputs.name }}.sha256" \
+            --repo "${{ github.repository }}" --clobber
+
+      - name: Keep it as an artifact too
+        uses: actions/upload-artifact@v7
+        with:
+          name: xenia_canary_flatpak
+          path: ${{ steps.bundle.outputs.name }}
+          compression-level: 0
