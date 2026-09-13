@@ -63,15 +63,38 @@ is the changelog.
     <img src="assets/peerloom/preferences.png" width="720" alt="Preferences window" />
 </p>
 
-## Building
+## Installing
 
 Each [release](https://github.com/peerloomllc/xenia-canary/releases)
 carries an **AppImage** built on Ubuntu 24.04: download, `chmod +x`, run.
-It needs glibc 2.39 or newer and a Vulkan driver, nothing else (the
+It needs glibc 2.38 or newer and a Vulkan driver, nothing else (the
 runtime is static; no FUSE package required), and it updates in place
-with [AppImageUpdate](https://appimage.github.io/AppImageUpdate/). A **tarball** built on
-Fedora 44 against its system libraries is there too. To build from source on Fedora
-(44):
+with [AppImageUpdate](https://appimage.github.io/AppImageUpdate/). Some
+releases also carry a **tarball** built on Fedora 44 against its system
+libraries.
+
+### Steam Deck
+
+Download **`Install-Xenia-on-Steam-Deck.desktop`** from the latest
+release, right-click it in the file manager, tick **Is executable** under
+Properties, then double-click it. It fetches the newest build, adds it to
+Steam so gaming mode can launch it, gives that entry artwork, and sets up
+a USB guitar, which SteamOS cannot drive on its own. Close Steam first:
+it rewrites its shortcut list when it exits.
+
+From a terminal, the same thing is:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/peerloomllc/xenia-canary/linux-native-work/packaging/steam-deck/deck-setup.sh | bash
+```
+
+[packaging/steam-deck/README.md](packaging/steam-deck/README.md) covers
+what it does, what it backs up, and the Steam Input setting a guitar
+needs.
+
+## Building
+
+To build from source on Fedora (44):
 
 ```sh
 sudo dnf install clang cmake ninja-build python3 gtk3-devel lz4-devel sdl2-compat-devel \
