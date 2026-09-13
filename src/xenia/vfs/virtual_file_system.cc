@@ -174,10 +174,9 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
   }
 
   const auto& device = *it;
-  auto relative_path =
-      normalized_path.size() >= device->mount_path().size()
-          ? normalized_path.substr(device->mount_path().size())
-          : std::string();
+  auto relative_path = normalized_path.size() >= device->mount_path().size()
+                           ? normalized_path.substr(device->mount_path().size())
+                           : std::string();
   return device->ResolvePath(relative_path);
 }
 

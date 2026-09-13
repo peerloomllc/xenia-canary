@@ -968,9 +968,10 @@ uint32_t XThread::SelfSuspend(bool already_counted) {
   if (already_counted) {
     // Re-issued by a restore: the count was taken before the save.
     previous = previous ? previous - 1 : 0;
-    XELOGI("XThread {:08X}: parked again in NtSuspendThread after a restore "
-           "(guest suspend count {})",
-           handle(), uint32_t(guest_thread->suspend_count));
+    XELOGI(
+        "XThread {:08X}: parked again in NtSuspendThread after a restore "
+        "(guest suspend count {})",
+        handle(), uint32_t(guest_thread->suspend_count));
   } else {
     guest_thread->suspend_count++;
   }
@@ -1090,9 +1091,10 @@ bool XThread::Save(ByteStream* stream) {
       // Caught between calling NtSuspendThread on itself and parking: the
       // step to the return address can never complete. It is parked now,
       // so save it at the call like any self-suspended thread.
-      XELOGI("XThread {:08X}: parked in its own NtSuspendThread during the "
-             "step; saving it at the call",
-             handle());
+      XELOGI(
+          "XThread {:08X}: parked in its own NtSuspendThread during the "
+          "step; saving it at the call",
+          handle());
       pc = emulator()->processor()->StepToGuestSafePoint(
           thread_id_, false, std::max<uint32_t>(suspend_count(), 1), &parked);
     }
@@ -1181,9 +1183,10 @@ bool XThread::Save(ByteStream* stream) {
   // Format 9: parked in its own NtSuspendThread (re-issued on restore).
   stream->Write<uint8_t>(saved_in_self_suspend_ ? 1 : 0);
   if (saved_in_self_suspend_) {
-    XELOGI("XThread {:08X}: saved parked in NtSuspendThread (guest suspend "
-           "count {})",
-           handle(), suspend_count());
+    XELOGI(
+        "XThread {:08X}: saved parked in NtSuspendThread (guest suspend "
+        "count {})",
+        handle(), suspend_count());
   }
   saved_in_self_suspend_ = false;
   if (life) {
@@ -1220,10 +1223,11 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state,
 
   ThreadSavedState state;
   stream->Read(&state, sizeof(ThreadSavedState));
-  XELOGI("XThread::Restore handle={:08X} id={} '{}' running={} pc={:08X} "
-         "stack={:08X}",
-         thread->handle(), state.thread_id, thread->thread_name_,
-         state.is_running, state.context.pc, state.stack_base);
+  XELOGI(
+      "XThread::Restore handle={:08X} id={} '{}' running={} pc={:08X} "
+      "stack={:08X}",
+      thread->handle(), state.thread_id, thread->thread_name_, state.is_running,
+      state.context.pc, state.stack_base);
   thread->thread_id_ = state.thread_id;
   // New threads take ++next_xthread_id_, and a restore hands its threads the
   // ids they were saved with. Without this the counter carries on from where

@@ -558,8 +558,8 @@ bool VulkanCommandProcessor::SetupContext() {
     if (dirty_bbox_enabled_) {
       // Dirty bounding box buffer, written by guest vertex shaders.
       shared_memory_and_edram_descriptor_set_layout_bindings[1].binding = 1;
-      shared_memory_and_edram_descriptor_set_layout_bindings[1]
-          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      shared_memory_and_edram_descriptor_set_layout_bindings[1].descriptorType =
+          VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
       shared_memory_and_edram_descriptor_set_layout_bindings[1]
           .descriptorCount = 1;
       shared_memory_and_edram_descriptor_set_layout_bindings[1].stageFlags =
@@ -753,11 +753,10 @@ bool VulkanCommandProcessor::SetupContext() {
         &dirty_bbox_descriptor_buffer_info;
     write_descriptor_set_dirty_bbox.pTexelBufferView = nullptr;
   }
-  dfn.vkUpdateDescriptorSets(
-      device,
-      1 + 2 * uint32_t(edram_fragment_shader_interlock) +
-          uint32_t(dirty_bbox_enabled_),
-      write_descriptor_sets, 0, nullptr);
+  dfn.vkUpdateDescriptorSets(device,
+                             1 + 2 * uint32_t(edram_fragment_shader_interlock) +
+                                 uint32_t(dirty_bbox_enabled_),
+                             write_descriptor_sets, 0, nullptr);
   if (edram_fragment_shader_interlock) {
     zpd_fsi_counter_descriptor_buffer_ = zpd_fsi_counter_sink_buffer_;
     zpd_fsi_counter_descriptor_range_ = zpd_fsi_counter_sink_range;
@@ -1719,8 +1718,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
       frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format);
   if (swap_texture_view == VK_NULL_HANDLE) {
     if ((++swaps_no_texture % 60) == 1) {
-      XELOGW("IssueSwap #{}: no swap texture for frontbuffer {:08X} ({} so far)",
-             swaps, frontbuffer_ptr, swaps_no_texture);
+      XELOGW(
+          "IssueSwap #{}: no swap texture for frontbuffer {:08X} ({} so far)",
+          swaps, frontbuffer_ptr, swaps_no_texture);
     }
     return;
   }
@@ -1956,7 +1956,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
         render_pass_begin_info.clearValueCount = 0;
         render_pass_begin_info.pClearValues = nullptr;
         stats_render_pass_count_.fetch_add(1, std::memory_order_relaxed);
-  deferred_command_buffer_.CmdVkBeginRenderPass(
+        deferred_command_buffer_.CmdVkBeginRenderPass(
             &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
         current_render_pass_ = swap_apply_gamma_render_pass_;
         current_framebuffer_ =
@@ -2062,8 +2062,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
               // frontbuffer width (the scene renders at its own internal
               // resolution). Size the resolve to the depth RT's real width with
               // the frontbuffer's aspect, and sample its top-left 1:1; ReShade
-              // then samples this depth texture with normalised UVs, aligning it
-              // with the colour image.
+              // then samples this depth texture with normalised UVs, aligning
+              // it with the colour image.
               uint32_t depth_w = scene_depth.width ? scene_depth.width
                                                    : frontbuffer_width_scaled;
               uint32_t depth_h =
@@ -4554,8 +4554,8 @@ void VulkanCommandProcessor::StartGpuTimeSubmission() {
       gpu_stat_query_ = stat_query;
       deferred_command_buffer_.CmdVkResetQueryPool(gpu_stat_query_pool_,
                                                    stat_query, 1);
-      deferred_command_buffer_.CmdVkBeginQuery(gpu_stat_query_pool_,
-                                               stat_query, 0);
+      deferred_command_buffer_.CmdVkBeginQuery(gpu_stat_query_pool_, stat_query,
+                                               0);
     }
   }
 }
@@ -4604,12 +4604,10 @@ void VulkanCommandProcessor::DrainGpuTimeRecords(
             VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
       double period = double(gpu_time_timestamp_period_);
       auto region_ns = [&](uint32_t begin_index, uint32_t end_index) {
-        return uint64_t(
-            std::max(0.0, double(results[end_index] - results[begin_index]) *
-                              period));
+        return uint64_t(std::max(
+            0.0, double(results[end_index] - results[begin_index]) * period));
       };
-      stats_gpu_total_ns_.fetch_add(region_ns(0, 1),
-                                    std::memory_order_relaxed);
+      stats_gpu_total_ns_.fetch_add(region_ns(0, 1), std::memory_order_relaxed);
       if (record.stat_valid) {
         uint64_t fragment_invocations = 0;
         if (dfn.vkGetQueryPoolResults(
@@ -4732,12 +4730,11 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
                ? VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT
                : 0);
       dirty_bbox_needs_init_ = false;
-      deferred_command_buffer_.CmdVkFillBuffer(
-          dirty_bbox_buffer_, 0, VK_WHOLE_SIZE, 0);
+      deferred_command_buffer_.CmdVkFillBuffer(dirty_bbox_buffer_, 0,
+                                               VK_WHOLE_SIZE, 0);
       PushBufferMemoryBarrier(
-          dirty_bbox_buffer_, 0, VK_WHOLE_SIZE,
-          VK_PIPELINE_STAGE_TRANSFER_BIT, dirty_bbox_stages,
-          VK_ACCESS_TRANSFER_WRITE_BIT,
+          dirty_bbox_buffer_, 0, VK_WHOLE_SIZE, VK_PIPELINE_STAGE_TRANSFER_BIT,
+          dirty_bbox_stages, VK_ACCESS_TRANSFER_WRITE_BIT,
           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     }
     if (dirty_bbox_pair_probe_pending_ &&
@@ -4840,9 +4837,8 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
           probe_min_x[0], probe_max_x[0], probe_min_y[0], probe_max_y[0],
           probe_empty[0] ? " EMPTY" : "", dirty_bbox_pair_probe_slots_[1],
           probe_min_x[1], probe_max_x[1], probe_min_y[1], probe_max_y[1],
-          probe_empty[1] ? " EMPTY" : "",
-          union_min_x, union_max_x, union_min_y, union_max_y,
-          union_empty ? "EMPTY" : "non-empty",
+          probe_empty[1] ? " EMPTY" : "", union_min_x, union_max_x, union_min_y,
+          union_max_y, union_empty ? "EMPTY" : "non-empty",
           union_fraction * 100.0, dirty_bbox_pair_probe_dest_extent_[0],
           dirty_bbox_pair_probe_range_height_,
           dirty_bbox_pair_probe_source_extent_[0],
@@ -5171,10 +5167,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       const VkDeviceSize dirty_bbox_size =
           sizeof(uint32_t) * 4 * RenderTargetCache::kDirtyBboxSlotCount;
       PushBufferMemoryBarrier(
-          dirty_bbox_buffer_, 0, VK_WHOLE_SIZE,
-          dirty_bbox_stages, VK_PIPELINE_STAGE_TRANSFER_BIT,
-          VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT |
-                                          VK_ACCESS_TRANSFER_READ_BIT);
+          dirty_bbox_buffer_, 0, VK_WHOLE_SIZE, dirty_bbox_stages,
+          VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+          VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
       SubmitBarriers(true);
       if (cvars::log_dirty_bbox && !dirty_bbox_readback_pending_ &&
           (dirty_bbox_frame_counter_ % 300) == 0) {
@@ -5182,9 +5177,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
         dirty_bbox_copy.srcOffset = 0;
         dirty_bbox_copy.dstOffset = 0;
         dirty_bbox_copy.size = dirty_bbox_size;
-        deferred_command_buffer_.CmdVkCopyBuffer(
-            dirty_bbox_buffer_, dirty_bbox_readback_buffer_, 1,
-            &dirty_bbox_copy);
+        deferred_command_buffer_.CmdVkCopyBuffer(dirty_bbox_buffer_,
+                                                 dirty_bbox_readback_buffer_, 1,
+                                                 &dirty_bbox_copy);
         dirty_bbox_readback_pending_ = true;
         dirty_bbox_readback_submission_ = GetCurrentSubmission();
       }
@@ -5192,9 +5187,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       deferred_command_buffer_.CmdVkFillBuffer(dirty_bbox_buffer_, 0,
                                                VK_WHOLE_SIZE, 0);
       PushBufferMemoryBarrier(
-          dirty_bbox_buffer_, 0, VK_WHOLE_SIZE,
-          VK_PIPELINE_STAGE_TRANSFER_BIT, dirty_bbox_stages,
-          VK_ACCESS_TRANSFER_WRITE_BIT,
+          dirty_bbox_buffer_, 0, VK_WHOLE_SIZE, VK_PIPELINE_STAGE_TRANSFER_BIT,
+          dirty_bbox_stages, VK_ACCESS_TRANSFER_WRITE_BIT,
           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     }
 
@@ -5989,15 +5983,16 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
         draw_util::Scissor draw_scissor;
         draw_util::GetScissor(regs, draw_scissor);
         DirtyBboxDrawRecord record;
-        record.vertex_shader_hash = active_vertex_shader()
-                                        ? active_vertex_shader()->ucode_data_hash()
-                                        : 0;
-        record.pixel_shader_hash = active_pixel_shader()
-                                       ? active_pixel_shader()->ucode_data_hash()
-                                       : 0;
+        record.vertex_shader_hash =
+            active_vertex_shader() ? active_vertex_shader()->ucode_data_hash()
+                                   : 0;
+        record.pixel_shader_hash =
+            active_pixel_shader() ? active_pixel_shader()->ucode_data_hash()
+                                  : 0;
         record.primitive_type =
             uint32_t(primitive_processing_result.host_primitive_type);
-        record.vertex_count = primitive_processing_result.host_draw_vertex_count;
+        record.vertex_count =
+            primitive_processing_result.host_draw_vertex_count;
         record.viewport[0] = viewport_info.xy_extent[0];
         record.viewport[1] = viewport_info.xy_extent[1];
         record.scissor_offset[0] = draw_scissor.offset[0];
@@ -6016,10 +6011,10 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     // px = ndc * scale + offset for the current host viewport.
     float bbox_px_scale_x = float(viewport_info.xy_extent[0]) * 0.5f;
     float bbox_px_scale_y = float(viewport_info.xy_extent[1]) * 0.5f;
-    float bbox_px_offset_x = float(viewport_info.xy_offset[0]) +
-                             bbox_px_scale_x;
-    float bbox_px_offset_y = float(viewport_info.xy_offset[1]) +
-                             bbox_px_scale_y;
+    float bbox_px_offset_x =
+        float(viewport_info.xy_offset[0]) + bbox_px_scale_x;
+    float bbox_px_offset_y =
+        float(viewport_info.xy_offset[1]) + bbox_px_scale_y;
     dirty |= system_constants_.dirty_bbox_px_scale[0] != bbox_px_scale_x ||
              system_constants_.dirty_bbox_px_scale[1] != bbox_px_scale_y ||
              system_constants_.dirty_bbox_px_offset[0] != bbox_px_offset_x ||

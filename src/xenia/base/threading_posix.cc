@@ -16,8 +16,6 @@
 #include "xenia/base/threading_timer_queue.h"
 
 #include <pthread.h>
-#include <csetjmp>
-#include <thread>
 #include <sched.h>
 #include <semaphore.h>
 #include <signal.h>
@@ -25,8 +23,10 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <array>
+#include <csetjmp>
 #include <cstddef>
 #include <ctime>
+#include <thread>
 
 #include "logging.h"
 
@@ -161,7 +161,6 @@ struct BlockingWaitMark {
   ~BlockingWaitMark() { SetBlockingWait(false); }
   void Done() { SetBlockingWait(false); }
 };
-
 
 void MaybeYield() {
   sched_yield();
@@ -614,9 +613,10 @@ class PosixCondition<Event> : public PosixConditionBase {
       }
     }
     if (!locked) {
-      XELOGW("PosixEvent::Query: mutex held by tid {} for >100 ms; reading "
-             "state unlocked",
-             native_mutex->__data.__owner & 0x3fffffff);
+      XELOGW(
+          "PosixEvent::Query: mutex held by tid {} for >100 ms; reading "
+          "state unlocked",
+          native_mutex->__data.__owner & 0x3fffffff);
     }
     bool state = signal_.load(std::memory_order_acquire);
     if (locked) {
@@ -1260,10 +1260,10 @@ class PosixCondition<Thread> final : public PosixConditionBase {
   mutable bool fifo_failed_ = false;  // True after SCHED_FIFO was rejected
   bool signaled_;
   int exit_code_;
-  State state_;             // Protected by state_mutex_
+  State state_;  // Protected by state_mutex_
   // Written under state_mutex_, but read from the suspend signal handler.
   std::atomic<uint32_t> suspend_count_;
-  sem_t suspend_sem_;       // Async-signal-safe suspend/resume semaphore
+  sem_t suspend_sem_;  // Async-signal-safe suspend/resume semaphore
   mutable std::mutex state_mutex_;
   mutable std::mutex callback_mutex_;
   mutable std::condition_variable state_signal_;

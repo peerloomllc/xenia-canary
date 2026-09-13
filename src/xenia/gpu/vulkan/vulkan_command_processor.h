@@ -187,15 +187,16 @@ class VulkanCommandProcessor final : public CommandProcessor {
       command_processor_.BeginGpuTimeRegion(category);
     }
     ~GpuTimeRegionScope() { command_processor_.EndGpuTimeRegion(); }
+
    private:
     VulkanCommandProcessor& command_processor_;
   };
 
-    // Dirty region tracking accessors for the render target cache.
+  // Dirty region tracking accessors for the render target cache.
   bool dirty_bbox_tracking_enabled() const { return dirty_bbox_enabled_; }
   VkBuffer dirty_bbox_buffer() const { return dirty_bbox_buffer_; }
 
-    uint64_t GetCurrentSubmission() const {
+  uint64_t GetCurrentSubmission() const {
     return completion_timeline_.GetUpcomingSubmission();
   }
   uint64_t GetCompletedSubmission() const override {
@@ -655,15 +656,11 @@ class VulkanCommandProcessor final : public CommandProcessor {
   bool dirty_bbox_pair_probe_pending() const {
     return dirty_bbox_pair_probe_pending_;
   }
-  bool CaptureDirtyBboxPairProbe(uint32_t source_slot, uint32_t dest_slot,
-                                 const char* gate = "eligible",
-                                 uint32_t start_tiles = 0,
-                                 uint32_t end_tiles = 0,
-                                 uint32_t dest_width = 0,
-                                 uint32_t dest_height = 0,
-                                 uint32_t range_height = 0,
-                                 uint32_t source_width = 0,
-                                 uint32_t source_height = 0);
+  bool CaptureDirtyBboxPairProbe(
+      uint32_t source_slot, uint32_t dest_slot, const char* gate = "eligible",
+      uint32_t start_tiles = 0, uint32_t end_tiles = 0, uint32_t dest_width = 0,
+      uint32_t dest_height = 0, uint32_t range_height = 0,
+      uint32_t source_width = 0, uint32_t source_height = 0);
   // The boxes for these slots are about to be zeroed: the draws recorded
   // against them no longer describe what a box holds.
   void ClearDirtyBboxDrawLog(uint32_t slot) {
@@ -673,7 +670,6 @@ class VulkanCommandProcessor final : public CommandProcessor {
   }
 
  private:
-
   VkQueryPool gpu_time_query_pool_ = VK_NULL_HANDLE;
   static constexpr uint32_t kGpuStatPoolQueries = 64;
   VkQueryPool gpu_stat_query_pool_ = VK_NULL_HANDLE;

@@ -16,10 +16,10 @@
 
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
-#include "xenia/config.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/platform.h"
+#include "xenia/config.h"
 #include "xenia/ui/vulkan/vulkan_reshade.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
 
@@ -81,11 +81,10 @@ DEFINE_bool(
     "use reversed depth; toggle if a depth shader looks inverted "
     "(RESHADE_DEPTH_INPUT_IS_REVERSED).",
     "GPU");
-DEFINE_bool(
-    reshade_depth_upside_down, false,
-    "Flip the guest depth buffer vertically for ReShade "
-    "(RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN).",
-    "GPU");
+DEFINE_bool(reshade_depth_upside_down, false,
+            "Flip the guest depth buffer vertically for ReShade "
+            "(RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN).",
+            "GPU");
 DEFINE_int32(
     reshade_depth_buffer, -1,
     "Which guest depth buffer the ReShade depth feed captures: -1 picks "
@@ -335,8 +334,7 @@ bool VulkanPresenter::CaptureGuestOutput(RawImage& image_out) {
   if (!guest_output_image) {
     return false;
   }
-  return CaptureImage(guest_output_image->image(),
-                      guest_output_image->extent(),
+  return CaptureImage(guest_output_image->image(), guest_output_image->extent(),
                       kGuestOutputInternalLayout,
                       kGuestOutputInternalAccessMask,
                       kGuestOutputInternalStageMask, image_out);
@@ -350,8 +348,7 @@ bool VulkanPresenter::CaptureReShadeOutput(RawImage& image_out) {
   // thread; call this only while no shader load/unload is pending.
   bool any_enabled = false;
   for (const ReShadeStackEntry& entry : reshade_stack_) {
-    if (entry.effect && entry.effect->enabled &&
-        entry.effect->runtime_ready) {
+    if (entry.effect && entry.effect->enabled && entry.effect->runtime_ready) {
       any_enabled = true;
       break;
     }
@@ -359,11 +356,10 @@ bool VulkanPresenter::CaptureReShadeOutput(RawImage& image_out) {
   if (!any_enabled || reshade_failed_ || !reshade_output_image_) {
     return CaptureGuestOutput(image_out);
   }
-  return CaptureImage(reshade_output_image_->image(),
-                      reshade_output_image_->extent(),
-                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                      VK_ACCESS_SHADER_READ_BIT,
-                      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, image_out);
+  return CaptureImage(
+      reshade_output_image_->image(), reshade_output_image_->extent(),
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, image_out);
 }
 
 bool VulkanPresenter::WantsReShadeDepth() const {
@@ -375,8 +371,7 @@ bool VulkanPresenter::WantsReShadeDepth() const {
     if (!entry.effect) {
       continue;
     }
-    for (const VulkanReShade::Texture& texture :
-         entry.effect->textures) {
+    for (const VulkanReShade::Texture& texture : entry.effect->textures) {
       if (texture.is_depth) {
         return true;
       }
@@ -577,10 +572,10 @@ bool VulkanPresenter::CaptureImage(VkImage image, VkExtent2D image_extent,
     std::swap(image_memory_barrier.srcAccessMask,
               image_memory_barrier.dstAccessMask);
     std::swap(image_memory_barrier.oldLayout, image_memory_barrier.newLayout);
-    dfn.vkCmdPipelineBarrier(
-        command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_HOST_BIT | image_stage_mask, 0, 0, nullptr, 1,
-        &buffer_memory_barrier, 1, &image_memory_barrier);
+    dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_HOST_BIT | image_stage_mask, 0,
+                             0, nullptr, 1, &buffer_memory_barrier, 1,
+                             &image_memory_barrier);
 
     if (dfn.vkEndCommandBuffer(command_buffer) != VK_SUCCESS) {
       XELOGE(
@@ -2104,14 +2099,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
               VkDescriptorImageInfo image_info;
               image_info.sampler = VK_NULL_HANDLE;
               image_info.imageView = reshade_output_image_->view();
-              image_info.imageLayout =
-                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+              image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
               VkWriteDescriptorSet write;
               write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
               write.pNext = nullptr;
-              write.dstSet = paint_context_.guest_output_descriptor_sets
-                                 [PaintContext::
-                                      kGuestOutputDescriptorSetReShadeSampled];
+              write.dstSet =
+                  paint_context_.guest_output_descriptor_sets
+                      [PaintContext::kGuestOutputDescriptorSetReShadeSampled];
               write.dstBinding = 0;
               write.dstArrayElement = 0;
               write.descriptorCount = 1;
@@ -2250,8 +2244,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
             dlss_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             dlss_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             dlss_barrier.image = dlss_output_image->image();
-            dlss_barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1,
-                                             0, 1};
+            dlss_barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
+                                             1};
             bool dlss_done = false;
             if (dlss_ && !dlss_failed_ && dlss_input_image) {
               // The previous content is discarded; the execution dependency
@@ -2267,16 +2261,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
               uint32_t dlss_input_width, dlss_input_height;
               guest_output_flow.GetEffectInputSize(i, dlss_input_width,
                                                    dlss_input_height);
-              if (dlss_->EnsureFeature(draw_command_buffer, dlss_input_width,
-                                       dlss_input_height,
-                                       dlss_output_size.first,
-                                       dlss_output_size.second) &&
-                  dlss_->Evaluate(draw_command_buffer,
-                                  dlss_input_image->image(),
-                                  dlss_input_image->view(),
-                                  dlss_output_image->image(),
-                                  dlss_output_image->view(),
-                                  kGuestOutputFormat, false)) {
+              if (dlss_->EnsureFeature(
+                      draw_command_buffer, dlss_input_width, dlss_input_height,
+                      dlss_output_size.first, dlss_output_size.second) &&
+                  dlss_->Evaluate(
+                      draw_command_buffer, dlss_input_image->image(),
+                      dlss_input_image->view(), dlss_output_image->image(),
+                      dlss_output_image->view(), kGuestOutputFormat, false)) {
                 dlss_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
                 dlss_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
                 dlss_barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -2302,17 +2293,17 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
               dlss_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
               dlss_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
               dlss_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-              dfn.vkCmdPipelineBarrier(
-                  draw_command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                  &dlss_barrier);
+              dfn.vkCmdPipelineBarrier(draw_command_buffer,
+                                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                                       nullptr, 0, nullptr, 1, &dlss_barrier);
               VkClearColorValue dlss_clear_color = {};
               VkImageSubresourceRange dlss_clear_range = {
                   VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-              dfn.vkCmdClearColorImage(
-                  draw_command_buffer, dlss_output_image->image(),
-                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &dlss_clear_color, 1,
-                  &dlss_clear_range);
+              dfn.vkCmdClearColorImage(draw_command_buffer,
+                                       dlss_output_image->image(),
+                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                       &dlss_clear_color, 1, &dlss_clear_range);
               dlss_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
               dlss_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
               dlss_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -3153,7 +3144,6 @@ VkPipeline VulkanPresenter::CreateGuestOutputPaintPipeline(
   return pipeline;
 }
 
-
 std::vector<Presenter::ReShadeEffectInfo>
 VulkanPresenter::GetReShadeStackFromUIThread() {
   std::lock_guard<std::mutex> lock(reshade_control_mutex_);
@@ -3416,8 +3406,7 @@ void VulkanPresenter::PublishReShadeUi() {
       ui.name = entry.effect->name;
       ui.enabled = entry.effect->enabled;
     } else {
-      ui.name =
-          std::filesystem::path(entry.path).stem().string() + " (failed)";
+      ui.name = std::filesystem::path(entry.path).stem().string() + " (failed)";
       ui.enabled = false;
     }
     ui.controls = entry.controls;
@@ -3484,8 +3473,7 @@ void VulkanPresenter::ApplyReShadeStack(uint32_t width, uint32_t height) {
       // orientation is baked in).
       for (size_t i = 0; i < old.size() && !convention_changed; ++i) {
         if (!reused[i] && old[i].effect && old[i].path == d.path &&
-            old[i].effect->width == width &&
-            old[i].effect->height == height) {
+            old[i].effect->width == width && old[i].effect->height == height) {
           entry.effect = std::move(old[i].effect);
           entry.controls = std::move(old[i].controls);
           reused[i] = true;
@@ -3516,8 +3504,7 @@ void VulkanPresenter::ApplyReShadeStack(uint32_t width, uint32_t height) {
   // Apply enabled flags and control values (index-aligned with desired).
   {
     std::lock_guard<std::mutex> lock(reshade_control_mutex_);
-    for (size_t i = 0;
-         i < reshade_stack_.size() && i < desired.size(); ++i) {
+    for (size_t i = 0; i < reshade_stack_.size() && i < desired.size(); ++i) {
       ReShadeStackEntry& entry = reshade_stack_[i];
       if (!entry.effect) {
         continue;
@@ -3648,8 +3635,8 @@ void VulkanPresenter::WriteReShadePresetFile(const std::string& file) {
     desired = reshade_desired_;
   }
   std::error_code ec;
-  std::filesystem::create_directories(
-      std::filesystem::path(file).parent_path(), ec);
+  std::filesystem::create_directories(std::filesystem::path(file).parent_path(),
+                                      ec);
   std::ofstream stream(file, std::ios::trunc);
   if (!stream) {
     XELOGW("VulkanPresenter: could not write the ReShade preset '{}'", file);
@@ -3667,7 +3654,6 @@ void VulkanPresenter::WriteReShadePresetFile(const std::string& file) {
     }
   }
 }
-
 
 }  // namespace vulkan
 }  // namespace ui

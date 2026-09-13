@@ -481,7 +481,8 @@ bool ContentManager::Save(ByteStream* stream) {
     stream->Write(std::string_view(device_path));
     stream->Write(std::string_view(package->GetPackageHostPath().string()));
     auto root = package->GetRootName();
-    stream->Write(std::string_view(root ? std::string(root->view()) : std::string()));
+    stream->Write(
+        std::string_view(root ? std::string(root->view()) : std::string()));
     XELOGI("ContentManager::Save: {} <- {} ({})", device_path,
            package->GetPackageHostPath().string(),
            root ? std::string(root->view()) : std::string("no root name"));
@@ -509,7 +510,8 @@ bool ContentManager::Restore(ByteStream* stream) {
     uint32_t id = 0;
     const std::string prefix = "\\Device\\Content\\";
     if (device_path.rfind(prefix, 0) == 0) {
-      id = uint32_t(std::strtoul(device_path.c_str() + prefix.size(), nullptr, 10));
+      id = uint32_t(
+          std::strtoul(device_path.c_str() + prefix.size(), nullptr, 10));
     }
     if (id) {
       content_device_id_ = id - 1;

@@ -7,8 +7,8 @@
  ******************************************************************************
  */
 
-#include "third_party/qrcodegen/qrcodegen.hpp"
 #include "xenia/app/emulator_window.h"
+#include "third_party/qrcodegen/qrcodegen.hpp"
 
 #include "xenia/apu/apu_flags.h"
 #include "xenia/config.h"
@@ -21,19 +21,19 @@
 #include <cstring>
 #endif
 
+#include <algorithm>
+#include <array>
 #include <cctype>
 #include <cfloat>
-#include <ctime>
-#include <map>
-#include <fstream>
-#include <cmath>
-#include <algorithm>
-#include <filesystem>
-#include <system_error>
-#include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <map>
 #include <string_view>
+#include <system_error>
 
 #include "third_party/imgui/imgui.h"
 #include "third_party/stb/stb_image_write.h"
@@ -62,8 +62,8 @@
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/hid/input_system.h"
-#include "xenia/kernel/xam/content_manager.h"
 #include "xenia/kernel/user_module.h"
+#include "xenia/kernel/xam/content_manager.h"
 #include "xenia/kernel/xam/profile_manager.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xam/xam_state.h"
@@ -147,11 +147,12 @@ DEFINE_string(support_lightning_address, "peerloomllc@strike.me",
               "Help > Support Development: Lightning donation address (empty "
               "hides its QR code).",
               "UI");
-DEFINE_int32(screenshot_burst_seconds, 0,
-             "Diagnostic: from N seconds after launch, save every new frame's "
-             "guest output as a PNG (screenshot_burst_frames of them) into "
-             "screenshot_burst_dir, named by swap number. For flicker analysis.",
-             "UI");
+DEFINE_int32(
+    screenshot_burst_seconds, 0,
+    "Diagnostic: from N seconds after launch, save every new frame's "
+    "guest output as a PNG (screenshot_burst_frames of them) into "
+    "screenshot_burst_dir, named by swap number. For flicker analysis.",
+    "UI");
 DEFINE_int32(screenshot_burst_frames, 30,
              "Diagnostic: frames to save for --screenshot_burst_seconds.",
              "UI");
@@ -208,8 +209,8 @@ DEFINE_string(load_state_hotkey, "F10",
 DEFINE_string(save_state_dir, "",
               "Directory for save states. Empty: <storage root>/savestates.",
               "General");
-DEFINE_string(library_view, "list",
-              "Game library layout: list or grid.", "General");
+DEFINE_string(library_view, "list", "Game library layout: list or grid.",
+              "General");
 DEFINE_string(games_dir, "",
               "Folder holding game files (.iso, .xex, .zar), scanned by "
               "File > Game Library and used as the starting folder of "
@@ -245,8 +246,8 @@ std::optional<ui::VirtualKey> ParseHotkeyName(const std::string& name);
 // variable; its desktop mode does not.
 bool RunningUnderGamescope() {
   const char* desktop = std::getenv("XDG_CURRENT_DESKTOP");
-  return desktop && std::string_view(desktop).find("gamescope") !=
-                        std::string_view::npos;
+  return desktop &&
+         std::string_view(desktop).find("gamescope") != std::string_view::npos;
 }
 }  // namespace
 }  // namespace app
@@ -1053,7 +1054,8 @@ bool EmulatorWindow::Initialize() {
   window_->AddListener(&window_listener_);
   UpdateStatusOverlay(nullptr);
   emulator_->on_pause_state_changed.AddListener([this](bool paused) {
-    app_context().CallInUIThread([this, paused]() { SetPausedOverlay(paused); });
+    app_context().CallInUIThread(
+        [this, paused]() { SetPausedOverlay(paused); });
   });
   window_->AddInputListener(&window_listener_, kZOrderEmulatorWindowInput);
 
@@ -1095,9 +1097,9 @@ bool EmulatorWindow::Initialize() {
                          std::bind(&EmulatorWindow::FileOpen, this)));
     file_menu->AddChild(std::move(recent_menu));
 #if XE_PLATFORM_LINUX
-    file_menu->AddChild(MenuItem::Create(
-        MenuItem::Type::kString, "Game &Library", "",
-        std::bind(&EmulatorWindow::ToggleDashboard, this)));
+    file_menu->AddChild(
+        MenuItem::Create(MenuItem::Type::kString, "Game &Library", "",
+                         std::bind(&EmulatorWindow::ToggleDashboard, this)));
 #else
     file_menu->AddChild(MenuItem::Create(
         MenuItem::Type::kString, "Game &Library...", "",
@@ -1149,22 +1151,22 @@ bool EmulatorWindow::Initialize() {
         hotkey_of(HotkeyAction::kFrameAdvance, cvars::frame_advance_hotkey),
         std::bind(&EmulatorWindow::FrameAdvance, this)));
     emulation_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
-    emulation_menu->AddChild(MenuItem::Create(
-        MenuItem::Type::kString, "&Normal Speed", "Numpad *",
-        std::bind(&EmulatorWindow::CpuTimeScalarReset, this)));
+    emulation_menu->AddChild(
+        MenuItem::Create(MenuItem::Type::kString, "&Normal Speed", "Numpad *",
+                         std::bind(&EmulatorWindow::CpuTimeScalarReset, this)));
     emulation_menu->AddChild(MenuItem::Create(
         MenuItem::Type::kString, "&Fast Forward (speed x2)", "Numpad +",
         std::bind(&EmulatorWindow::CpuTimeScalarSetDouble, this)));
     emulation_menu->AddChild(MenuItem::Create(
         MenuItem::Type::kString, "Slow &Motion (speed /2)", "Numpad -",
         std::bind(&EmulatorWindow::CpuTimeScalarSetHalf, this)));
-    emulation_menu->AddChild(MenuItem::Create(
-        MenuItem::Type::kString, "Show FPS &overlay", "",
-        std::bind(&EmulatorWindow::ToggleFpsOverlay, this)));
-    emulation_menu->AddChild(MenuItem::Create(
-        MenuItem::Type::kString, "&Mute",
-        hotkey_of(HotkeyAction::kMute, cvars::mute_hotkey),
-        std::bind(&EmulatorWindow::ToggleMute, this)));
+    emulation_menu->AddChild(
+        MenuItem::Create(MenuItem::Type::kString, "Show FPS &overlay", "",
+                         std::bind(&EmulatorWindow::ToggleFpsOverlay, this)));
+    emulation_menu->AddChild(
+        MenuItem::Create(MenuItem::Type::kString, "&Mute",
+                         hotkey_of(HotkeyAction::kMute, cvars::mute_hotkey),
+                         std::bind(&EmulatorWindow::ToggleMute, this)));
     emulation_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
     emulation_menu->AddChild(MenuItem::Create(
         MenuItem::Type::kString, "&Save State",
@@ -1224,10 +1226,9 @@ bool EmulatorWindow::Initialize() {
         std::bind(&EmulatorWindow::ToggleConsoleSettingsDialog, this)));
     panels->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
     auto size_menu = MenuItem::Create(MenuItem::Type::kPopup, "Panel &size");
-    for (auto [label, scale] : {std::pair{"Normal", 1.0f},
-                                std::pair{"Large (1.25x)", 1.25f},
-                                std::pair{"Larger (1.5x)", 1.5f},
-                                std::pair{"Largest (2x)", 2.0f}}) {
+    for (auto [label, scale] :
+         {std::pair{"Normal", 1.0f}, std::pair{"Large (1.25x)", 1.25f},
+          std::pair{"Larger (1.5x)", 1.5f}, std::pair{"Largest (2x)", 2.0f}}) {
       size_menu->AddChild(MenuItem::Create(
           MenuItem::Type::kString, label, "",
           std::bind(&EmulatorWindow::SetUIScale, this, scale)));
@@ -1267,15 +1268,15 @@ bool EmulatorWindow::Initialize() {
         "Ctrl+Pause/Break",
         std::bind(&EmulatorWindow::CpuBreakIntoHostDebugger, this)));
 #if XE_OPTION_PROFILING
-  tools_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
-  {
-    tools_menu->AddChild(MenuItem::Create(MenuItem::Type::kString,
-                                        "Toggle Profiler &Display", "F3",
-                                        []() { Profiler::ToggleDisplay(); }));
-    tools_menu->AddChild(MenuItem::Create(MenuItem::Type::kString,
-                                        "&Pause/Resume Profiler", "`",
-                                        []() { Profiler::TogglePause(); }));
-  }
+    tools_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
+    {
+      tools_menu->AddChild(
+          MenuItem::Create(MenuItem::Type::kString, "Toggle Profiler &Display",
+                           "F3", []() { Profiler::ToggleDisplay(); }));
+      tools_menu->AddChild(MenuItem::Create(MenuItem::Type::kString,
+                                            "&Pause/Resume Profiler", "`",
+                                            []() { Profiler::TogglePause(); }));
+    }
 #endif
     tools_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
     tools_menu->AddChild(MenuItem::Create(
@@ -1344,7 +1345,8 @@ bool EmulatorWindow::Initialize() {
         uint64_t now = gs->command_processor()->swap_count();
         if (now == last) {
           std::this_thread::sleep_for(std::chrono::microseconds(500));
-          if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(30)) {
+          if (std::chrono::steady_clock::now() - t0 >
+              std::chrono::seconds(30)) {
             XELOGW("SCREENSHOT BURST: gave up after 30 s, {} frames saved",
                    saved);
             return;
@@ -1779,9 +1781,9 @@ std::vector<std::string> AssignableHotkeyChoices() {
     add(ui::VirtualKey(uint16_t(ui::VirtualKey::k0) + i));
   }
   for (ui::VirtualKey k :
-       {ui::VirtualKey::kSpace, ui::VirtualKey::kDelete, ui::VirtualKey::kInsert,
-        ui::VirtualKey::kHome, ui::VirtualKey::kEnd, ui::VirtualKey::kPrior,
-        ui::VirtualKey::kNext, ui::VirtualKey::kTab}) {
+       {ui::VirtualKey::kSpace, ui::VirtualKey::kDelete,
+        ui::VirtualKey::kInsert, ui::VirtualKey::kHome, ui::VirtualKey::kEnd,
+        ui::VirtualKey::kPrior, ui::VirtualKey::kNext, ui::VirtualKey::kTab}) {
     add(k);
   }
   return out;
@@ -1835,8 +1837,7 @@ const char* HotkeyActionCvar(EmulatorWindow::HotkeyAction action) {
 }
 }  // namespace
 
-bool EmulatorWindow::SetActionHotkey(HotkeyAction action,
-                                     ui::VirtualKey key) {
+bool EmulatorWindow::SetActionHotkey(HotkeyAction action, ui::VirtualKey key) {
   std::string name = HotkeyName(key);
   if (name.empty()) {
     hotkey_status_ =
@@ -1845,8 +1846,8 @@ bool EmulatorWindow::SetActionHotkey(HotkeyAction action,
     return false;
   }
   if (const FixedHotkey* fixed = FindFixedHotkey(key)) {
-    hotkey_status_ = fmt::format("{} is already used for \"{}\".",
-                                 fixed->name, fixed->action);
+    hotkey_status_ = fmt::format("{} is already used for \"{}\".", fixed->name,
+                                 fixed->action);
     return false;
   }
   for (int i = 0; i < int(HotkeyAction::kCount); ++i) {
@@ -2101,7 +2102,8 @@ void EmulatorWindow::StateOverlayDialog::OnDraw(ImGuiIO& io) {
                      IM_COL32(255, 255, 255, 255), title);
   ImVec2 hint_pos((io.DisplaySize.x - hint_size.x) * 0.5f,
                   y + title_size.y + 8.0f);
-  draw_list->AddText(font, base_size, ImVec2(hint_pos.x + 1.0f, hint_pos.y + 1.0f),
+  draw_list->AddText(font, base_size,
+                     ImVec2(hint_pos.x + 1.0f, hint_pos.y + 1.0f),
                      IM_COL32(0, 0, 0, 200), hint.c_str());
   draw_list->AddText(font, base_size, hint_pos, IM_COL32(230, 230, 230, 255),
                      hint.c_str());
@@ -2303,9 +2305,8 @@ void EmulatorWindow::ScheduleResumeFromState() {
       // A resume point is used once. Leaving it would send every later
       // launch back to the same moment.
       std::filesystem::remove(path, ec);
-      std::filesystem::remove(path.parent_path() /
-                                  (path.stem().string() + ".png"),
-                              ec);
+      std::filesystem::remove(
+          path.parent_path() / (path.stem().string() + ".png"), ec);
     }
     state_op_in_progress_ = false;
     app_context().CallInUIThread([this, ok, ms]() {
@@ -2374,7 +2375,8 @@ std::filesystem::path EmulatorWindow::SaveStateSlotPath(int slot) {
         info.disc_number) {
       disc = info.disc_number;
     }
-    auto target = dir / fmt::format("{:08X}_disc{}_{}.sav", title_id, disc, slot);
+    auto target =
+        dir / fmt::format("{:08X}_disc{}_{}.sav", title_id, disc, slot);
     if (!std::filesystem::exists(target, ec)) {
       RenameSaveStateFiles(per_title, target);
     }
@@ -2394,9 +2396,10 @@ std::string EmulatorWindow::SaveStateSlotSummary(int slot) {
     return fmt::format("Slot {}: empty", slot);
   }
   auto mtime = std::filesystem::last_write_time(path, ec);
-  auto system_time = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-      mtime - std::filesystem::file_time_type::clock::now() +
-      std::chrono::system_clock::now());
+  auto system_time =
+      std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+          mtime - std::filesystem::file_time_type::clock::now() +
+          std::chrono::system_clock::now());
   std::time_t t = std::chrono::system_clock::to_time_t(system_time);
   char when[32] = {};
   std::strftime(when, sizeof(when), "%Y-%m-%d %H:%M", std::localtime(&t));
@@ -2548,8 +2551,7 @@ void EmulatorWindow::SetSaveStateDir(const std::filesystem::path& dir) {
   } else {
     previous_save_state_dir_.clear();
   }
-  XELOGI("Save state folder: {} (was {})", new_dir.string(),
-         old_dir.string());
+  XELOGI("Save state folder: {} (was {})", new_dir.string(), old_dir.string());
 }
 
 size_t EmulatorWindow::CountSaveStateFiles(const std::filesystem::path& dir) {
@@ -2581,8 +2583,8 @@ void EmulatorWindow::MoveSaveStates(const std::filesystem::path& from,
       }
       auto target = to / entry.path().filename();
       if (std::filesystem::exists(target, ec)) {
-        XELOGW("Move save states: {} exists, {} left in place",
-               target.string(), entry.path().string());
+        XELOGW("Move save states: {} exists, {} left in place", target.string(),
+               entry.path().string());
         ++failed;
         continue;
       }
@@ -2729,18 +2731,17 @@ void EmulatorWindow::GameLibraryDialog::OnDraw(ImGuiIO& io) {
   ImGui::SetNextWindowSizeConstraints(
       ImVec2(0.0f, 0.0f), ImVec2(FLT_MAX, io.DisplaySize.y - 40.0f));
   bool dialog_open = true;
-  if (!ImGui::Begin("Game library", &dialog_open,
-                    ImGuiWindowFlags_NoCollapse |
-                        ImGuiWindowFlags_AlwaysAutoResize)) {
+  if (!ImGui::Begin(
+          "Game library", &dialog_open,
+          ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
     ImGui::End();
     Close();
     emulator_window_.ToggleGameLibraryDialog();
     return;
   }
   EmulatorWindow& w = emulator_window_;
-  ImGui::Text("Folder: %s", cvars::games_dir.empty()
-                                ? "(none)"
-                                : cvars::games_dir.c_str());
+  ImGui::Text("Folder: %s",
+              cvars::games_dir.empty() ? "(none)" : cvars::games_dir.c_str());
   if (ImGui::Button("Change folder...")) {
     // Deferred: the picker runs its own event loop, and CallInUIThread runs
     // inline when it is already on the UI thread, which a draw is.
@@ -2759,9 +2760,8 @@ void EmulatorWindow::GameLibraryDialog::OnDraw(ImGuiIO& io) {
   ImGui::TextUnformatted(w.library_status_.c_str());
   ImGui::Separator();
   if (!w.library_entries_.empty() &&
-      ImGui::BeginTable("games", 4,
-                        ImGuiTableFlags_SizingFixedFit |
-                            ImGuiTableFlags_RowBg)) {
+      ImGui::BeginTable(
+          "games", 4, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
     ImGui::TableSetupColumn("File");
     ImGui::TableSetupColumn("Title");
     ImGui::TableSetupColumn("Size");
@@ -2822,15 +2822,15 @@ std::string SizeText(uint64_t bytes) {
 // Moves from -> to. A folder that already exists at the target is merged
 // one level down; a file that already exists is left in place. Falls back
 // to copy + remove across filesystems.
-void MoveTree(const std::filesystem::path& from, const std::filesystem::path& to,
-              size_t& moved, size_t& left) {
+void MoveTree(const std::filesystem::path& from,
+              const std::filesystem::path& to, size_t& moved, size_t& left) {
   std::error_code ec;
   if (!std::filesystem::exists(to, ec)) {
     std::filesystem::rename(from, to, ec);
     if (ec) {
       ec.clear();
-      std::filesystem::copy(from, to,
-                            std::filesystem::copy_options::recursive, ec);
+      std::filesystem::copy(from, to, std::filesystem::copy_options::recursive,
+                            ec);
       if (!ec) {
         std::filesystem::remove_all(from, ec);
       }
@@ -2913,8 +2913,9 @@ void EmulatorWindow::SetContentRoot(const std::filesystem::path& dir) {
     }
   }
   // content_root is defined in xenia_main.cc; reach it through the registry.
-  auto it = cvar::ConfigVars ? cvar::ConfigVars->find("content_root")
-                             : std::map<std::string, cvar::IConfigVar*>::iterator();
+  auto it = cvar::ConfigVars
+                ? cvar::ConfigVars->find("content_root")
+                : std::map<std::string, cvar::IConfigVar*>::iterator();
   if (!cvar::ConfigVars || it == cvar::ConfigVars->end()) {
     XELOGE("Content folder: no content_root config variable");
     return;
@@ -2958,7 +2959,8 @@ size_t EmulatorWindow::CountContentTitles(const std::filesystem::path& dir) {
   std::error_code ec;
   size_t n = 0;
   for (auto& profile : std::filesystem::directory_iterator(dir, ec)) {
-    if (!profile.is_directory(ec) || !IsHexName(profile.path().filename(), 16)) {
+    if (!profile.is_directory(ec) ||
+        !IsHexName(profile.path().filename(), 16)) {
       continue;
     }
     for (auto& title : std::filesystem::directory_iterator(profile, ec)) {
@@ -2975,7 +2977,8 @@ void EmulatorWindow::MoveContent(const std::filesystem::path& from,
   if (state_op_in_progress_.exchange(true)) {
     return;
   }
-  content_status_ = fmt::format("Moving {} to {}...", from.string(), to.string());
+  content_status_ =
+      fmt::format("Moving {} to {}...", from.string(), to.string());
   std::thread([this, from, to]() {
     xe::threading::set_name("Move Content");
     std::error_code ec;
@@ -2988,8 +2991,7 @@ void EmulatorWindow::MoveContent(const std::filesystem::path& from,
       }
       MoveTree(profile.path(), to / profile.path().filename(), moved, left);
     }
-    XELOGI("Move content: {} moved, {} left in {}", moved, left,
-           from.string());
+    XELOGI("Move content: {} moved, {} left in {}", moved, left, from.string());
     std::string text =
         left ? fmt::format("{} item(s) moved, {} left in {} (see the log)",
                            moved, left, from.string())
@@ -2997,8 +2999,8 @@ void EmulatorWindow::MoveContent(const std::filesystem::path& from,
     state_op_in_progress_ = false;
     app_context().CallInUIThread([this, text]() {
       ScanContentRoot();
-      new xe::ui::HostNotificationWindow(imgui_drawer(), "Content folder",
-                                         text, 0);
+      new xe::ui::HostNotificationWindow(imgui_drawer(), "Content folder", text,
+                                         0);
     });
   }).detach();
 }
@@ -3024,11 +3026,12 @@ void EmulatorWindow::ScanContentRoot() {
   size_t items = 0;
   std::map<uint32_t, ContentTitle> titles;
   for (auto& profile : std::filesystem::directory_iterator(root, ec)) {
-    if (!profile.is_directory(ec) || !IsHexName(profile.path().filename(), 16)) {
+    if (!profile.is_directory(ec) ||
+        !IsHexName(profile.path().filename(), 16)) {
       continue;
     }
-    uint64_t xuid = std::strtoull(profile.path().filename().string().c_str(),
-                                  nullptr, 16);
+    uint64_t xuid =
+        std::strtoull(profile.path().filename().string().c_str(), nullptr, 16);
     for (auto& title : std::filesystem::directory_iterator(profile, ec)) {
       if (!title.is_directory(ec) || !IsHexName(title.path().filename(), 8)) {
         continue;
@@ -3093,12 +3096,11 @@ void EmulatorWindow::ScanContentRoot() {
               });
     content_titles_.push_back(std::move(title));
   }
-  content_status_ =
-      content_titles_.empty()
-          ? "Nothing is installed in this folder."
-          : fmt::format("{} item(s) for {} title(s){}", items,
-                        content_titles_.size(),
-                        truncated ? ", list cut at 2000" : "");
+  content_status_ = content_titles_.empty()
+                        ? "Nothing is installed in this folder."
+                        : fmt::format("{} item(s) for {} title(s){}", items,
+                                      content_titles_.size(),
+                                      truncated ? ", list cut at 2000" : "");
   XELOGI("Content folder: {} scanned, {} items, {} titles", root.string(),
          items, content_titles_.size());
 }
@@ -3109,9 +3111,9 @@ void EmulatorWindow::ContentFolderDialog::OnDraw(ImGuiIO& io) {
   ImGui::SetNextWindowSizeConstraints(
       ImVec2(0.0f, 0.0f), ImVec2(FLT_MAX, io.DisplaySize.y - 40.0f));
   bool dialog_open = true;
-  if (!ImGui::Begin("Content folder", &dialog_open,
-                    ImGuiWindowFlags_NoCollapse |
-                        ImGuiWindowFlags_AlwaysAutoResize)) {
+  if (!ImGui::Begin(
+          "Content folder", &dialog_open,
+          ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
     ImGui::End();
     Close();
     emulator_window_.ToggleContentFolderDialog();
@@ -3183,9 +3185,9 @@ void EmulatorWindow::ContentFolderDialog::OnDraw(ImGuiIO& io) {
         title.title_id == running || w.content_titles_.size() <= 3,
         ImGuiCond_Once);
     if (ImGui::CollapsingHeader(header.c_str()) &&
-        ImGui::BeginTable("items", 4,
-                          ImGuiTableFlags_SizingFixedFit |
-                              ImGuiTableFlags_RowBg)) {
+        ImGui::BeginTable(
+            "items", 4,
+            ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
       ImGui::TableSetupColumn("Type");
       ImGui::TableSetupColumn("Name");
       ImGui::TableSetupColumn("File");
@@ -3294,10 +3296,10 @@ void GpuOptionCheckbox(const char* label, const char* name, bool value) {
 }
 
 // Combo over fixed string values; index -1 (not found) shows as the first.
-void GpuOptionStringCombo(const char* label, const char* name,
-                          const std::string& value,
-                          const std::vector<std::pair<const char*, const char*>>&
-                              choices /* value, label */) {
+void GpuOptionStringCombo(
+    const char* label, const char* name, const std::string& value,
+    const std::vector<std::pair<const char*, const char*>>&
+        choices /* value, label */) {
   int current = 0;
   for (size_t i = 0; i < choices.size(); ++i) {
     if (value == choices[i].first) {
@@ -3391,11 +3393,10 @@ void EmulatorWindow::SeedReShadeShaders() {
     return;
   }
   std::filesystem::create_directories(dest, ec);
-  std::filesystem::copy(
-      bundled, dest,
-      std::filesystem::copy_options::recursive |
-          std::filesystem::copy_options::overwrite_existing,
-      ec);
+  std::filesystem::copy(bundled, dest,
+                        std::filesystem::copy_options::recursive |
+                            std::filesystem::copy_options::overwrite_existing,
+                        ec);
   if (ec) {
     XELOGW("ReShade: could not seed shaders into '{}': {}", dest.string(),
            ec.message());
@@ -3425,8 +3426,8 @@ void EmulatorWindow::ToggleReShadeEffect() {
   for (int i = 0; i < int(stack.size()); ++i) {
     presenter->SetReShadeEffectEnabledFromUIThread(i, turn_on);
   }
-  new xe::ui::HostNotificationWindow(
-      imgui_drawer(), "ReShade", turn_on ? "Effects on" : "Effects off", 0);
+  new xe::ui::HostNotificationWindow(imgui_drawer(), "ReShade",
+                                     turn_on ? "Effects on" : "Effects off", 0);
 }
 
 void EmulatorWindow::ToggleReShadeOverlay() {
@@ -3487,9 +3488,9 @@ void EmulatorWindow::ReShadeOverlayDialog::OnDraw(ImGuiIO& io) {
   }
   ImGui::TextUnformatted("Shader folder:");
   ImGui::SetNextItemWidth(-70.0f);
-  bool apply_dir = ImGui::InputText(
-      "##rs_dir", shader_dir_buffer_, sizeof(shader_dir_buffer_),
-      ImGuiInputTextFlags_EnterReturnsTrue);
+  bool apply_dir = ImGui::InputText("##rs_dir", shader_dir_buffer_,
+                                    sizeof(shader_dir_buffer_),
+                                    ImGuiInputTextFlags_EnterReturnsTrue);
   ImGui::SameLine();
   if (ImGui::Button("Set##rs_setdir")) {
     apply_dir = true;
@@ -3574,8 +3575,7 @@ void EmulatorWindow::ReShadeOverlayDialog::OnDraw(ImGuiIO& io) {
       const bool selected = name == preset_name_buffer_;
       // Clicking a preset fills the name box (so Load loads it, or Save
       // overwrites it); a double-click loads it outright.
-      if (ImGui::Selectable((name + "##rs_preset_" + name).c_str(),
-                            selected)) {
+      if (ImGui::Selectable((name + "##rs_preset_" + name).c_str(), selected)) {
         std::snprintf(preset_name_buffer_, sizeof(preset_name_buffer_), "%s",
                       name.c_str());
       }
@@ -3609,7 +3609,8 @@ void EmulatorWindow::ReShadeOverlayDialog::OnDraw(ImGuiIO& io) {
     save_preset = true;
   }
   if (save_preset && preset_name_buffer_[0]) {
-    presenter->SaveReShadePresetToFileFromUIThread(named_preset_path().string());
+    presenter->SaveReShadePresetToFileFromUIThread(
+        named_preset_path().string());
   }
   ImGui::Separator();
 
@@ -3644,8 +3645,7 @@ void EmulatorWindow::ReShadeOverlayDialog::OnDraw(ImGuiIO& io) {
         presenter->GetReShadeDepthBuffersFromUIThread();
     int depth_choice = presenter->GetReShadeDepthBufferChoiceFromUIThread();
     auto depth_buffer_label = [&](int index) {
-      const ui::Presenter::ReShadeDepthBufferInfo& info =
-          depth_buffers[index];
+      const ui::Presenter::ReShadeDepthBufferInfo& info = depth_buffers[index];
       std::string label = std::to_string(index) + ": " +
                           std::to_string(info.width) + "x" +
                           std::to_string(info.height);
@@ -3737,9 +3737,9 @@ void EmulatorWindow::ReShadeOverlayDialog::OnDraw(ImGuiIO& io) {
         const std::string id = "##rs_" + std::to_string(i) + "_" + control.name;
         bool changed = false;
         if (control.ui_type == "color" && control.components >= 3) {
-          changed = ImGui::ColorEdit3((control.label + id).c_str(),
-                                      control.value,
-                                      ImGuiColorEditFlags_NoInputs);
+          changed =
+              ImGui::ColorEdit3((control.label + id).c_str(), control.value,
+                                ImGuiColorEditFlags_NoInputs);
         } else if (control.ui_type == "bool" || control.components == 0) {
           bool b = control.value[0] != 0.0f;
           if (ImGui::Checkbox((control.label + id).c_str(), &b)) {
@@ -3751,15 +3751,14 @@ void EmulatorWindow::ReShadeOverlayDialog::OnDraw(ImGuiIO& io) {
                                        &control.value[0], control.min_value,
                                        control.max_value, "%.3f");
         } else {
-          changed = ImGui::SliderScalarN(
-              (control.label + id).c_str(), ImGuiDataType_Float, control.value,
-              control.components, &control.min_value, &control.max_value,
-              "%.3f");
+          changed = ImGui::SliderScalarN((control.label + id).c_str(),
+                                         ImGuiDataType_Float, control.value,
+                                         control.components, &control.min_value,
+                                         &control.max_value, "%.3f");
         }
         if (changed) {
-          presenter->SetReShadeControlFromUIThread(i, control.name,
-                                                   control.value,
-                                                   control.components);
+          presenter->SetReShadeControlFromUIThread(
+              i, control.name, control.value, control.components);
         }
         if (ImGui::IsItemDeactivatedAfterEdit()) {
           presenter->SaveReShadePresetFromUIThread();
@@ -3781,9 +3780,9 @@ void EmulatorWindow::GpuOptionsDialog::OnDraw(ImGuiIO& io) {
   ImGui::SetNextWindowSizeConstraints(
       ImVec2(0.0f, 0.0f), ImVec2(FLT_MAX, io.DisplaySize.y - 40.0f));
   bool dialog_open = true;
-  if (!ImGui::Begin("Advanced GPU options", &dialog_open,
-                    ImGuiWindowFlags_NoCollapse |
-                        ImGuiWindowFlags_AlwaysAutoResize)) {
+  if (!ImGui::Begin(
+          "Advanced GPU options", &dialog_open,
+          ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
     ImGui::End();
     Close();
     emulator_window_.ToggleGpuOptionsDialog();
@@ -3800,8 +3799,9 @@ void EmulatorWindow::GpuOptionsDialog::OnDraw(ImGuiIO& io) {
       "Hover an option for the description.");
   ImGui::PopTextWrapPos();
 
-  if (ImGui::TreeNodeEx("Takes effect now", ImGuiTreeNodeFlags_Framed |
-                                                ImGuiTreeNodeFlags_DefaultOpen)) {
+  if (ImGui::TreeNodeEx(
+          "Takes effect now",
+          ImGuiTreeNodeFlags_Framed | ImGuiTreeNodeFlags_DefaultOpen)) {
     {
       bool fps = cvars::show_fps;
       if (ImGui::Checkbox("Show FPS overlay", &fps)) {
@@ -3819,21 +3819,20 @@ void EmulatorWindow::GpuOptionsDialog::OnDraw(ImGuiIO& io) {
     {
       float v = float(cvars::occlusion_query_saturation);
       ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14.0f);
-      ImGui::SliderFloat("Occlusion query saturation",
-                         &v, 0.0f, 1.0f, "%.2f");
+      ImGui::SliderFloat("Occlusion query saturation", &v, 0.0f, 1.0f, "%.2f");
       if (ImGui::IsItemDeactivatedAfterEdit()) {
         SetGpuOption<double>("occlusion_query_saturation", double(v));
       }
       GpuOptionTooltip("occlusion_query_saturation");
     }
-    GpuOptionStringCombo(
-        "Readback resolve", "readback_resolve", cvars::readback_resolve,
-        {{"none", "none: no CPU readback"},
-         {"fast", "fast: previous frame, no stall"},
-         {"full", "full: wait for the GPU"}});
+    GpuOptionStringCombo("Readback resolve", "readback_resolve",
+                         cvars::readback_resolve,
+                         {{"none", "none: no CPU readback"},
+                          {"fast", "fast: previous frame, no stall"},
+                          {"full", "full: wait for the GPU"}});
     {
-      static const char* kAniso[] = {"No override",  "Off", "1x", "2x",
-                                     "4x",           "8x",  "16x"};
+      static const char* kAniso[] = {"No override", "Off", "1x", "2x",
+                                     "4x",          "8x",  "16x"};
       int current = std::clamp(cvars::anisotropic_override + 1, 0, 6);
       ImGui::SetNextItemWidth(ImGui::GetFontSize() * 26.0f);
       if (ImGui::Combo("Anisotropic filtering", &current, kAniso, 7)) {
@@ -3855,8 +3854,8 @@ void EmulatorWindow::GpuOptionsDialog::OnDraw(ImGuiIO& io) {
     GpuOptionCheckbox("Asynchronous shader compilation (new pipelines)",
                       "async_shader_compilation",
                       cvars::async_shader_compilation);
-    GpuOptionCheckbox("Force depth clamp (new pipelines)",
-                      "force_depth_clamp", cvars::force_depth_clamp);
+    GpuOptionCheckbox("Force depth clamp (new pipelines)", "force_depth_clamp",
+                      cvars::force_depth_clamp);
     GpuOptionInt<uint32_t>("Texture cache soft limit, MB",
                            "texture_cache_memory_limit_soft",
                            cvars::texture_cache_memory_limit_soft, 16, 65536);
@@ -3870,10 +3869,12 @@ void EmulatorWindow::GpuOptionsDialog::OnDraw(ImGuiIO& io) {
     ImGui::TreePop();
   }
 
-  if (ImGui::TreeNodeEx("Needs a relaunch", ImGuiTreeNodeFlags_Framed |
-                                                ImGuiTreeNodeFlags_DefaultOpen)) {
-    ImGui::TextDisabled("Read when the emulator starts; a change waits for "
-                        "the next launch.");
+  if (ImGui::TreeNodeEx(
+          "Needs a relaunch",
+          ImGuiTreeNodeFlags_Framed | ImGuiTreeNodeFlags_DefaultOpen)) {
+    ImGui::TextDisabled(
+        "Read when the emulator starts; a change waits for "
+        "the next launch.");
     {
       static const char* kPresets[] = {"Custom", "720p, native (1x1)",
                                        "1440p (2x2)", "4K (3x3)"};
@@ -3924,16 +3925,16 @@ void EmulatorWindow::GpuOptionsDialog::OnDraw(ImGuiIO& io) {
         {{"", "any: pick what suits the GPU"},
          {"fbo", "fbo: host framebuffers, faster, fewer formats"},
          {"fsi", "fsi: fragment shader interlock, most accurate"}});
-    GpuOptionCheckbox(
-        "Skip copying unchanged screen regions (experimental)",
-        "dirty_region_tracking", cvars::dirty_region_tracking);
+    GpuOptionCheckbox("Skip copying unchanged screen regions (experimental)",
+                      "dirty_region_tracking", cvars::dirty_region_tracking);
     ImGui::TextDisabled(
         "Tracks what each draw touches so render target copies move only "
         "what changed. Much faster above 1x in some games; the fbo render "
         "target path only, and not yet verified in every scene.");
-    GpuOptionInt<uint64_t>("Frame rate limit, fps (0 = 60 with VSync, else "
-                           "unlimited)",
-                           "framerate_limit", cvars::framerate_limit, 0, 1000);
+    GpuOptionInt<uint64_t>(
+        "Frame rate limit, fps (0 = 60 with VSync, else "
+        "unlimited)",
+        "framerate_limit", cvars::framerate_limit, 0, 1000);
     GpuOptionCheckbox("Sparse shared memory (Vulkan)",
                       "vulkan_sparse_shared_memory",
                       cvars::vulkan_sparse_shared_memory);
@@ -3970,9 +3971,9 @@ void EmulatorWindow::SaveStatesDialog::OnDraw(ImGuiIO& io) {
   ImGui::SetNextWindowSizeConstraints(
       ImVec2(0.0f, 0.0f), ImVec2(FLT_MAX, io.DisplaySize.y - 40.0f));
   bool dialog_open = true;
-  if (!ImGui::Begin("Save states", &dialog_open,
-                    ImGuiWindowFlags_NoCollapse |
-                        ImGuiWindowFlags_AlwaysAutoResize)) {
+  if (!ImGui::Begin(
+          "Save states", &dialog_open,
+          ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
     ImGui::End();
     Close();
     emulator_window_.ToggleSaveStatesDialog();
@@ -4050,8 +4051,8 @@ void EmulatorWindow::SaveStatesDialog::OnDraw(ImGuiIO& io) {
         ImGui::Dummy(ImVec2(128.0f, 72.0f));
       }
       ImGui::TableSetColumnIndex(1);
-      std::string summary =
-          title_open ? w.SaveStateSlotSummary(slot) : fmt::format("Slot {}", slot);
+      std::string summary = title_open ? w.SaveStateSlotSummary(slot)
+                                       : fmt::format("Slot {}", slot);
       if (slot == current) {
         ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "%s  (selected)",
                            summary.c_str());
@@ -4079,9 +4080,8 @@ void EmulatorWindow::SaveStatesDialog::OnDraw(ImGuiIO& io) {
       // Delete needs a file to delete, but not a running title: a slot can
       // be cleared out from the dialog with nothing loaded.
       std::error_code slot_ec;
-      bool has_file =
-          title_open && std::filesystem::exists(w.SaveStateSlotPath(slot),
-                                                slot_ec);
+      bool has_file = title_open && std::filesystem::exists(
+                                        w.SaveStateSlotPath(slot), slot_ec);
       ImGui::SameLine();
       ImGui::BeginDisabled(busy || !has_file);
       if (ImGui::Button("Delete")) {
@@ -4165,9 +4165,9 @@ void EmulatorWindow::SlotOverlayDialog::OnDraw(ImGuiIO& io) {
   }
   int current = std::clamp(cvars::save_state_slot, 1, kSaveStateSlots);
   // Thumbnails 128x72, smaller when the window is short.
-  float thumb_h = std::clamp(
-      (io.DisplaySize.y - 120.0f) / float(kSaveStateSlots) - 6.0f, 27.0f,
-      72.0f);
+  float thumb_h =
+      std::clamp((io.DisplaySize.y - 120.0f) / float(kSaveStateSlots) - 6.0f,
+                 27.0f, 72.0f);
   float thumb_w = std::roundf(thumb_h * 16.0f / 9.0f);
   ImGui::SetNextWindowPos(
       ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
@@ -4182,15 +4182,16 @@ void EmulatorWindow::SlotOverlayDialog::OnDraw(ImGuiIO& io) {
                        ImGuiWindowFlags_NoNav)) {
     auto save_key = w.action_key(HotkeyAction::kSaveState);
     auto load_key = w.action_key(HotkeyAction::kLoadState);
-    ImGui::Text("Save state slots   %s / %s select, %s saves, %s loads, "
-                "Esc hides",
-                cvars::prev_slot_hotkey.c_str(), cvars::next_slot_hotkey.c_str(),
-                save_key ? HotkeyName(*save_key).c_str() : "(no key)",
-                load_key ? HotkeyName(*load_key).c_str() : "(no key)");
+    ImGui::Text(
+        "Save state slots   %s / %s select, %s saves, %s loads, "
+        "Esc hides",
+        cvars::prev_slot_hotkey.c_str(), cvars::next_slot_hotkey.c_str(),
+        save_key ? HotkeyName(*save_key).c_str() : "(no key)",
+        load_key ? HotkeyName(*load_key).c_str() : "(no key)");
     ImGui::Separator();
-    if (ImGui::BeginTable("slots", 2,
-                          ImGuiTableFlags_SizingFixedFit |
-                              ImGuiTableFlags_RowBg)) {
+    if (ImGui::BeginTable(
+            "slots", 2,
+            ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
       for (int slot = 1; slot <= kSaveStateSlots; ++slot) {
         ImGui::TableNextRow();
         if (slot == current) {
@@ -4308,10 +4309,10 @@ void EmulatorWindow::SaveState() {
         ok ? fmt::format("Slot {}: saved ({} MB, {:.1f} s)",
                          std::clamp(cvars::save_state_slot, 1, kSaveStateSlots),
                          bytes >> 20, ms / 1000.0)
-           : emu->last_save_error().empty()
-                 ? "Save FAILED (a thread could not be stepped; see the log). "
-                   "The previous save state was kept."
-                 : fmt::format("Save FAILED: {}.", emu->last_save_error());
+        : emu->last_save_error().empty()
+            ? "Save FAILED (a thread could not be stepped; see the log). "
+              "The previous save state was kept."
+            : fmt::format("Save FAILED: {}.", emu->last_save_error());
     state_op_in_progress_ = false;
     app_context().CallInUIThread([this, text, ok]() {
       SetStateOverlay(nullptr, nullptr);
@@ -4368,11 +4369,11 @@ void EmulatorWindow::LoadState() {
                   .count();
     XELOGI("Load state: {} from {} in {} ms", ok ? "loaded" : "FAILED",
            path.string(), ms);
-    std::string text = ok ? fmt::format("Slot {}: loaded ({:.1f} s)",
-                                        std::clamp(cvars::save_state_slot, 1,
-                                                   kSaveStateSlots),
-                                        ms / 1000.0)
-                          : fmt::format("Load FAILED: {}", path.string());
+    std::string text =
+        ok ? fmt::format("Slot {}: loaded ({:.1f} s)",
+                         std::clamp(cvars::save_state_slot, 1, kSaveStateSlots),
+                         ms / 1000.0)
+           : fmt::format("Load FAILED: {}", path.string());
     for (const auto& warning : emu->restore_warnings()) {
       text += "\n" + warning;
     }
@@ -5221,7 +5222,7 @@ void EmulatorWindow::UpdateStatusOverlay(const char* notify_title) {
     if (std::string(notify_title) == "Audio") {
       text = cvars::mute ? "Muted" : "Unmuted";
     } else {
-      text = normal_speed ? "Normal speed (1.00x)"
+      text = normal_speed   ? "Normal speed (1.00x)"
              : scalar > 1.0 ? fmt::format("Fast-forward {:.2f}x", scalar)
                             : fmt::format("Slow-motion {:.2f}x", scalar);
     }
@@ -5268,19 +5269,18 @@ void EmulatorWindow::StatusOverlayDialog::OnDraw(ImGuiIO& io) {
                        ImGuiWindowFlags_NoNav)) {
     ImGui::SetWindowFontScale(1.5f);
     if (cvars::show_fps) {
-      ImGui::TextColored(
-          emulator_window_.emulator_->is_title_open()
-              ? ImVec4(0.6f, 1.0f, 0.6f, 1.0f)
-              : ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
-          "%s",
-          emulator_window_.emulator_->is_title_open()
-              ? fmt::format("{:.0f} FPS", fps_).c_str()
-              : "FPS: no title");
+      ImGui::TextColored(emulator_window_.emulator_->is_title_open()
+                             ? ImVec4(0.6f, 1.0f, 0.6f, 1.0f)
+                             : ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
+                         "%s",
+                         emulator_window_.emulator_->is_title_open()
+                             ? fmt::format("{:.0f} FPS", fps_).c_str()
+                             : "FPS: no title");
     }
     if (!normal_speed) {
-      std::string text =
-          scalar > 1.0 ? fmt::format(">> FAST-FORWARD {:.2f}x", scalar)
-                       : fmt::format("<< SLOW-MOTION {:.2f}x", scalar);
+      std::string text = scalar > 1.0
+                             ? fmt::format(">> FAST-FORWARD {:.2f}x", scalar)
+                             : fmt::format("<< SLOW-MOTION {:.2f}x", scalar);
       ImGui::TextColored(scalar > 1.0 ? ImVec4(1.0f, 0.85f, 0.2f, 1.0f)
                                       : ImVec4(0.5f, 0.8f, 1.0f, 1.0f),
                          "%s", text.c_str());
@@ -5416,8 +5416,7 @@ void DrawQrCodeCentered(const std::string& text, float module_px) {
 
 void CenteredText(const char* text) {
   ImGui::SetCursorPosX(std::max(
-      0.0f,
-      (ImGui::GetWindowSize().x - ImGui::CalcTextSize(text).x) * 0.5f));
+      0.0f, (ImGui::GetWindowSize().x - ImGui::CalcTextSize(text).x) * 0.5f));
   ImGui::TextUnformatted(text);
 }
 
@@ -5430,9 +5429,9 @@ void CenteredField(const char* id, const std::string& text) {
   ImGui::SetCursorPosX(
       std::max(0.0f, (ImGui::GetWindowSize().x - width) * 0.5f));
   ImGui::SetNextItemWidth(width);
-  ImGui::InputText(id, buffer.data(), buffer.size() + 1,
-                   ImGuiInputTextFlags_ReadOnly |
-                       ImGuiInputTextFlags_AutoSelectAll);
+  ImGui::InputText(
+      id, buffer.data(), buffer.size() + 1,
+      ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_AutoSelectAll);
 }
 
 // Label + QR code + copyable string, as one centred block.
@@ -5448,15 +5447,16 @@ void EmulatorWindow::SupportDialog::OnDraw(ImGuiIO& io) {
   ImGui::SetNextWindowPos(ImVec2(60, 60), ImGuiCond_FirstUseEver);
   bool dialog_open = true;
   ImGui::PushStyleVar(ImGuiStyleVar_WindowTitleAlign, ImVec2(0.5f, 0.5f));
-  if (!ImGui::Begin("Support Development", &dialog_open,
-                    ImGuiWindowFlags_NoCollapse |
-                        ImGuiWindowFlags_AlwaysAutoResize)) {
+  if (!ImGui::Begin(
+          "Support Development", &dialog_open,
+          ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
     ImGui::End();
     ImGui::PopStyleVar();
     return;
   }
   CenteredText("This build is free software by PeerLoom LLC.");
-  CenteredText("If you receive value from it, please consider returning value.");
+  CenteredText(
+      "If you receive value from it, please consider returning value.");
   ImGui::Spacing();
   if (!cvars::support_page_url.empty()) {
     const char* button_label = "Open the support page in the browser...";
@@ -5488,8 +5488,7 @@ void EmulatorWindow::SupportDialog::OnDraw(ImGuiIO& io) {
   }
   if (!cvars::support_coffee_url.empty()) {
     QrSection("Buy Me a Coffee (card)", "##support_coffee",
-              cvars::support_coffee_url, cvars::support_coffee_url,
-              module_px);
+              cvars::support_coffee_url, cvars::support_coffee_url, module_px);
   }
   ImGui::End();
   ImGui::PopStyleVar();
@@ -6326,13 +6325,13 @@ void EmulatorWindow::ClearDialogs() {
 
 #include <gtk/gtk.h>
 
-#include "xenia/ui/window_gtk.h"
-#include "xenia/kernel/xam/ui/gamercard_ui.h"
+#include "xenia/kernel/util/xex2_info.h"
 #include "xenia/kernel/xam/profile_manager.h"
+#include "xenia/kernel/xam/ui/gamercard_ui.h"
+#include "xenia/ui/window_gtk.h"
 #include "xenia/vfs/devices/disc_image_device.h"
 #include "xenia/vfs/devices/disc_zarchive_device.h"
 #include "xenia/vfs/file.h"
-#include "xenia/kernel/util/xex2_info.h"
 
 namespace xe {
 namespace app {
@@ -6437,10 +6436,14 @@ void NotifySettingsChanged() {
 // the restart rather than left wondering why nothing happened.
 const std::set<std::string>& RelaunchCvars() {
   static const std::set<std::string> names = {
-      "draw_resolution_scale_x",   "draw_resolution_scale_y",
-      "framerate_limit",           "render_target_path_vulkan",
-      "vulkan_sparse_shared_memory", "vulkan_pipeline_creation_threads",
-      "promote_vector_context_values", "dirty_region_tracking",
+      "draw_resolution_scale_x",
+      "draw_resolution_scale_y",
+      "framerate_limit",
+      "render_target_path_vulkan",
+      "vulkan_sparse_shared_memory",
+      "vulkan_pipeline_creation_threads",
+      "promote_vector_context_values",
+      "dirty_region_tracking",
   };
   return names;
 }
@@ -6543,11 +6546,11 @@ GtkWidget* AttachCheckWithHelp(GtkWidget* grid, int& row, GtkWidget* check,
 }
 
 // Combo over (value, label) pairs; on_change gets the chosen value.
-GtkWidget* AddCombo(GtkWidget* grid, int& row, const char* label,
-                    const char* name,
-              const std::vector<std::pair<std::string, std::string>>& choices,
-              const std::string& current,
-              std::function<void(const std::string&)> on_change) {
+GtkWidget* AddCombo(
+    GtkWidget* grid, int& row, const char* label, const char* name,
+    const std::vector<std::pair<std::string, std::string>>& choices,
+    const std::string& current,
+    std::function<void(const std::string&)> on_change) {
   gtk_grid_attach(GTK_GRID(grid), LabelWithHelp(label, name), 0, row, 1, 1);
   GtkWidget* combo = gtk_combo_box_text_new();
   int active = 0;
@@ -6561,33 +6564,31 @@ GtkWidget* AddCombo(GtkWidget* grid, int& row, const char* label,
   gtk_combo_box_set_active(GTK_COMBO_BOX(combo), active);
   gtk_widget_set_hexpand(combo, TRUE);
   std::string cvar_name = name ? name : "";
-  AttachSettingsCallback(combo, "changed",
-                         [choices, on_change, cvar_name](GtkWidget* w) {
-    int index = gtk_combo_box_get_active(GTK_COMBO_BOX(w));
-    if (index >= 0 && index < int(choices.size())) {
-      on_change(choices[index].first);
-    }
-    NoteSettingChanged(cvar_name.c_str());
-  });
+  AttachSettingsCallback(
+      combo, "changed", [choices, on_change, cvar_name](GtkWidget* w) {
+        int index = gtk_combo_box_get_active(GTK_COMBO_BOX(w));
+        if (index >= 0 && index < int(choices.size())) {
+          on_change(choices[index].first);
+        }
+        NoteSettingChanged(cvar_name.c_str());
+      });
   gtk_grid_attach(GTK_GRID(grid), combo, 1, row++, 1, 1);
   return combo;
 }
 
 GtkWidget* AddSpin(GtkWidget* grid, int& row, const char* label,
-                   const char* name,
-             double value, double min_value, double max_value,
-             std::function<void(double)> on_change) {
+                   const char* name, double value, double min_value,
+                   double max_value, std::function<void(double)> on_change) {
   gtk_grid_attach(GTK_GRID(grid), LabelWithHelp(label, name), 0, row, 1, 1);
   GtkWidget* spin = gtk_spin_button_new_with_range(min_value, max_value, 1.0);
   gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin), value);
   gtk_widget_set_halign(spin, GTK_ALIGN_START);
   std::string spin_cvar = name ? name : "";
-  AttachSettingsCallback(spin, "value-changed",
-                         [on_change, spin_cvar](GtkWidget* w) {
-                           on_change(gtk_spin_button_get_value(
-                               GTK_SPIN_BUTTON(w)));
-                           NoteSettingChanged(spin_cvar.c_str());
-                         });
+  AttachSettingsCallback(
+      spin, "value-changed", [on_change, spin_cvar](GtkWidget* w) {
+        on_change(gtk_spin_button_get_value(GTK_SPIN_BUTTON(w)));
+        NoteSettingChanged(spin_cvar.c_str());
+      });
   gtk_grid_attach(GTK_GRID(grid), spin, 1, row++, 1, 1);
   return spin;
 }
@@ -6595,9 +6596,9 @@ GtkWidget* AddSpin(GtkWidget* grid, int& row, const char* label,
 // Horizontal slider with the value shown; on_change fires on every step of a
 // drag, so callers should use SetGpuOptionDeferred.
 GtkWidget* AddScale(GtkWidget* grid, int& row, const char* label,
-                    const char* name,
-              double value, double min_value, double max_value, double step,
-              std::function<void(double)> on_change) {
+                    const char* name, double value, double min_value,
+                    double max_value, double step,
+                    std::function<void(double)> on_change) {
   gtk_grid_attach(GTK_GRID(grid), LabelWithHelp(label, name), 0, row, 1, 1);
   GtkWidget* scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL,
                                               min_value, max_value, step);
@@ -6690,10 +6691,10 @@ std::string GitBlobSha(const std::filesystem::path& path) {
     return "";
   }
   int code = 0;
-  std::string out = RunCommandCapture(
-      fmt::format("(printf 'blob {}\\0'; cat {}) | sha1sum", size,
-                  ShellQuote(path.string())),
-      &code);
+  std::string out =
+      RunCommandCapture(fmt::format("(printf 'blob {}\\0'; cat {}) | sha1sum",
+                                    size, ShellQuote(path.string())),
+                        &code);
   if (code != 0 || out.size() < 40) {
     return "";
   }
@@ -6739,7 +6740,8 @@ std::string JsonUnescape(const std::string& in) {
         if (i + 4 >= in.size()) {
           return out;
         }
-        uint32_t cp = uint32_t(strtoul(in.substr(i + 1, 4).c_str(), nullptr, 16));
+        uint32_t cp =
+            uint32_t(strtoul(in.substr(i + 1, 4).c_str(), nullptr, 16));
         i += 4;
         if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 < in.size() &&
             in[i + 1] == '\\' && in[i + 2] == 'u') {
@@ -6798,7 +6800,8 @@ bool SetPatchEnabledInFile(const std::filesystem::path& path,
   auto quoted_value = [](const std::string& t) {
     size_t q1 = t.find('"');
     size_t q2 = q1 == std::string::npos ? q1 : t.find('"', q1 + 1);
-    return q2 == std::string::npos ? std::string() : t.substr(q1 + 1, q2 - q1 - 1);
+    return q2 == std::string::npos ? std::string()
+                                   : t.substr(q1 + 1, q2 - q1 - 1);
   };
   bool in_patch = false;
   bool in_target = false;
@@ -6837,8 +6840,8 @@ bool SetPatchEnabledInFile(const std::filesystem::path& path,
       size_t hash = lines[i].find('#');
       std::string comment =
           hash == std::string::npos ? "" : " " + lines[i].substr(hash);
-      lines[i] = prefix + "is_enabled = " + (enabled ? "true" : "false") +
-                 comment;
+      lines[i] =
+          prefix + "is_enabled = " + (enabled ? "true" : "false") + comment;
       done = true;
     }
   }
@@ -6902,7 +6905,8 @@ std::string NormalisedBlobSha(const std::filesystem::path& path) {
   }
   std::string content((std::istreambuf_iterator<char>(in)),
                       std::istreambuf_iterator<char>());
-  static const std::regex enabled_true("(^|\n)([ \t]*is_enabled[ \t]*=[ \t]*)true");
+  static const std::regex enabled_true(
+      "(^|\n)([ \t]*is_enabled[ \t]*=[ \t]*)true");
   content = std::regex_replace(content, enabled_true, "$1$2false");
   std::error_code ec;
   std::filesystem::path temp =
@@ -6964,7 +6968,8 @@ const char* kCommunityPatchesRawUrl =
 
 std::optional<ui::VirtualKey> VirtualKeyFromGdk(guint keyval) {
   if (keyval >= GDK_KEY_F1 && keyval <= GDK_KEY_F24) {
-    return ui::VirtualKey(uint16_t(ui::VirtualKey::kF1) + (keyval - GDK_KEY_F1));
+    return ui::VirtualKey(uint16_t(ui::VirtualKey::kF1) +
+                          (keyval - GDK_KEY_F1));
   }
   if (keyval >= GDK_KEY_a && keyval <= GDK_KEY_z) {
     return ui::VirtualKey(uint16_t(ui::VirtualKey::kA) + (keyval - GDK_KEY_a));
@@ -7027,12 +7032,12 @@ PatchCategory GuessPatchCategory(const std::string& name,
   // The game's own toys, checked first: "Enable Debug Menu" is an extra even
   // though such menus are where the cheats usually live.
   static const char* kExtraWords[] = {
-      "debug menu",     "debug settings",   "developer menu",
-      "developer settings", "dev menu",     "test menu",
-      "level select",   "free cam",         "freecam",
-      "free camera",    "helicam",          "fly around",
-      "wireframe",      "skip intro",       "skip logo",
-      "skip video",     "skip movie",       "camera bounding box",
+      "debug menu",         "debug settings", "developer menu",
+      "developer settings", "dev menu",       "test menu",
+      "level select",       "free cam",       "freecam",
+      "free camera",        "helicam",        "fly around",
+      "wireframe",          "skip intro",     "skip logo",
+      "skip video",         "skip movie",     "camera bounding box",
   };
   for (const char* word : kExtraWords) {
     if (name_has(word)) {
@@ -7040,12 +7045,12 @@ PatchCategory GuessPatchCategory(const std::string& name,
     }
   }
   static const char* kCheatWords[] = {
-      "infinite",     "unlimited",    "god mode",     "godmode",
-      "invincib",     "no clip",      "noclip",       "one hit kill",
-      "one-hit kill", "instant kill", "unlock all",   "all items",
-      "all weapons",  "all character", "all cars",    "bottomless",
-      "max money",    "max health",   "max ammo",     "max level",
-      "max stats",    "never die",    "always win",   "no reload",
+      "infinite",     "unlimited",     "god mode",   "godmode",
+      "invincib",     "no clip",       "noclip",     "one hit kill",
+      "one-hit kill", "instant kill",  "unlock all", "all items",
+      "all weapons",  "all character", "all cars",   "bottomless",
+      "max money",    "max health",    "max ammo",   "max level",
+      "max stats",    "never die",     "always win", "no reload",
       "cheat",
   };
   for (const char* word : kCheatWords) {
@@ -7112,9 +7117,10 @@ void EmulatorWindow::RefreshSettingsWindow() {
       auto* cp = emulator_->graphics_system()
                      ? emulator_->graphics_system()->command_processor()
                      : nullptr;
-      text = cp ? fmt::format("in use: {}x{}", cp->zpd_draw_resolution_scale_x(),
-                              cp->zpd_draw_resolution_scale_y())
-                : "";
+      text =
+          cp ? fmt::format("in use: {}x{}", cp->zpd_draw_resolution_scale_x(),
+                           cp->zpd_draw_resolution_scale_y())
+             : "";
     }
     gtk_label_set_text(GTK_LABEL(widget), text.c_str());
   }
@@ -7227,19 +7233,17 @@ void EmulatorWindow::ToggleSettingsWindow() {
         return;
       }
       const size_t count = config::GameConfigValues(title_hex).size();
-      gtk_label_set_text(
-          GTK_LABEL(status),
-          count ? fmt::format("{} setting{} saved for this game", count,
-                              count == 1 ? "" : "s")
-                      .c_str()
-                : "No settings saved for this game yet");
+      gtk_label_set_text(GTK_LABEL(status),
+                         count ? fmt::format("{} setting{} saved for this game",
+                                             count, count == 1 ? "" : "s")
+                                     .c_str()
+                               : "No settings saved for this game yet");
       gtk_widget_set_sensitive(clear, count != 0);
     };
     refresh_status();
     // Also after a setting is written, so the count is current.
     settings_refresh_hooks_.push_back(refresh_status);
-    auto* refresh_holder =
-        new std::function<void()>(refresh_status);
+    auto* refresh_holder = new std::function<void()>(refresh_status);
     g_signal_connect_data(
         check, "toggled", G_CALLBACK(+[](GtkWidget* w, gpointer data) {
           auto* refresh = static_cast<std::function<void()>*>(data);
@@ -7291,8 +7295,8 @@ void EmulatorWindow::ToggleSettingsWindow() {
       // Output-size presets over the two scale cvars (a 720p title).
       int cx = std::clamp(cvars::draw_resolution_scale_x, 1, 7);
       int cy = std::clamp(cvars::draw_resolution_scale_y, 1, 7);
-      std::string current = cx == cy && cx >= 1 && cx <= 3 ? std::to_string(cx)
-                                                            : "custom";
+      std::string current =
+          cx == cy && cx >= 1 && cx <= 3 ? std::to_string(cx) : "custom";
       AddCombo(grid, row, "Output preset (for a 720p game; relaunch)",
                "draw_resolution_scale_x",
                {{"custom", "Custom (set width and height below)"},
@@ -7311,14 +7315,16 @@ void EmulatorWindow::ToggleSettingsWindow() {
                  // the window is reopened.
                });
     }
-    AddCombo(grid, row, "Resolution scale, width (relaunch)", "draw_resolution_scale_x",
-             scales, std::to_string(std::clamp(cvars::draw_resolution_scale_x, 1, 7)),
+    AddCombo(grid, row, "Resolution scale, width (relaunch)",
+             "draw_resolution_scale_x", scales,
+             std::to_string(std::clamp(cvars::draw_resolution_scale_x, 1, 7)),
              [this](const std::string& v) {
                SetGpuOption<int32_t>("draw_resolution_scale_x", std::stoi(v));
                RefreshSettingsWindow();
              });
-    AddCombo(grid, row, "Resolution scale, height (relaunch)", "draw_resolution_scale_y",
-             scales, std::to_string(std::clamp(cvars::draw_resolution_scale_y, 1, 7)),
+    AddCombo(grid, row, "Resolution scale, height (relaunch)",
+             "draw_resolution_scale_y", scales,
+             std::to_string(std::clamp(cvars::draw_resolution_scale_y, 1, 7)),
              [this](const std::string& v) {
                SetGpuOption<int32_t>("draw_resolution_scale_y", std::stoi(v));
                RefreshSettingsWindow();
@@ -7327,12 +7333,15 @@ void EmulatorWindow::ToggleSettingsWindow() {
     remember("scale_in_use", in_use);
     gtk_grid_attach(GTK_GRID(grid), in_use, 1, row++, 1, 1);
     int framerate_row = row;
-    AddSpin(grid, row,
-            cvars::vsync
-                ? "Frame rate limit, fps (0 = 60, from VSync; relaunch)"
-                : "Frame rate limit, fps (0 = unlimited, VSync is off; relaunch)",
-            "framerate_limit", double(cvars::framerate_limit), 0, 1000,
-            [](double v) { SetGpuOption<uint64_t>("framerate_limit", uint64_t(v)); });
+    AddSpin(
+        grid, row,
+        cvars::vsync
+            ? "Frame rate limit, fps (0 = 60, from VSync; relaunch)"
+            : "Frame rate limit, fps (0 = unlimited, VSync is off; relaunch)",
+        "framerate_limit", double(cvars::framerate_limit), 0, 1000,
+        [](double v) {
+          SetGpuOption<uint64_t>("framerate_limit", uint64_t(v));
+        });
     // What 0 means depends on VSync, so the wording follows it live.
     settings_refresh_hooks_.push_back([grid, framerate_row]() {
       GtkWidget* label = RowLabelText(grid, framerate_row);
@@ -7372,8 +7381,8 @@ void EmulatorWindow::ToggleSettingsWindow() {
       // Registered as a refresh hook below, so it re-runs whenever another
       // setting changes rather than only when the window is built.
       auto update_scaling_dependents = [this, &grid, &cas_sharpness,
-                                        &fsr_reduction, &scaling_note,
-                                        &cas_row, &fsr_row]() {
+                                        &fsr_reduction, &scaling_note, &cas_row,
+                                        &fsr_row]() {
         std::string mode = GetCvarValueForGuestOutputPaintEffect(
             GetGuestOutputPaintEffectForCvarValue(
                 cvars::postprocess_scaling_and_sharpening));
@@ -7388,9 +7397,10 @@ void EmulatorWindow::ToggleSettingsWindow() {
           // FSR only upscales while the frame is smaller than the output
           // (presenter.cc, the EASU pass loop); once the resolution scale
           // has caught up with the window it is just a sharpener.
-          uint32_t scaled_width = 1280u * std::max(
-              1, std::min(cvars::draw_resolution_scale_x, 7));
-          uint32_t window_width = window_ ? window_->GetActualPhysicalWidth() : 0;
+          uint32_t scaled_width =
+              1280u * std::max(1, std::min(cvars::draw_resolution_scale_x, 7));
+          uint32_t window_width =
+              window_ ? window_->GetActualPhysicalWidth() : 0;
           if (window_width && scaled_width >= window_width) {
             note =
                 "At this resolution scale the image already fills the window, "
@@ -7433,8 +7443,7 @@ void EmulatorWindow::ToggleSettingsWindow() {
           "postprocess_ffx_cas_additional_sharpness",
           cvars::postprocess_ffx_cas_additional_sharpness,
           PaintConfig::kCasAdditionalSharpnessMin,
-          PaintConfig::kCasAdditionalSharpnessMax, 0.01,
-          [this](double v) {
+          PaintConfig::kCasAdditionalSharpnessMax, 0.01, [this](double v) {
             SetGpuOptionDeferred<double>(
                 "postprocess_ffx_cas_additional_sharpness", v);
             ApplyDisplayConfigForCvars();
@@ -7445,8 +7454,7 @@ void EmulatorWindow::ToggleSettingsWindow() {
           "postprocess_ffx_fsr_sharpness_reduction",
           cvars::postprocess_ffx_fsr_sharpness_reduction,
           PaintConfig::kFsrSharpnessReductionMin,
-          PaintConfig::kFsrSharpnessReductionMax, 0.01,
-          [this](double v) {
+          PaintConfig::kFsrSharpnessReductionMax, 0.01, [this](double v) {
             SetGpuOptionDeferred<double>(
                 "postprocess_ffx_fsr_sharpness_reduction", v);
             ApplyDisplayConfigForCvars();
@@ -7454,36 +7462,36 @@ void EmulatorWindow::ToggleSettingsWindow() {
       update_scaling_dependents();
       // The same check, holding what it needs by value: the locals above are
       // gone by the time a later change fires this.
-      settings_refresh_hooks_.push_back(
-          [this, grid, cas_sharpness, fsr_reduction, scaling_note, cas_row,
-           fsr_row]() {
-            std::string mode = GetCvarValueForGuestOutputPaintEffect(
-                GetGuestOutputPaintEffectForCvarValue(
-                    cvars::postprocess_scaling_and_sharpening));
-            bool is_fsr = mode == "fsr";
-            bool is_cas = mode == "cas";
-            SetRowSensitive(grid, cas_row, cas_sharpness, is_fsr || is_cas);
-            SetRowSensitive(grid, fsr_row, fsr_reduction, is_fsr);
-            std::string note;
-            if (is_fsr) {
-              uint32_t scaled_width =
-                  1280u * std::max(1, std::min(cvars::draw_resolution_scale_x, 7));
-              uint32_t window_width =
-                  window_ ? window_->GetActualPhysicalWidth() : 0;
-              if (window_width && scaled_width >= window_width) {
-                note =
-                    "At this resolution scale the image already fills the "
-                    "window, so FSR has nothing to upscale and only sharpens. "
-                    "Lower the scale to let it upscale, or pick CAS.";
-              }
-            } else if (is_cas) {
-              note = "FSR settings do not apply to CAS.";
-            } else {
-              note = "Bilinear does no sharpening, so neither slider applies.";
-            }
-            gtk_label_set_text(GTK_LABEL(scaling_note), note.c_str());
-            gtk_widget_set_visible(scaling_note, !note.empty());
-          });
+      settings_refresh_hooks_.push_back([this, grid, cas_sharpness,
+                                         fsr_reduction, scaling_note, cas_row,
+                                         fsr_row]() {
+        std::string mode = GetCvarValueForGuestOutputPaintEffect(
+            GetGuestOutputPaintEffectForCvarValue(
+                cvars::postprocess_scaling_and_sharpening));
+        bool is_fsr = mode == "fsr";
+        bool is_cas = mode == "cas";
+        SetRowSensitive(grid, cas_row, cas_sharpness, is_fsr || is_cas);
+        SetRowSensitive(grid, fsr_row, fsr_reduction, is_fsr);
+        std::string note;
+        if (is_fsr) {
+          uint32_t scaled_width =
+              1280u * std::max(1, std::min(cvars::draw_resolution_scale_x, 7));
+          uint32_t window_width =
+              window_ ? window_->GetActualPhysicalWidth() : 0;
+          if (window_width && scaled_width >= window_width) {
+            note =
+                "At this resolution scale the image already fills the "
+                "window, so FSR has nothing to upscale and only sharpens. "
+                "Lower the scale to let it upscale, or pick CAS.";
+          }
+        } else if (is_cas) {
+          note = "FSR settings do not apply to CAS.";
+        } else {
+          note = "Bilinear does no sharpening, so neither slider applies.";
+        }
+        gtk_label_set_text(GTK_LABEL(scaling_note), note.c_str());
+        gtk_widget_set_visible(scaling_note, !note.empty());
+      });
       {
         GtkWidget* dither =
             gtk_check_button_new_with_label("Dither the output to 8 bits");
@@ -7491,9 +7499,8 @@ void EmulatorWindow::ToggleSettingsWindow() {
                                      cvars::postprocess_dither);
         SetTooltipFromCvar(dither, "postprocess_dither");
         AttachSettingsCallback(dither, "toggled", [this](GtkWidget* w) {
-          SetGpuOption<bool>(
-              "postprocess_dither",
-              gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(w)));
+          SetGpuOption<bool>("postprocess_dither", gtk_toggle_button_get_active(
+                                                       GTK_TOGGLE_BUTTON(w)));
           ApplyDisplayConfigForCvars();
         });
         AttachCheckWithHelp(grid, row, dither, "postprocess_dither");
@@ -7565,8 +7572,13 @@ void EmulatorWindow::ToggleSettingsWindow() {
                SetGpuOption<std::string>("readback_resolve", v);
              });
     AddCombo(grid, row, "Anisotropic filtering", "anisotropic_override",
-             {{"-1", "No override"}, {"0", "Off"}, {"1", "1x"}, {"2", "2x"},
-              {"3", "4x"}, {"4", "8x"}, {"5", "16x"}},
+             {{"-1", "No override"},
+              {"0", "Off"},
+              {"1", "1x"},
+              {"2", "2x"},
+              {"3", "4x"},
+              {"4", "8x"},
+              {"5", "16x"}},
              std::to_string(cvars::anisotropic_override),
              [](const std::string& v) {
                SetGpuOption<int32_t>("anisotropic_override", std::stoi(v));
@@ -7674,8 +7686,8 @@ void EmulatorWindow::ToggleSettingsWindow() {
   {
     GtkWidget* box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
     gtk_container_set_border_width(GTK_CONTAINER(box), 8);
-    GtkWidget* grid = NewSection(box, "Window (takes effect on the next run)",
-                                 true);
+    GtkWidget* grid =
+        NewSection(box, "Window (takes effect on the next run)", true);
     int row = 0;
 
     // The displays this machine has, by the name the system gives them, so a
@@ -7701,9 +7713,9 @@ void EmulatorWindow::ToggleSettingsWindow() {
       }
     }
     AddCombo(grid, row, "Open on display", "display_index", displays,
-             std::to_string(cvars::display_index),
-             [](const std::string& v) {
-               SetGpuOption<int32_t>("display_index", int32_t(std::atoi(v.c_str())));
+             std::to_string(cvars::display_index), [](const std::string& v) {
+               SetGpuOption<int32_t>("display_index",
+                                     int32_t(std::atoi(v.c_str())));
              });
     AddCheck(grid, row, "Start in fullscreen", "fullscreen", cvars::fullscreen);
 
@@ -7786,7 +7798,8 @@ void EmulatorWindow::ToggleSettingsWindow() {
              });
     gtk_grid_attach(GTK_GRID(grid), HeadingLabel("Media player (XMP)"), 0,
                     row++, 2, 1);
-    GtkWidget* xmp = gtk_button_new_with_label("Open the media player panel...");
+    GtkWidget* xmp =
+        gtk_button_new_with_label("Open the media player panel...");
     AttachSettingsCallback(xmp, "clicked",
                            [this](GtkWidget*) { ToggleXMPConfigDialog(); });
     gtk_widget_set_halign(xmp, GTK_ALIGN_START);
@@ -7796,7 +7809,6 @@ void EmulatorWindow::ToggleSettingsWindow() {
     gtk_grid_attach(GTK_GRID(grid), note, 0, row++, 2, 1);
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), TabScroller(grid),
                              gtk_label_new("Audio"));
-
   }
 
   // ---- Input: controllers and keyboard hotkeys ----
@@ -7820,8 +7832,8 @@ void EmulatorWindow::ToggleSettingsWindow() {
     gtk_grid_attach(GTK_GRID(grid), vibration, 0, row++, 4, 1);
     AddCheck(grid, row, "Forward the guide button to the game", "guide_button",
              cvars::guide_button);
-    GtkWidget* overlay = gtk_button_new_with_label(
-        "Show the controller hotkeys overlay");
+    GtkWidget* overlay =
+        gtk_button_new_with_label("Show the controller hotkeys overlay");
     AttachSettingsCallback(overlay, "clicked",
                            [this](GtkWidget*) { DisplayHotKeysConfig(); });
     gtk_widget_set_halign(overlay, GTK_ALIGN_START);
@@ -7952,36 +7964,35 @@ void EmulatorWindow::ToggleSettingsWindow() {
 
   g_signal_connect(
       win, "key-press-event",
-      G_CALLBACK(+[](GtkWidget* w, GdkEventKey* event,
-                     gpointer data) -> gboolean {
-        auto* self = static_cast<EmulatorWindow*>(data);
-        if (self->settings_capture_action_ < 0) {
-          // Escape closes the window, for the same reason the Close button
-          // exists: there may be no title bar to close it from.
-          if (event->keyval == GDK_KEY_Escape) {
-            gtk_widget_destroy(w);
+      G_CALLBACK(
+          +[](GtkWidget* w, GdkEventKey* event, gpointer data) -> gboolean {
+            auto* self = static_cast<EmulatorWindow*>(data);
+            if (self->settings_capture_action_ < 0) {
+              // Escape closes the window, for the same reason the Close button
+              // exists: there may be no title bar to close it from.
+              if (event->keyval == GDK_KEY_Escape) {
+                gtk_widget_destroy(w);
+                return TRUE;
+              }
+              return FALSE;
+            }
+            if (event->keyval == GDK_KEY_Escape) {
+              self->settings_capture_action_ = -1;
+              self->RefreshSettingsWindow();
+              return TRUE;
+            }
+            auto key = VirtualKeyFromGdk(event->keyval);
+            if (!key) {
+              return TRUE;  // modifiers and unassignable keys: keep waiting
+            }
+            int a = self->settings_capture_action_;
+            self->settings_capture_action_ = -1;
+            self->SetActionHotkey(HotkeyAction(a), *key);
+            self->RefreshSettingsWindow();
             return TRUE;
-          }
-          return FALSE;
-        }
-        if (event->keyval == GDK_KEY_Escape) {
-          self->settings_capture_action_ = -1;
-          self->RefreshSettingsWindow();
-          return TRUE;
-        }
-        auto key = VirtualKeyFromGdk(event->keyval);
-        if (!key) {
-          return TRUE;  // modifiers and unassignable keys: keep waiting
-        }
-        int a = self->settings_capture_action_;
-        self->settings_capture_action_ = -1;
-        self->SetActionHotkey(HotkeyAction(a), *key);
-        self->RefreshSettingsWindow();
-        return TRUE;
-      }),
+          }),
       this);
-  g_signal_connect(win, "destroy",
-                   G_CALLBACK(+[](GtkWidget*, gpointer data) {
+  g_signal_connect(win, "destroy", G_CALLBACK(+[](GtkWidget*, gpointer data) {
                      auto* self = static_cast<EmulatorWindow*>(data);
                      self->settings_window_ = nullptr;
                      // Anything written after this window is gone belongs in
@@ -8014,7 +8025,6 @@ void EmulatorWindow::ToggleSettingsWindow() {
   XELOGI("Settings window opened");
 }
 
-
 // ---- Game library dashboard ----
 
 namespace {
@@ -8030,12 +8040,12 @@ enum DashboardColumn {
   kColRegion,
   kColDiscs,
   kColRating,
-  kColIndex,        // int: index into library_titles_
-  kColSeconds,      // int64 sort key
-  kColLastPlayedTs, // int64 sort key
-  kColSizeBytes,    // int64 sort key
-  kColRatingValue,  // int sort key
-  kColIcon,         // GdkPixbuf*, 32 px
+  kColIndex,         // int: index into library_titles_
+  kColSeconds,       // int64 sort key
+  kColLastPlayedTs,  // int64 sort key
+  kColSizeBytes,     // int64 sort key
+  kColRatingValue,   // int sort key
+  kColIcon,          // GdkPixbuf*, 32 px
   kColCount
 };
 
@@ -8047,10 +8057,18 @@ std::string RegionText(uint32_t region) {
     return "All";
   }
   std::vector<std::string> parts;
-  if (region & 0x000000FF) parts.push_back("NTSC-U");
-  if (region & 0x0000FF00) parts.push_back("NTSC-J");
-  if (region & 0x00FF0000) parts.push_back("PAL");
-  if (region & 0xFF000000) parts.push_back("Other");
+  if (region & 0x000000FF) {
+    parts.push_back("NTSC-U");
+  }
+  if (region & 0x0000FF00) {
+    parts.push_back("NTSC-J");
+  }
+  if (region & 0x00FF0000) {
+    parts.push_back("PAL");
+  }
+  if (region & 0xFF000000) {
+    parts.push_back("Other");
+  }
   std::string out;
   for (auto& part : parts) {
     out += (out.empty() ? "" : ", ") + part;
@@ -8100,7 +8118,8 @@ EmulatorWindow::LibraryTitle* EmulatorWindow::LibraryEntryFor(
     const std::filesystem::path& path) {
   std::error_code ec;
   for (auto& title : library_titles_) {
-    if (title.path == path || std::filesystem::equivalent(title.path, path, ec)) {
+    if (title.path == path ||
+        std::filesystem::equivalent(title.path, path, ec)) {
       return &title;
     }
   }
@@ -8232,7 +8251,9 @@ void EmulatorWindow::LoadLibrary() {
       continue;
     }
     LibraryTitle title;
-    title.path = t->get_as<std::string>("path") ? t->get_as<std::string>("path")->get() : "";
+    title.path = t->get_as<std::string>("path")
+                     ? t->get_as<std::string>("path")->get()
+                     : "";
     if (title.path.empty()) {
       continue;
     }
@@ -8245,11 +8266,13 @@ void EmulatorWindow::LoadLibrary() {
       return v ? v->get() : 0;
     };
     title.type = str("type");
-    title.title_id = uint32_t(std::strtoul(str("title_id").c_str(), nullptr, 16));
+    title.title_id =
+        uint32_t(std::strtoul(str("title_id").c_str(), nullptr, 16));
     title.title_name = str("title_name");
     title.disc_number = uint8_t(num("disc_number"));
     title.disc_count = uint8_t(num("disc_count"));
-    title.media_id = uint32_t(std::strtoul(str("media_id").c_str(), nullptr, 16));
+    title.media_id =
+        uint32_t(std::strtoul(str("media_id").c_str(), nullptr, 16));
     title.region = uint32_t(std::strtoul(str("region").c_str(), nullptr, 16));
     title.size = uint64_t(num("size"));
     title.seconds_played = num("seconds_played");
@@ -8305,8 +8328,8 @@ bool EmulatorWindow::ReadTitleInfo(LibraryTitle& title) {
       device = std::make_unique<vfs::DiscImageDevice>("\\Device\\LibraryScan",
                                                       title.path);
     } else {
-      device = std::make_unique<vfs::DiscZarchiveDevice>("\\Device\\LibraryScan",
-                                                         title.path);
+      device = std::make_unique<vfs::DiscZarchiveDevice>(
+          "\\Device\\LibraryScan", title.path);
     }
     if (!device->Initialize()) {
       return false;
@@ -8316,7 +8339,8 @@ bool EmulatorWindow::ReadTitleInfo(LibraryTitle& title) {
       return false;
     }
     vfs::File* file = nullptr;
-    if (entry->Open(vfs::FileAccess::kFileReadData, &file) != X_STATUS_SUCCESS ||
+    if (entry->Open(vfs::FileAccess::kFileReadData, &file) !=
+            X_STATUS_SUCCESS ||
         !file) {
       return false;
     }
@@ -8352,7 +8376,8 @@ bool EmulatorWindow::ReadTitleInfo(LibraryTitle& title) {
   }
   uint32_t security = xex->security_offset;
   if (security + 0x180 <= header.size()) {
-    title.region = xe::load_and_swap<uint32_t>(header.data() + security + 0x178);
+    title.region =
+        xe::load_and_swap<uint32_t>(header.data() + security + 0x178);
   }
   return title.title_id != 0;
 }
@@ -8402,7 +8427,10 @@ void EmulatorWindow::ScanLibrary() {
       continue;
     }
     std::string ext = xe::utf8::lower_ascii(entry.path().extension().string());
-    std::string type = ext == ".iso" ? "ISO" : ext == ".xex" ? "XEX" : ext == ".zar" ? "ZAR" : "";
+    std::string type = ext == ".iso"   ? "ISO"
+                       : ext == ".xex" ? "XEX"
+                       : ext == ".zar" ? "ZAR"
+                                       : "";
     if (type.empty()) {
       continue;
     }
@@ -8436,8 +8464,9 @@ void EmulatorWindow::ScanLibrary() {
     return !std::filesystem::exists(t.path, ec) ||
            xe::utf8::lower_ascii(t.path.extension().string()) == ".m3u";
   });
-  XELOGI("Library: {} scanned, {} new, {} without a readable XEX header, {} total",
-         root.string(), added, unreadable, library_titles_.size());
+  XELOGI(
+      "Library: {} scanned, {} new, {} without a readable XEX header, {} total",
+      root.string(), added, unreadable, library_titles_.size());
   if (added) {
     SaveLibrary();
   }
@@ -8471,9 +8500,10 @@ gboolean DashboardVisibleFunc(GtkTreeModel* model, GtkTreeIter* iter,
 bool EmulatorWindow::DashboardRowVisible(void* model_ptr, void* iter_ptr) {
   auto* model = static_cast<GtkTreeModel*>(model_ptr);
   auto* iter = static_cast<GtkTreeIter*>(iter_ptr);
-  gchar *type = nullptr, *title = nullptr, *title_id = nullptr, *region = nullptr;
-  gtk_tree_model_get(model, iter, kColType, &type, kColTitle, &title, kColTitleId,
-                     &title_id, kColRegion, &region, -1);
+  gchar *type = nullptr, *title = nullptr, *title_id = nullptr,
+        *region = nullptr;
+  gtk_tree_model_get(model, iter, kColType, &type, kColTitle, &title,
+                     kColTitleId, &title_id, kColRegion, &region, -1);
   bool visible = true;
   if (dashboard_search_) {
     std::string needle =
@@ -8494,8 +8524,7 @@ bool EmulatorWindow::DashboardRowVisible(void* model_ptr, void* iter_ptr) {
   if (visible && dashboard_region_) {
     int r = gtk_combo_box_get_active(GTK_COMBO_BOX(dashboard_region_));
     static const char* kRegions[] = {"", "NTSC-U", "NTSC-J", "PAL"};
-    if (r > 0 && r < 4 &&
-        (!region || !std::strstr(region, kRegions[r])) &&
+    if (r > 0 && r < 4 && (!region || !std::strstr(region, kRegions[r])) &&
         !(region && !std::strcmp(region, "All"))) {
       visible = false;
     }
@@ -8562,12 +8591,14 @@ void EmulatorWindow::BuildDashboard() {
       G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING,
       G_TYPE_INT, G_TYPE_INT64, G_TYPE_INT64, G_TYPE_INT64, G_TYPE_INT,
       GDK_TYPE_PIXBUF);
-  GtkTreeModel* filter = gtk_tree_model_filter_new(GTK_TREE_MODEL(store), nullptr);
+  GtkTreeModel* filter =
+      gtk_tree_model_filter_new(GTK_TREE_MODEL(store), nullptr);
   gtk_tree_model_filter_set_visible_func(GTK_TREE_MODEL_FILTER(filter),
                                          DashboardVisibleFunc, this, nullptr);
   GtkTreeModel* sortable = gtk_tree_model_sort_new_with_model(filter);
   GtkWidget* view = gtk_tree_view_new_with_model(sortable);
-  gtk_tree_view_set_grid_lines(GTK_TREE_VIEW(view), GTK_TREE_VIEW_GRID_LINES_HORIZONTAL);
+  gtk_tree_view_set_grid_lines(GTK_TREE_VIEW(view),
+                               GTK_TREE_VIEW_GRID_LINES_HORIZONTAL);
   struct Col {
     const char* title;
     int column;
@@ -8590,9 +8621,8 @@ void EmulatorWindow::BuildDashboard() {
     g_object_set(renderer, "xalign", c.xalign, "xpad", 8, "ypad", 6, nullptr);
     GtkTreeViewColumn* column = gtk_tree_view_column_new_with_attributes(
         c.title, renderer, "text", c.column, nullptr);
-    gtk_tree_view_column_set_cell_data_func(column, renderer,
-                                            DashboardRowBackground, nullptr,
-                                            nullptr);
+    gtk_tree_view_column_set_cell_data_func(
+        column, renderer, DashboardRowBackground, nullptr, nullptr);
     gtk_tree_view_column_set_sort_column_id(column, c.sort_column);
     gtk_tree_view_column_set_resizable(column, TRUE);
     gtk_tree_view_column_set_expand(column, c.expand);
@@ -8604,9 +8634,8 @@ void EmulatorWindow::BuildDashboard() {
     g_object_set(pix, "xpad", 6, "ypad", 2, nullptr);
     GtkTreeViewColumn* column = gtk_tree_view_column_new_with_attributes(
         "", pix, "pixbuf", kColIcon, nullptr);
-    gtk_tree_view_column_set_cell_data_func(column, pix,
-                                            DashboardRowBackground, nullptr,
-                                            nullptr);
+    gtk_tree_view_column_set_cell_data_func(column, pix, DashboardRowBackground,
+                                            nullptr, nullptr);
     gtk_tree_view_insert_column(GTK_TREE_VIEW(view), column, 0);
   }
   gtk_tree_sortable_set_sort_column_id(GTK_TREE_SORTABLE(sortable),
@@ -8624,20 +8653,20 @@ void EmulatorWindow::BuildDashboard() {
   gtk_icon_view_set_column_spacing(GTK_ICON_VIEW(grid), 12);
   gtk_icon_view_set_row_spacing(GTK_ICON_VIEW(grid), 12);
   gtk_icon_view_set_margin(GTK_ICON_VIEW(grid), 12);
-  g_signal_connect(grid, "item-activated",
-                   G_CALLBACK(+[](GtkIconView* icon_view, GtkTreePath* path,
-                                  gpointer data) {
-                     auto* w = static_cast<EmulatorWindow*>(data);
-                     GtkTreeModel* model = gtk_icon_view_get_model(icon_view);
-                     GtkTreeIter iter;
-                     if (!gtk_tree_model_get_iter(model, &iter, path)) {
-                       return;
-                     }
-                     gint index = -1;
-                     gtk_tree_model_get(model, &iter, 2, &index, -1);
-                     w->LaunchLibraryIndex(index);
-                   }),
-                   this);
+  g_signal_connect(
+      grid, "item-activated",
+      G_CALLBACK(+[](GtkIconView* icon_view, GtkTreePath* path, gpointer data) {
+        auto* w = static_cast<EmulatorWindow*>(data);
+        GtkTreeModel* model = gtk_icon_view_get_model(icon_view);
+        GtkTreeIter iter;
+        if (!gtk_tree_model_get_iter(model, &iter, path)) {
+          return;
+        }
+        gint index = -1;
+        gtk_tree_model_get(model, &iter, 2, &index, -1);
+        w->LaunchLibraryIndex(index);
+      }),
+      this);
   GtkWidget* grid_scroller = gtk_scrolled_window_new(nullptr, nullptr);
   gtk_container_add(GTK_CONTAINER(grid_scroller), grid);
   GtkWidget* stack = gtk_stack_new();
@@ -8657,7 +8686,7 @@ void EmulatorWindow::BuildDashboard() {
   gtk_toggle_button_set_mode(GTK_TOGGLE_BUTTON(grid_button), FALSE);
   gtk_toggle_button_set_active(
       GTK_TOGGLE_BUTTON(cvars::library_view == "grid" ? grid_button
-                                                       : list_button),
+                                                      : list_button),
       TRUE);
   auto on_view = +[](GtkToggleButton* button, gpointer data) {
     if (!gtk_toggle_button_get_active(button)) {
@@ -8707,35 +8736,34 @@ void EmulatorWindow::BuildDashboard() {
   g_signal_connect(search, "search-changed", G_CALLBACK(+refilter), this);
   g_signal_connect(type, "changed", G_CALLBACK(+refilter), this);
   g_signal_connect(region, "changed", G_CALLBACK(+refilter), this);
-  g_signal_connect(rescan, "clicked",
-                   G_CALLBACK(+[](GtkWidget*, gpointer data) {
-                     auto* w = static_cast<EmulatorWindow*>(data);
-                     // Say why rather than doing nothing: with no folder set,
-                     // or one that has gone away, a scan has nothing to walk
-                     // and the button looked broken.
-                     std::error_code ec;
-                     if (cvars::games_dir.empty()) {
-                       xe::ShowSimpleMessageBox(
-                           xe::SimpleMessageBoxType::Warning,
-                           "No games folder is set, so there is nothing to "
-                           "scan.\n\nUse \"Games folder...\" to choose the "
-                           "folder holding your .iso, .xex or .zar files.");
-                       return;
-                     }
-                     if (!std::filesystem::is_directory(
-                             std::filesystem::path(cvars::games_dir), ec)) {
-                       xe::ShowSimpleMessageBox(
-                           xe::SimpleMessageBoxType::Warning,
-                           "The games folder is set to\n\n  " +
-                               cvars::games_dir +
-                               "\n\nwhich is not a folder that can be read. "
-                               "Use \"Games folder...\" to pick another.");
-                       return;
-                     }
-                     w->ScanLibrary();
-                     w->RefreshDashboard();
-                   }),
-                   this);
+  g_signal_connect(
+      rescan, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer data) {
+        auto* w = static_cast<EmulatorWindow*>(data);
+        // Say why rather than doing nothing: with no folder set,
+        // or one that has gone away, a scan has nothing to walk
+        // and the button looked broken.
+        std::error_code ec;
+        if (cvars::games_dir.empty()) {
+          xe::ShowSimpleMessageBox(
+              xe::SimpleMessageBoxType::Warning,
+              "No games folder is set, so there is nothing to "
+              "scan.\n\nUse \"Games folder...\" to choose the "
+              "folder holding your .iso, .xex or .zar files.");
+          return;
+        }
+        if (!std::filesystem::is_directory(
+                std::filesystem::path(cvars::games_dir), ec)) {
+          xe::ShowSimpleMessageBox(
+              xe::SimpleMessageBoxType::Warning,
+              "The games folder is set to\n\n  " + cvars::games_dir +
+                  "\n\nwhich is not a folder that can be read. "
+                  "Use \"Games folder...\" to pick another.");
+          return;
+        }
+        w->ScanLibrary();
+        w->RefreshDashboard();
+      }),
+      this);
   g_signal_connect(folder, "clicked",
                    G_CALLBACK(+[](GtkWidget*, gpointer data) {
                      auto* w = static_cast<EmulatorWindow*>(data);
@@ -8744,32 +8772,31 @@ void EmulatorWindow::BuildDashboard() {
                      w->RefreshDashboard();
                    }),
                    this);
-  g_signal_connect(back, "clicked",
-                   G_CALLBACK(+[](GtkWidget*, gpointer data) {
+  g_signal_connect(back, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer data) {
                      static_cast<EmulatorWindow*>(data)->ShowDashboard(false);
                    }),
                    this);
   // Double-click: launch.
-  g_signal_connect(
-      view, "row-activated",
-      G_CALLBACK(+[](GtkTreeView* tree, GtkTreePath* path, GtkTreeViewColumn*,
-                     gpointer data) {
-        auto* w = static_cast<EmulatorWindow*>(data);
-        GtkTreeModel* model = gtk_tree_view_get_model(tree);
-        GtkTreeIter iter;
-        if (!gtk_tree_model_get_iter(model, &iter, path)) {
-          return;
-        }
-        gint index = -1;
-        gtk_tree_model_get(model, &iter, kColIndex, &index, -1);
-        if (index >= 0 && index < int(w->library_titles_.size())) {
-          // Through LaunchLibraryIndex, like the grid view and the Launch
-          // menu item: launching the file itself skips the playlist, so a
-          // multi-disc title started here knew nothing about its other discs.
-          w->LaunchLibraryIndex(index);
-        }
-      }),
-      this);
+  g_signal_connect(view, "row-activated",
+                   G_CALLBACK(+[](GtkTreeView* tree, GtkTreePath* path,
+                                  GtkTreeViewColumn*, gpointer data) {
+                     auto* w = static_cast<EmulatorWindow*>(data);
+                     GtkTreeModel* model = gtk_tree_view_get_model(tree);
+                     GtkTreeIter iter;
+                     if (!gtk_tree_model_get_iter(model, &iter, path)) {
+                       return;
+                     }
+                     gint index = -1;
+                     gtk_tree_model_get(model, &iter, kColIndex, &index, -1);
+                     if (index >= 0 && index < int(w->library_titles_.size())) {
+                       // Through LaunchLibraryIndex, like the grid view and the
+                       // Launch menu item: launching the file itself skips the
+                       // playlist, so a multi-disc title started here knew
+                       // nothing about its other discs.
+                       w->LaunchLibraryIndex(index);
+                     }
+                   }),
+                   this);
   // Right-click: rating and folder.
   g_signal_connect(
       view, "button-press-event",
@@ -8801,42 +8828,47 @@ void EmulatorWindow::BuildDashboard() {
         auto add = [&](const char* label, int rating) {
           GtkWidget* item = gtk_menu_item_new_with_label(label);
           g_object_set_data(G_OBJECT(item), "rating", GINT_TO_POINTER(rating));
-          g_signal_connect(item, "activate",
-                           G_CALLBACK(+[](GtkWidget* item, gpointer data) {
-                             auto* w = static_cast<EmulatorWindow*>(data);
-                             int rating = GPOINTER_TO_INT(
-                                 g_object_get_data(G_OBJECT(item), "rating"));
-                             int i = w->dashboard_menu_index_;
-                             if (i < 0 || i >= int(w->library_titles_.size())) {
-                               return;
-                             }
-                             if (rating == -1) {
-                               std::thread(LaunchFileExplorer,
-                                           w->library_titles_[i].path.parent_path())
-                                   .detach();
-                               return;
-                             }
-                             if (rating == -2) {
-                               w->LaunchLibraryIndex(i);
-                               return;
-                             }
-                             w->library_titles_[i].rating = rating;
-                             w->SaveLibrary();
-                             w->RefreshDashboard();
-                           }),
-                           w);
+          g_signal_connect(
+              item, "activate", G_CALLBACK(+[](GtkWidget* item, gpointer data) {
+                auto* w = static_cast<EmulatorWindow*>(data);
+                int rating = GPOINTER_TO_INT(
+                    g_object_get_data(G_OBJECT(item), "rating"));
+                int i = w->dashboard_menu_index_;
+                if (i < 0 || i >= int(w->library_titles_.size())) {
+                  return;
+                }
+                if (rating == -1) {
+                  std::thread(LaunchFileExplorer,
+                              w->library_titles_[i].path.parent_path())
+                      .detach();
+                  return;
+                }
+                if (rating == -2) {
+                  w->LaunchLibraryIndex(i);
+                  return;
+                }
+                w->library_titles_[i].rating = rating;
+                w->SaveLibrary();
+                w->RefreshDashboard();
+              }),
+              w);
           gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
         };
         add("Launch", -2);
-        gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu),
+                              gtk_separator_menu_item_new());
         for (int r = 5; r >= 1; --r) {
-          add((RatingText(r) + fmt::format("  {} star{}", r, r == 1 ? "" : "s")).c_str(), r);
+          add((RatingText(r) + fmt::format("  {} star{}", r, r == 1 ? "" : "s"))
+                  .c_str(),
+              r);
         }
         add("No rating", 0);
-        gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu),
+                              gtk_separator_menu_item_new());
         add("Open folder", -1);
         gtk_widget_show_all(menu);
-        gtk_menu_popup_at_pointer(GTK_MENU(menu), reinterpret_cast<GdkEvent*>(event));
+        gtk_menu_popup_at_pointer(GTK_MENU(menu),
+                                  reinterpret_cast<GdkEvent*>(event));
         return TRUE;
       }),
       this);
@@ -9017,9 +9049,8 @@ void EmulatorWindow::RefreshDashboardGrid() {
       std::string label = title && *title ? title : t.path.stem().string();
       GtkTreeIter row;
       gtk_list_store_append(grid_store, &row);
-      gtk_list_store_set(grid_store, &row, 0,
-                         TitleIconPixbuf(t.title_id, 96), 1, label.c_str(),
-                         2, index, -1);
+      gtk_list_store_set(grid_store, &row, 0, TitleIconPixbuf(t.title_id, 96),
+                         1, label.c_str(), 2, index, -1);
     }
     g_free(title);
   } while (gtk_tree_model_iter_next(model, &iter));
@@ -9130,7 +9161,8 @@ void EmulatorWindow::OnDashboardTitleLaunched() {
   if (!title) {
     LibraryTitle fresh;
     fresh.path = last_launched_path_;
-    std::string ext = xe::utf8::lower_ascii(last_launched_path_.extension().string());
+    std::string ext =
+        xe::utf8::lower_ascii(last_launched_path_.extension().string());
     if (ext == ".m3u") {
       // The playlist is not a library entry; its first disc is.
       const auto& playlist = emulator_->disc_playlist();
@@ -9141,7 +9173,10 @@ void EmulatorWindow::OnDashboardTitleLaunched() {
       fresh.path = playlist.front();
       ext = xe::utf8::lower_ascii(fresh.path.extension().string());
     }
-    fresh.type = ext == ".iso" ? "ISO" : ext == ".xex" ? "XEX" : ext == ".zar" ? "ZAR" : "";
+    fresh.type = ext == ".iso"   ? "ISO"
+                 : ext == ".xex" ? "XEX"
+                 : ext == ".zar" ? "ZAR"
+                                 : "";
     std::error_code ec;
     fresh.size = std::filesystem::file_size(fresh.path, ec);
     ReadTitleInfo(fresh);
@@ -9180,7 +9215,6 @@ void EmulatorWindow::AddPlayTime() {
   }
 }
 
-
 // ---- Preferences: Profiles tab ----
 
 // ---- Patches tab ----
@@ -9202,9 +9236,8 @@ std::map<uint32_t, std::string> EmulatorWindow::PatchTitles() {
     add(emulator_->title_id(), emulator_->title_name());
   }
   for (const LibraryTitle& title : library_titles_) {
-    add(title.title_id, title.title_name.empty()
-                            ? title.path.stem().string()
-                            : title.title_name);
+    add(title.title_id, title.title_name.empty() ? title.path.stem().string()
+                                                 : title.title_name);
   }
   if (auto* patcher = emulator_->patcher()) {
     for (const auto& file : patcher->patch_db()->GetAllPatches()) {
@@ -9313,9 +9346,9 @@ void EmulatorWindow::SavePatchCategories() {
   }
 }
 
-PatchCategory EmulatorWindow::PatchCategoryOf(
-    const std::filesystem::path& file, const std::string& name,
-    const std::string& desc) {
+PatchCategory EmulatorWindow::PatchCategoryOf(const std::filesystem::path& file,
+                                              const std::string& name,
+                                              const std::string& desc) {
   LoadPatchCategories();
   auto it = patch_categories_.find(PatchCategoryKey(file, name));
   if (it != patch_categories_.end()) {
@@ -9397,9 +9430,10 @@ std::vector<std::string> EmulatorWindow::DisableConflictingPatches(
       }
       if (SetPatchEnabledInFile(f.file_path, patch.patch_name, false)) {
         turned_off.push_back(patch.patch_name);
-        XELOGI("Patches: switched off '{}' in {}, it writes the same "
-               "address as '{}'",
-               patch.patch_name, f.file_path.filename().string(), name);
+        XELOGI(
+            "Patches: switched off '{}' in {}, it writes the same "
+            "address as '{}'",
+            patch.patch_name, f.file_path.filename().string(), name);
       }
     }
   }
@@ -9425,11 +9459,12 @@ void EmulatorWindow::BuildPatchCategoryPage(void* notebook_ptr,
 
   std::filesystem::path folder = emulator_->storage_root() / "patches";
   GtkWidget* intro = LeftLabel(
-      fmt::format("{} They all come from the same patch files "
-                  "(<tt>&lt;title id&gt; - &lt;name&gt;.patch.toml</tt>) in {}, "
-                  "sorted onto these tabs by what each one does. A change here "
-                  "applies when the game next starts.",
-                  PatchCategoryIntro(category), folder.string())
+      fmt::format(
+          "{} They all come from the same patch files "
+          "(<tt>&lt;title id&gt; - &lt;name&gt;.patch.toml</tt>) in {}, "
+          "sorted onto these tabs by what each one does. A change here "
+          "applies when the game next starts.",
+          PatchCategoryIntro(category), folder.string())
           .c_str());
   gtk_label_set_use_markup(GTK_LABEL(intro), TRUE);
   gtk_label_set_line_wrap(GTK_LABEL(intro), TRUE);
@@ -9495,8 +9530,9 @@ void EmulatorWindow::BuildPatchCategoryPage(void* notebook_ptr,
     GtkWidget* actions = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     GtkWidget* lookup = gtk_button_new_with_label("Look up");
     gtk_widget_set_tooltip_text(
-        lookup, "Fetch the list of patch files in the repository (needs curl "
-                "and a network connection) and match it against your games.");
+        lookup,
+        "Fetch the list of patch files in the repository (needs curl "
+        "and a network connection) and match it against your games.");
     AttachSettingsCallback(lookup, "clicked",
                            [this](GtkWidget*) { LookupCommunityPatches(); });
     gtk_box_pack_start(GTK_BOX(actions), lookup, FALSE, FALSE, 0);
@@ -9646,10 +9682,11 @@ void EmulatorWindow::RefreshPatchesTab() {
           }
           other_version = !match;
           note_text = match ? "Matches the running copy of the game."
-                            : fmt::format("For a different version of the game "
-                                          "(file: {}; running: {:016X}); it "
-                                          "will not apply.",
-                                          hashes, *running_hash);
+                            : fmt::format(
+                                  "For a different version of the game "
+                                  "(file: {}; running: {:016X}); it "
+                                  "will not apply.",
+                                  hashes, *running_hash);
         }
         GtkWidget* section = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
         if (other_version) {
@@ -9745,10 +9782,10 @@ void EmulatorWindow::RefreshPatchesTab() {
                 fmt::format("To {}", PatchCategoryTabName(target)).c_str());
             gtk_widget_set_valign(move, GTK_ALIGN_CENTER);
             gtk_widget_set_tooltip_text(
-                move, fmt::format("Show '{}' on the {} tab instead.",
-                                  patch->patch_name,
-                                  PatchCategoryTabName(target))
-                          .c_str());
+                move,
+                fmt::format("Show '{}' on the {} tab instead.",
+                            patch->patch_name, PatchCategoryTabName(target))
+                    .c_str());
             AttachSettingsCallback(
                 move, "clicked", [this, path, name, target](GtkWidget*) {
                   SetPatchCategory(path, name, target);
@@ -9783,17 +9820,17 @@ void EmulatorWindow::RefreshPatchesTab() {
     } else if (titles.empty()) {
       status = "No games known yet: run one, or set the games folder.";
     } else if (!file_count) {
-      status = fmt::format(
-          "No patch file for this game in {}.{}", folder.string(),
-          category == PatchCategory::kFix
-              ? " Look it up in the community list below."
-              : " Look it up on the Patches tab.");
+      status =
+          fmt::format("No patch file for this game in {}.{}", folder.string(),
+                      category == PatchCategory::kFix
+                          ? " Look it up in the community list below."
+                          : " Look it up on the Patches tab.");
     } else if (!entry_count) {
       status = fmt::format(
           "This game's patch file has no {}. {}",
-          category == PatchCategory::kCheat
-              ? "cheats"
-              : category == PatchCategory::kExtra ? "extras" : "patches",
+          category == PatchCategory::kCheat   ? "cheats"
+          : category == PatchCategory::kExtra ? "extras"
+                                              : "patches",
           "Anything sorted onto another tab can be moved here with its "
           "button.");
     } else if (!cvars::apply_patches) {
@@ -9848,11 +9885,11 @@ void EmulatorWindow::RefreshCommunityPatchList() {
     bool installed = state != CommunityFileState::kMissing;
     bool current = state == CommunityFileState::kCurrent;
     GtkWidget* row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    std::string text = fmt::format(
-        "{}{}   <i>{}</i>", mine ? "" : "",
-        g_markup_escape_text(file.name.c_str(), -1),
-        current ? "installed, up to date"
-                : installed ? "installed, update available" : "not installed");
+    std::string text = fmt::format("{}{}   <i>{}</i>", mine ? "" : "",
+                                   g_markup_escape_text(file.name.c_str(), -1),
+                                   current     ? "installed, up to date"
+                                   : installed ? "installed, update available"
+                                               : "not installed");
     GtkWidget* label = gtk_label_new(nullptr);
     gtk_label_set_markup(GTK_LABEL(label), text.c_str());
     gtk_widget_set_halign(label, GTK_ALIGN_START);
@@ -9899,8 +9936,7 @@ void EmulatorWindow::LookupCommunityPatches() {
     std::vector<CommunityPatchFile> files;
     std::string error;
     if (code != 0) {
-      error = fmt::format("curl failed ({}): {}", code,
-                          json.substr(0, 200));
+      error = fmt::format("curl failed ({}): {}", code, json.substr(0, 200));
     } else {
       size_t pos = 0;
       const std::string key = "\"path\":\"";
@@ -9919,15 +9955,14 @@ void EmulatorWindow::LookupCommunityPatches() {
         }
         std::string path = JsonUnescape(raw);
         size_t sha_pos = json.find("\"sha\":\"", end);
-        std::string sha = sha_pos == std::string::npos
-                              ? ""
-                              : json.substr(sha_pos + 7, 40);
+        std::string sha =
+            sha_pos == std::string::npos ? "" : json.substr(sha_pos + 7, 40);
         pos = end;
         const std::string prefix = "patches/";
         const std::string suffix = ".patch.toml";
         if (path.rfind(prefix, 0) != 0 || path.size() < suffix.size() ||
-            path.compare(path.size() - suffix.size(), suffix.size(),
-                         suffix) != 0) {
+            path.compare(path.size() - suffix.size(), suffix.size(), suffix) !=
+                0) {
           continue;
         }
         std::string name = path.substr(prefix.size());
@@ -9937,7 +9972,8 @@ void EmulatorWindow::LookupCommunityPatches() {
         CommunityPatchFile file;
         file.name = name;
         file.sha = sha;
-        file.title_id = uint32_t(strtoul(name.substr(0, 8).c_str(), nullptr, 16));
+        file.title_id =
+            uint32_t(strtoul(name.substr(0, 8).c_str(), nullptr, 16));
         files.push_back(std::move(file));
       }
       if (files.empty()) {
@@ -10021,9 +10057,9 @@ void EmulatorWindow::DownloadCommunityPatch(const std::string& name) {
         }
       }
       XELOGI("Patches: downloaded {}{}", name,
-             enabled.empty()
-                 ? ""
-                 : fmt::format(" ({} previously enabled kept)", enabled.size()));
+             enabled.empty() ? ""
+                             : fmt::format(" ({} previously enabled kept)",
+                                           enabled.size()));
       if (patcher) {
         patcher->patch_db()->Reload(true);
       }
@@ -10049,10 +10085,12 @@ void EmulatorWindow::BuildProfilesTab(void* notebook_ptr) {
   gtk_box_pack_start(GTK_BOX(box), scroller, TRUE, TRUE, 0);
 
   // Create a profile.
-  gtk_box_pack_start(GTK_BOX(box), HeadingLabel("New profile"), FALSE, FALSE, 0);
+  gtk_box_pack_start(GTK_BOX(box), HeadingLabel("New profile"), FALSE, FALSE,
+                     0);
   GtkWidget* row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
   GtkWidget* name = gtk_entry_new();
-  gtk_entry_set_placeholder_text(GTK_ENTRY(name), "Gamertag (up to 15 characters)");
+  gtk_entry_set_placeholder_text(GTK_ENTRY(name),
+                                 "Gamertag (up to 15 characters)");
   gtk_entry_set_max_length(GTK_ENTRY(name), 15);
   gtk_widget_set_hexpand(name, TRUE);
   GtkWidget* autologin = gtk_check_button_new_with_label("Sign in at start-up");
@@ -10062,23 +10100,25 @@ void EmulatorWindow::BuildProfilesTab(void* notebook_ptr) {
   gtk_box_pack_start(GTK_BOX(row), autologin, FALSE, FALSE, 0);
   gtk_box_pack_start(GTK_BOX(row), create, FALSE, FALSE, 0);
   gtk_box_pack_start(GTK_BOX(box), row, FALSE, FALSE, 0);
-  AttachSettingsCallback(create, "clicked", [this, name, autologin](GtkWidget*) {
-    std::string gamertag = gtk_entry_get_text(GTK_ENTRY(name));
-    auto* pm = emulator_->kernel_state()->xam_state()->profile_manager();
-    if (!pm || !kernel::xam::ProfileManager::IsGamertagValid(gamertag)) {
-      new xe::ui::HostNotificationWindow(
-          imgui_drawer(), "Profiles",
-          "Gamertag: 1 to 15 letters, digits and spaces, not starting with "
-          "a digit or a space.",
-          0);
-      return;
-    }
-    bool ok = pm->CreateProfile(
-        gamertag, gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(autologin)));
-    XELOGI("Profiles: create '{}' {}", gamertag, ok ? "ok" : "FAILED");
-    gtk_entry_set_text(GTK_ENTRY(name), "");
-    RefreshProfilesTab();
-  });
+  AttachSettingsCallback(
+      create, "clicked", [this, name, autologin](GtkWidget*) {
+        std::string gamertag = gtk_entry_get_text(GTK_ENTRY(name));
+        auto* pm = emulator_->kernel_state()->xam_state()->profile_manager();
+        if (!pm || !kernel::xam::ProfileManager::IsGamertagValid(gamertag)) {
+          new xe::ui::HostNotificationWindow(
+              imgui_drawer(), "Profiles",
+              "Gamertag: 1 to 15 letters, digits and spaces, not starting with "
+              "a digit or a space.",
+              0);
+          return;
+        }
+        bool ok = pm->CreateProfile(
+            gamertag,
+            gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(autologin)));
+        XELOGI("Profiles: create '{}' {}", gamertag, ok ? "ok" : "FAILED");
+        gtk_entry_set_text(GTK_ENTRY(name), "");
+        RefreshProfilesTab();
+      });
   GtkWidget* note = LeftLabel(
       "Migrate data from an older content layout and edit gamercards with the "
       "in-window panel:");
@@ -10145,10 +10185,13 @@ void EmulatorWindow::RefreshProfilesTab() {
         RefreshProfilesTab();
       });
     } else {
-      add_button("Sign in", [this, pm, id]() {
-        pm->Login(id);
-        RefreshProfilesTab();
-      }, pm->IsAnyProfileSlotFree());
+      add_button(
+          "Sign in",
+          [this, pm, id]() {
+            pm->Login(id);
+            RefreshProfilesTab();
+          },
+          pm->IsAnyProfileSlotFree());
       GtkWidget* slot_combo = gtk_combo_box_text_new();
       gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(slot_combo), "Slot...");
       for (int i = 1; i <= XUserMaxUserCount; ++i) {
@@ -10156,17 +10199,18 @@ void EmulatorWindow::RefreshProfilesTab() {
                                        fmt::format("Slot {}", i).c_str());
       }
       gtk_combo_box_set_active(GTK_COMBO_BOX(slot_combo), 0);
-      AttachSettingsCallback(slot_combo, "changed", [this, pm, id](GtkWidget* w) {
-        int index = gtk_combo_box_get_active(GTK_COMBO_BOX(w));
-        if (index >= 1) {
-          uint8_t target = uint8_t(index - 1);
-          if (auto* current = pm->GetProfile(target)) {
-            pm->Logout(target);
-          }
-          pm->Login(id, target);
-          RefreshProfilesTab();
-        }
-      });
+      AttachSettingsCallback(
+          slot_combo, "changed", [this, pm, id](GtkWidget* w) {
+            int index = gtk_combo_box_get_active(GTK_COMBO_BOX(w));
+            if (index >= 1) {
+              uint8_t target = uint8_t(index - 1);
+              if (auto* current = pm->GetProfile(target)) {
+                pm->Logout(target);
+              }
+              pm->Login(id, target);
+              RefreshProfilesTab();
+            }
+          });
       gtk_box_pack_start(GTK_BOX(row), slot_combo, FALSE, FALSE, 0);
     }
     add_button("Modify...", [this, id]() {
@@ -10176,19 +10220,22 @@ void EmulatorWindow::RefreshProfilesTab() {
     add_button("Content folder", [pm, id]() {
       std::thread(LaunchFileExplorer, pm->GetProfileContentPath(id)).detach();
     });
-    add_button("Delete...", [this, pm, id, account]() {
-      GtkWidget* dialog = gtk_message_dialog_new(
-          GTK_WINDOW(settings_window_), GTK_DIALOG_MODAL,
-          GTK_MESSAGE_WARNING, GTK_BUTTONS_YES_NO,
-          "Delete profile %s (%016lX) and everything saved under it?",
-          account.GetGamertagString().c_str(), (unsigned long)id);
-      int answer = gtk_dialog_run(GTK_DIALOG(dialog));
-      gtk_widget_destroy(dialog);
-      if (answer == GTK_RESPONSE_YES) {
-        pm->DeleteProfile(id);
-        RefreshProfilesTab();
-      }
-    }, !emulator_->is_title_open());
+    add_button(
+        "Delete...",
+        [this, pm, id, account]() {
+          GtkWidget* dialog = gtk_message_dialog_new(
+              GTK_WINDOW(settings_window_), GTK_DIALOG_MODAL,
+              GTK_MESSAGE_WARNING, GTK_BUTTONS_YES_NO,
+              "Delete profile %s (%016lX) and everything saved under it?",
+              account.GetGamertagString().c_str(), (unsigned long)id);
+          int answer = gtk_dialog_run(GTK_DIALOG(dialog));
+          gtk_widget_destroy(dialog);
+          if (answer == GTK_RESPONSE_YES) {
+            pm->DeleteProfile(id);
+            RefreshProfilesTab();
+          }
+        },
+        !emulator_->is_title_open());
     gtk_container_add(list, row);
   }
   gtk_widget_show_all(GTK_WIDGET(list));
@@ -10233,15 +10280,16 @@ void AddConsoleCombo(GtkWidget* grid, int& row, const char* label,
   select();
   refreshers.push_back(select);
   gtk_widget_set_hexpand(combo, TRUE);
-  AttachSettingsCallback(combo, "changed", [keys, &field, on_change](GtkWidget* w) {
-    int index = gtk_combo_box_get_active(GTK_COMBO_BOX(w));
-    if (index >= 0 && index < int(keys.size())) {
-      field = keys[index];
-      if (on_change) {
-        on_change(keys[index]);
-      }
-    }
-  });
+  AttachSettingsCallback(
+      combo, "changed", [keys, &field, on_change](GtkWidget* w) {
+        int index = gtk_combo_box_get_active(GTK_COMBO_BOX(w));
+        if (index >= 0 && index < int(keys.size())) {
+          field = keys[index];
+          if (on_change) {
+            on_change(keys[index]);
+          }
+        }
+      });
   gtk_grid_attach(GTK_GRID(grid), combo, 1, row++, 1, 1);
 }
 
@@ -10266,8 +10314,9 @@ void AddConsoleFlag(GtkWidget* grid, int& row, const char* label,
 
 void EmulatorWindow::BuildConsoleTab(void* notebook_ptr) {
   auto* notebook = static_cast<GtkWidget*>(notebook_ptr);
-  auto* xconfig = emulator_->kernel_state() ? emulator_->kernel_state()->xconfig()
-                                            : nullptr;
+  auto* xconfig = emulator_->kernel_state()
+                      ? emulator_->kernel_state()->xconfig()
+                      : nullptr;
   GtkWidget* outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
   gtk_container_set_border_width(GTK_CONTAINER(outer), 12);
   if (!xconfig) {
@@ -10294,41 +10343,46 @@ void EmulatorWindow::BuildConsoleTab(void* notebook_ptr) {
 
   grid = NewSection(sections, "User", true);
   row = 0;
-  AddConsoleFlag<uint32_t>(grid, row, "Disable daylight-saving time",
-                           data.user.retail_flags,
-                           uint32_t(kernel::X_RETAIL_FLAGS::DSTOff), refreshers);
+  AddConsoleFlag<uint32_t>(
+      grid, row, "Disable daylight-saving time", data.user.retail_flags,
+      uint32_t(kernel::X_RETAIL_FLAGS::DSTOff), refreshers);
   AddConsoleFlag<uint32_t>(
       grid, row, "24-hour clock", data.user.retail_flags,
       uint32_t(kernel::X_RETAIL_FLAGS::TwentyFourHourClock), refreshers);
   static const std::map<uint32_t, std::string> kLanguages = {
-      {1, "English"},    {2, "Japanese"},  {3, "German"},
-      {4, "French"},     {5, "Spanish"},   {6, "Italian"},
+      {1, "English"},    {2, "Japanese"},
+      {3, "German"},     {4, "French"},
+      {5, "Spanish"},    {6, "Italian"},
       {7, "Korean"},     {8, "Traditional Chinese"},
-      {9, "Portuguese"}, {11, "Polish"},   {12, "Russian"},
-      {13, "Swedish"},   {14, "Turkish"},  {15, "Norwegian"},
+      {9, "Portuguese"}, {11, "Polish"},
+      {12, "Russian"},   {13, "Swedish"},
+      {14, "Turkish"},   {15, "Norwegian"},
       {16, "Dutch"},     {17, "Simplified Chinese"}};
   AddConsoleCombo<uint32_t>(grid, row, "Language", kLanguages,
                             data.user.language, refreshers);
   static const std::map<uint8_t, std::string> kCountries = {
-      {1, "AE"},  {2, "AL"},  {3, "AM"},  {4, "AR"},  {5, "AT"},  {6, "AU"},
-      {7, "AZ"},  {8, "BE"},  {9, "BG"},  {10, "BH"}, {11, "BN"}, {12, "BO"},
-      {13, "BR"}, {14, "BY"}, {15, "BZ"}, {16, "CA"}, {18, "CH"}, {19, "CL"},
-      {20, "CN"}, {21, "CO"}, {22, "CR"}, {23, "CZ"}, {24, "DE"}, {25, "DK"},
-      {26, "DO"}, {27, "DZ"}, {28, "EC"}, {29, "EE"}, {30, "EG"}, {31, "ES"},
-      {32, "FI"}, {33, "FO"}, {34, "FR"}, {35, "GB"}, {36, "GE"}, {37, "GR"},
-      {38, "GT"}, {39, "HK"}, {40, "HN"}, {41, "HR"}, {42, "HU"}, {43, "ID"},
-      {44, "IE"}, {45, "IL"}, {46, "IN"}, {47, "IQ"}, {48, "IR"}, {49, "IS"},
-      {50, "IT"}, {51, "JM"}, {52, "JO"}, {53, "JP"}, {54, "KE"}, {55, "KG"},
-      {56, "KR"}, {57, "KW"}, {58, "KZ"}, {59, "LB"}, {60, "LI"}, {61, "LT"},
-      {62, "LU"}, {63, "LV"}, {64, "LY"}, {65, "MA"}, {66, "MC"}, {67, "MK"},
-      {68, "MN"}, {69, "MO"}, {70, "MV"}, {71, "MX"}, {72, "MY"}, {73, "NI"},
-      {74, "NL"}, {75, "NO"}, {76, "NZ"}, {77, "OM"}, {78, "PA"}, {79, "PE"},
-      {80, "PH"}, {81, "PK"}, {82, "PL"}, {83, "PR"}, {84, "PT"}, {85, "PY"},
-      {86, "QA"}, {87, "RO"}, {88, "RU"}, {89, "SA"}, {90, "SE"}, {91, "SG"},
-      {92, "SI"}, {93, "SK"}, {95, "SV"}, {96, "SY"}, {97, "TH"}, {98, "TN"},
-      {99, "TR"}, {100, "TT"}, {101, "TW"}, {102, "UA"}, {103, "US"},
-      {104, "UY"}, {105, "UZ"}, {106, "VE"}, {107, "VN"}, {108, "YE"},
-      {109, "ZA"}, {110, "ZW"}};
+      {1, "AE"},   {2, "AL"},   {3, "AM"},   {4, "AR"},   {5, "AT"},
+      {6, "AU"},   {7, "AZ"},   {8, "BE"},   {9, "BG"},   {10, "BH"},
+      {11, "BN"},  {12, "BO"},  {13, "BR"},  {14, "BY"},  {15, "BZ"},
+      {16, "CA"},  {18, "CH"},  {19, "CL"},  {20, "CN"},  {21, "CO"},
+      {22, "CR"},  {23, "CZ"},  {24, "DE"},  {25, "DK"},  {26, "DO"},
+      {27, "DZ"},  {28, "EC"},  {29, "EE"},  {30, "EG"},  {31, "ES"},
+      {32, "FI"},  {33, "FO"},  {34, "FR"},  {35, "GB"},  {36, "GE"},
+      {37, "GR"},  {38, "GT"},  {39, "HK"},  {40, "HN"},  {41, "HR"},
+      {42, "HU"},  {43, "ID"},  {44, "IE"},  {45, "IL"},  {46, "IN"},
+      {47, "IQ"},  {48, "IR"},  {49, "IS"},  {50, "IT"},  {51, "JM"},
+      {52, "JO"},  {53, "JP"},  {54, "KE"},  {55, "KG"},  {56, "KR"},
+      {57, "KW"},  {58, "KZ"},  {59, "LB"},  {60, "LI"},  {61, "LT"},
+      {62, "LU"},  {63, "LV"},  {64, "LY"},  {65, "MA"},  {66, "MC"},
+      {67, "MK"},  {68, "MN"},  {69, "MO"},  {70, "MV"},  {71, "MX"},
+      {72, "MY"},  {73, "NI"},  {74, "NL"},  {75, "NO"},  {76, "NZ"},
+      {77, "OM"},  {78, "PA"},  {79, "PE"},  {80, "PH"},  {81, "PK"},
+      {82, "PL"},  {83, "PR"},  {84, "PT"},  {85, "PY"},  {86, "QA"},
+      {87, "RO"},  {88, "RU"},  {89, "SA"},  {90, "SE"},  {91, "SG"},
+      {92, "SI"},  {93, "SK"},  {95, "SV"},  {96, "SY"},  {97, "TH"},
+      {98, "TN"},  {99, "TR"},  {100, "TT"}, {101, "TW"}, {102, "UA"},
+      {103, "US"}, {104, "UY"}, {105, "UZ"}, {106, "VE"}, {107, "VN"},
+      {108, "YE"}, {109, "ZA"}, {110, "ZW"}};
   AddConsoleCombo<uint8_t>(grid, row, "Country", kCountries, data.user.country,
                            refreshers);
   {
@@ -10346,20 +10400,18 @@ void EmulatorWindow::BuildConsoleTab(void* notebook_ptr) {
   AddConsoleFlag<uint8_t>(grid, row, "Parental control",
                           data.user.parental_control_flags,
                           uint8_t(kernel::X_PC_FLAGS::PCEnabled), refreshers);
-  AddConsoleFlag<uint32_t>(grid, row, "Dashboard initialized",
-                           data.user.retail_flags,
-                           uint32_t(kernel::X_RETAIL_FLAGS::DashboardInitialized),
-                           refreshers);
-  AddConsoleFlag<uint32_t>(grid, row, "IPTV initialized", data.user.retail_flags,
-                           uint32_t(kernel::X_RETAIL_FLAGS::IPTVEnabled),
-                           refreshers);
+  AddConsoleFlag<uint32_t>(
+      grid, row, "Dashboard initialized", data.user.retail_flags,
+      uint32_t(kernel::X_RETAIL_FLAGS::DashboardInitialized), refreshers);
+  AddConsoleFlag<uint32_t>(
+      grid, row, "IPTV initialized", data.user.retail_flags,
+      uint32_t(kernel::X_RETAIL_FLAGS::IPTVEnabled), refreshers);
   AddConsoleFlag<uint32_t>(grid, row, "DVR initialized", data.user.retail_flags,
                            uint32_t(kernel::X_RETAIL_FLAGS::IPTVDVREnabled),
                            refreshers);
-  AddConsoleFlag<uint32_t>(grid, row, "Kinect initialized",
-                           data.user.retail_flags,
-                           uint32_t(kernel::X_RETAIL_FLAGS::KinectInitialized),
-                           refreshers);
+  AddConsoleFlag<uint32_t>(
+      grid, row, "Kinect initialized", data.user.retail_flags,
+      uint32_t(kernel::X_RETAIL_FLAGS::KinectInitialized), refreshers);
 
   grid = NewSection(sections, "System: video", false);
   row = 0;
@@ -10383,33 +10435,35 @@ void EmulatorWindow::BuildConsoleTab(void* notebook_ptr) {
           // Widescreen follows the picked resolution, as the ImGui panel does.
           bool widescreen = kernel::Resolution(uint32_t(value)).is_widescreen();
           uint32_t flag = uint32_t(kernel::X_VIDEO_FLAGS::Widescreen);
-          data.user.video_flags = widescreen ? (data.user.video_flags.get() | flag)
-                                             : (data.user.video_flags.get() & ~flag);
+          data.user.video_flags = widescreen
+                                      ? (data.user.video_flags.get() | flag)
+                                      : (data.user.video_flags.get() & ~flag);
         });
   }
   AddConsoleFlag<uint32_t>(grid, row, "Widescreen", data.user.video_flags,
-                           uint32_t(kernel::X_VIDEO_FLAGS::Widescreen), refreshers);
+                           uint32_t(kernel::X_VIDEO_FLAGS::Widescreen),
+                           refreshers);
 
   grid = NewSection(sections, "System: audio", false);
   row = 0;
   AddConsoleFlag<uint32_t>(grid, row, "Mono", data.user.audio_flags,
-                           uint32_t(kernel::X_AUDIO_FLAGS::AnalogMono), refreshers);
+                           uint32_t(kernel::X_AUDIO_FLAGS::AnalogMono),
+                           refreshers);
   AddConsoleFlag<uint32_t>(grid, row, "Dolby Pro Logic", data.user.audio_flags,
                            uint32_t(kernel::X_AUDIO_FLAGS::DolbyProLogic),
                            refreshers);
   AddConsoleFlag<uint32_t>(grid, row, "Dolby Digital", data.user.audio_flags,
                            uint32_t(kernel::X_AUDIO_FLAGS::DolbyDigital),
                            refreshers);
-  AddConsoleFlag<uint32_t>(grid, row, "Dolby Digital with WMA Pro",
-                           data.user.audio_flags,
-                           uint32_t(kernel::X_AUDIO_FLAGS::DolbyDigitalWithWMAPRO),
-                           refreshers);
-  AddConsoleFlag<uint32_t>(grid, row, "Low latency (unsupported)",
-                           data.user.audio_flags,
-                           uint32_t(kernel::X_AUDIO_FLAGS::LowLatency), refreshers);
+  AddConsoleFlag<uint32_t>(
+      grid, row, "Dolby Digital with WMA Pro", data.user.audio_flags,
+      uint32_t(kernel::X_AUDIO_FLAGS::DolbyDigitalWithWMAPRO), refreshers);
+  AddConsoleFlag<uint32_t>(
+      grid, row, "Low latency (unsupported)", data.user.audio_flags,
+      uint32_t(kernel::X_AUDIO_FLAGS::LowLatency), refreshers);
   {
-    gtk_grid_attach(GTK_GRID(grid), LeftLabel("Music player volume (%)"), 0, row,
-                    1, 1);
+    gtk_grid_attach(GTK_GRID(grid), LeftLabel("Music player volume (%)"), 0,
+                    row, 1, 1);
     GtkWidget* spin = gtk_spin_button_new_with_range(0, 100, 5);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin),
                               double(data.user.music_volume.get()) * 100.0);
@@ -10427,7 +10481,8 @@ void EmulatorWindow::BuildConsoleTab(void* notebook_ptr) {
 
   // Save / Reset, like the ImGui panel: only while no title runs.
   GtkWidget* buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-  GtkWidget* save = gtk_button_new_with_label("Save to the console configuration");
+  GtkWidget* save =
+      gtk_button_new_with_label("Save to the console configuration");
   GtkWidget* reset = gtk_button_new_with_label("Reset to defaults");
   GtkWidget* status = LeftLabel(
       emulator_->is_title_open()

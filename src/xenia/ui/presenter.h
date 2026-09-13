@@ -408,8 +408,7 @@ class Presenter {
       int index) {
     return {};
   }
-  virtual void SetReShadeControlFromUIThread(int index,
-                                             const std::string& name,
+  virtual void SetReShadeControlFromUIThread(int index, const std::string& name,
                                              const float* values,
                                              int components) {}
   // Shader browser: the directory to list .fx files from. The loaded stack
@@ -826,7 +825,6 @@ class Presenter {
   // function multiple times is safer.
   // Whether the backend can execute the GuestOutputPaintEffect::kDlaa pass.
   virtual bool SupportsDlaaGuestOutputPaintEffect() const { return false; }
-
 
   GuestOutputPaintFlow GetGuestOutputPaintFlow(
       const GuestOutputProperties& properties, uint32_t host_rt_width,

@@ -158,13 +158,14 @@ dword_result_t NtReadFile_entry(dword_t file_handle, dword_t event_handle,
         // Diagnostic (first 200): a read that failed or came up short.
         static std::atomic<int> logged{0};
         if (logged++ < 200) {
-          XELOGI("NtReadFile {} h={:08X} off={} len={} got={} status={:08X} "
-                 "pos={} size={}",
-                 file->file() ? file->entry()->name() : "<unresolved>",
-                 uint32_t(file_handle),
-                 byte_offset_ptr ? int64_t(*byte_offset_ptr) : -1,
-                 uint32_t(buffer_length), bytes_read, uint32_t(result),
-                 file->position(), file->file() ? file->entry()->size() : 0);
+          XELOGI(
+              "NtReadFile {} h={:08X} off={} len={} got={} status={:08X} "
+              "pos={} size={}",
+              file->file() ? file->entry()->name() : "<unresolved>",
+              uint32_t(file_handle),
+              byte_offset_ptr ? int64_t(*byte_offset_ptr) : -1,
+              uint32_t(buffer_length), bytes_read, uint32_t(result),
+              file->position(), file->file() ? file->entry()->size() : 0);
         }
       }
 

@@ -92,7 +92,9 @@ bool GtkFilePicker::Show(Window* parent_window) {
       size_t start = 0;
       while (start <= patterns.size()) {
         size_t end = patterns.find(';', start);
-        if (end == std::string::npos) end = patterns.size();
+        if (end == std::string::npos) {
+          end = patterns.size();
+        }
         if (end > start) {
           std::string pattern = patterns.substr(start, end - start);
           // GTK glob "*.*" matches only names containing a dot, so the

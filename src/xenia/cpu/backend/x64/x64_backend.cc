@@ -315,9 +315,10 @@ void RecordGuestCodeForProfiler(uint32_t guest_address, void* host_code,
       return;
     }
   }
-  fprintf(g_code_map_file, "%llx %llx guest_%08X\n",
-          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(host_code)),
-          static_cast<unsigned long long>(host_code_length), guest_address);
+  fprintf(
+      g_code_map_file, "%llx %llx guest_%08X\n",
+      static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(host_code)),
+      static_cast<unsigned long long>(host_code_length), guest_address);
   fflush(g_code_map_file);
 }
 
@@ -440,15 +441,16 @@ bool X64Backend::Initialize(Processor* processor) {
         slimparams, GuestProfilerUpdateThreadProc));
 #if defined(XE_X64_PROFILER_TIME_SOURCE_IS_VARIABLE)
     if (cvars::instrument_call_times) {
-    // Must be running before any guest code is emitted: a time source stuck at
-    // zero would record every function as taking no time at all.
-    g_profiler_time_source = Clock::QueryHostSystemTime();
-    xe::threading::Thread::CreationParameters timesource_params;
-    timesource_params.create_suspended = false;
-    timesource_params.initial_priority = xe::threading::ThreadPriority::kHighest;
-    timesource_params.stack_size = 65536 * 4;
-    g_profiler_time_source_thread = std::move(xe::threading::Thread::Create(
-        timesource_params, GuestProfilerTimeSourceThreadProc));
+      // Must be running before any guest code is emitted: a time source stuck
+      // at zero would record every function as taking no time at all.
+      g_profiler_time_source = Clock::QueryHostSystemTime();
+      xe::threading::Thread::CreationParameters timesource_params;
+      timesource_params.create_suspended = false;
+      timesource_params.initial_priority =
+          xe::threading::ThreadPriority::kHighest;
+      timesource_params.stack_size = 65536 * 4;
+      g_profiler_time_source_thread = std::move(xe::threading::Thread::Create(
+          timesource_params, GuestProfilerTimeSourceThreadProc));
     }
 #endif
   }
@@ -657,14 +659,15 @@ uint64_t X64Backend::CalculateNextHostInstruction(ThreadDebugInfo* thread_info,
 
 void X64Backend::InstallBreakpoint(Breakpoint* breakpoint) {
   size_t installed = 0;
-  breakpoint->ForEachHostAddress([breakpoint, &installed](uint64_t host_address) {
-    ++installed;
-    auto ptr = reinterpret_cast<void*>(host_address);
-    auto original_bytes = xe::load_and_swap<uint16_t>(ptr);
-    assert_true(original_bytes != 0x0F0B);
-    xe::store_and_swap<uint16_t>(ptr, 0x0F0B);
-    breakpoint->backend_data().emplace_back(host_address, original_bytes);
-  });
+  breakpoint->ForEachHostAddress(
+      [breakpoint, &installed](uint64_t host_address) {
+        ++installed;
+        auto ptr = reinterpret_cast<void*>(host_address);
+        auto original_bytes = xe::load_and_swap<uint16_t>(ptr);
+        assert_true(original_bytes != 0x0F0B);
+        xe::store_and_swap<uint16_t>(ptr, 0x0F0B);
+        breakpoint->backend_data().emplace_back(host_address, original_bytes);
+      });
   XELOGI("InstallBreakpoint: guest {:08X} -> {} host address(es)",
          breakpoint->guest_address(), installed);
 }

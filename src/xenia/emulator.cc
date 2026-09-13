@@ -9,9 +9,9 @@
 
 #include <chrono>
 #include <condition_variable>
-#include <mutex>
-#include <fstream>
 #include <cstdio>
+#include <fstream>
+#include <mutex>
 #include <ranges>
 #include <thread>
 
@@ -25,8 +25,8 @@
 #include "third_party/zarchive/include/zarchive/zarchivecommon.h"
 #include "third_party/zarchive/include/zarchive/zarchivewriter.h"
 #include "third_party/zarchive/src/sha_256.h"
-#include "xenia/apu/audio_system.h"
 #include "xenia/apu/audio_driver.h"
+#include "xenia/apu/audio_system.h"
 #include "xenia/apu/xma_context.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_stream.h"
@@ -51,11 +51,12 @@
 #include "xenia/cpu/stack_walker.h"
 #include "xenia/cpu/thread_state.h"
 #include "xenia/gpu/command_processor.h"
-#include "xenia/gpu/render_target_cache.h"
 #include "xenia/gpu/graphics_system.h"
+#include "xenia/gpu/render_target_cache.h"
 #include "xenia/hid/input_driver.h"
 #include "xenia/hid/input_system.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/smc.h"
 #include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/xam/achievement_manager.h"
@@ -71,7 +72,6 @@
 #include "xenia/ui/window.h"
 #include "xenia/ui/windowed_app_context.h"
 #include "xenia/vfs/device.h"
-#include "xenia/kernel/smc.h"
 #include "xenia/vfs/devices/disc_image_device.h"
 #include "xenia/vfs/devices/disc_zarchive_device.h"
 #include "xenia/vfs/devices/host_path_device.h"
@@ -104,7 +104,8 @@ DEFINE_string(savestate_experiment_path, "xenia_experiment.sav",
               "Experiment: save state path.", "General");
 DEFINE_int32(savestate_experiment_cycles, 1,
              "Experiment: repeat the save+restore sequence this many times, "
-             "20 s apart.", "General");
+             "20 s apart.",
+             "General");
 DEFINE_int32(savestate_experiment_restore_repeat, 1,
              "Experiment: how many times to restore, 20 s apart.", "General");
 DEFINE_string(savestate_experiment_preload_path, "",
@@ -1324,8 +1325,7 @@ void Emulator::FrameAdvanceCheckpoint() {
   // stands, and a lock held by a suspended thread would strand the release.
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(2);
-  while (frame_advance_hold_ &&
-         std::chrono::steady_clock::now() < deadline) {
+  while (frame_advance_hold_ && std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::microseconds(200));
   }
 }
@@ -1372,9 +1372,10 @@ void Emulator::Pause(bool capture_edram) {
   }
 
   pause_guest_tick_count_ = Clock::QueryGuestTickCount();
-  XELOGI("! EMULATOR PAUSED ! ({} guest threads suspended, guest clock {:.3f} s)",
-         paused_threads_.size(),
-         double(pause_guest_tick_count_) / Clock::guest_tick_frequency());
+  XELOGI(
+      "! EMULATOR PAUSED ! ({} guest threads suspended, guest clock {:.3f} s)",
+      paused_threads_.size(),
+      double(pause_guest_tick_count_) / Clock::guest_tick_frequency());
   // Listeners may post to the UI thread; never do that while holding the
   // global critical region.
   lock.unlock();
@@ -1398,10 +1399,11 @@ void Emulator::Resume() {
     Clock::SetGuestTickCount(pause_guest_tick_count_);
     kernel_state_->UpdateKeTimestampBundle();
   }
-  XELOGI("! EMULATOR RESUMING ! guest clock {:.3f} s at pause, {:.3f} s now, {}",
-         double(pause_guest_tick_count_) / Clock::guest_tick_frequency(),
-         double(now_ticks) / Clock::guest_tick_frequency(),
-         cvars::pause_rewinds_guest_clock ? "set back" : "left running");
+  XELOGI(
+      "! EMULATOR RESUMING ! guest clock {:.3f} s at pause, {:.3f} s now, {}",
+      double(pause_guest_tick_count_) / Clock::guest_tick_frequency(),
+      double(now_ticks) / Clock::guest_tick_frequency(),
+      cvars::pause_rewinds_guest_clock ? "set back" : "left running");
   pause_guest_tick_count_ = 0;
 
   graphics_system_->Resume();
@@ -1471,8 +1473,12 @@ constexpr size_t kSaveStateHeaderSizeV3 = 48;
 static_assert(sizeof(SaveStateContainerHeader) == 64);
 
 size_t SaveStateHeaderSize(uint32_t version) {
-  if (version >= 6) return sizeof(SaveStateContainerHeader);
-  if (version >= 3) return kSaveStateHeaderSizeV3;
+  if (version >= 6) {
+    return sizeof(SaveStateContainerHeader);
+  }
+  if (version >= 3) {
+    return kSaveStateHeaderSizeV3;
+  }
   return kSaveStateHeaderSizeV2;
 }
 
@@ -1499,8 +1505,12 @@ bool ReadSaveStateHeader(FILE* file, SaveStateContainerHeader* header,
     header->version = 1;
     header->has_title_id = has_title_id;
     header->title_id = has_title_id ? title_id : 0;
-    if (out_legacy_title_id) *out_legacy_title_id = title_id;
-    if (out_legacy_has_title_id) *out_legacy_has_title_id = has_title_id;
+    if (out_legacy_title_id) {
+      *out_legacy_title_id = title_id;
+    }
+    if (out_legacy_has_title_id) {
+      *out_legacy_has_title_id = has_title_id;
+    }
     return true;
   }
   if (signature != kSaveStateContainerSignature) {
@@ -1512,8 +1522,8 @@ bool ReadSaveStateHeader(FILE* file, SaveStateContainerHeader* header,
   }
   if (header->version >= 3) {
     size_t rest = SaveStateHeaderSize(header->version) - kSaveStateHeaderSizeV2;
-    if (fread(reinterpret_cast<uint8_t*>(header) + kSaveStateHeaderSizeV2,
-              rest, 1, file) != 1) {
+    if (fread(reinterpret_cast<uint8_t*>(header) + kSaveStateHeaderSizeV2, rest,
+              1, file) != 1) {
       return false;
     }
   }
@@ -1731,12 +1741,11 @@ bool Emulator::SaveToFile(const std::filesystem::path& path,
   for (uint64_t offset = 0; write_ok && offset < raw_size;
        offset += kSaveStateChunkSize) {
     SaveStateChunkHeader chunk;
-    chunk.raw_size = uint32_t(std::min<uint64_t>(kSaveStateChunkSize,
-                                                 raw_size - offset));
-    int n = LZ4_compress_default(
-        reinterpret_cast<const char*>(buffer + offset),
-        reinterpret_cast<char*>(compressed.data()), int(chunk.raw_size),
-        int(compressed.size()));
+    chunk.raw_size =
+        uint32_t(std::min<uint64_t>(kSaveStateChunkSize, raw_size - offset));
+    int n = LZ4_compress_default(reinterpret_cast<const char*>(buffer + offset),
+                                 reinterpret_cast<char*>(compressed.data()),
+                                 int(chunk.raw_size), int(compressed.size()));
     const uint8_t* src = buffer + offset;
     chunk.stored_size = chunk.raw_size;
     if (n > 0 && uint32_t(n) < chunk.raw_size) {
@@ -1866,8 +1875,8 @@ bool Emulator::RestoreFromFile(const std::filesystem::path& path) {
         break;
       }
       if (chunk.stored_size == chunk.raw_size) {
-        read_ok = fread(buffer + offset, 1, chunk.raw_size, file) ==
-                  chunk.raw_size;
+        read_ok =
+            fread(buffer + offset, 1, chunk.raw_size, file) == chunk.raw_size;
       } else {
         read_ok = fread(compressed.data(), 1, chunk.stored_size, file) ==
                   chunk.stored_size;
@@ -1973,8 +1982,9 @@ bool Emulator::RestoreFromFile(const std::filesystem::path& path) {
           module->CalculateHash();
         }
         hash = module->hash();
-        XELOGW("RestoreFromFile: no launch-time module hash; using the hash "
-               "of the restored code, which may not match the patch DB");
+        XELOGW(
+            "RestoreFromFile: no launch-time module hash; using the hash "
+            "of the restored code, which may not match the patch DB");
       }
       XELOGI("RestoreFromFile: re-applying patches for {:08X} (hash {:016X})",
              module->title_id(), hash.value_or(0));
@@ -1997,10 +2007,11 @@ bool Emulator::RestoreFromFile(const std::filesystem::path& path) {
     pause_guest_tick_count_ = header.guest_tick_count;
     kernel_state_->set_timestamp_updates_paused(false);
     kernel_state_->UpdateKeTimestampBundle();
-    XELOGI("RestoreFromFile: guest clock set to {:.3f} s from the header (was "
-           "{:.3f} s)",
-           double(header.guest_tick_count) / Clock::guest_tick_frequency(),
-           double(now) / Clock::guest_tick_frequency());
+    XELOGI(
+        "RestoreFromFile: guest clock set to {:.3f} s from the header (was "
+        "{:.3f} s)",
+        double(header.guest_tick_count) / Clock::guest_tick_frequency(),
+        double(now) / Clock::guest_tick_frequency());
   } else {
     XELOGW(
         "RestoreFromFile: format {} file has no guest clock; timed steps in "
@@ -2036,9 +2047,10 @@ bool Emulator::RestoreFromFile(const std::filesystem::path& path) {
       // to re-issue that call.
       if (thread->suspend_count() > 0 &&
           !thread->restored_self_suspend_pending()) {
-        XELOGI("RestoreFromFile: thread {:08X} left suspended (guest suspend "
-               "count {})",
-               thread->handle(), thread->suspend_count());
+        XELOGI(
+            "RestoreFromFile: thread {:08X} left suspended (guest suspend "
+            "count {})",
+            thread->handle(), thread->suspend_count());
         continue;
       }
       paused_threads_.push_back(thread);
@@ -2110,8 +2122,7 @@ std::string Emulator::SaveStateMismatch(const SaveStateFileInfo& info) const {
   return "";
 }
 
-bool Emulator::ReadDiscInfo(const std::filesystem::path& path,
-                            DiscInfo* out) {
+bool Emulator::ReadDiscInfo(const std::filesystem::path& path, DiscInfo* out) {
   if (!out) {
     return false;
   }
@@ -2135,12 +2146,12 @@ bool Emulator::ReadDiscInfo(const std::filesystem::path& path,
       header.resize(n);
     } break;
     case FileSignatureType::XISO:
-      device = std::make_unique<vfs::DiscImageDevice>("\\Device\\DiscScan",
-                                                      path);
+      device =
+          std::make_unique<vfs::DiscImageDevice>("\\Device\\DiscScan", path);
       break;
     case FileSignatureType::ZAR:
-      device = std::make_unique<vfs::DiscZarchiveDevice>(
-          "\\Device\\DiscScan", path);
+      device =
+          std::make_unique<vfs::DiscZarchiveDevice>("\\Device\\DiscScan", path);
       break;
     default:
       return false;
@@ -2292,8 +2303,8 @@ std::filesystem::path Emulator::FindSiblingDisc(uint8_t n) {
 
   auto matches = [&](const std::filesystem::path& candidate) {
     DiscInfo info;
-    return ReadDiscInfo(candidate, &info) && info.title_id == title_id_.value() &&
-           info.disc_number == n;
+    return ReadDiscInfo(candidate, &info) &&
+           info.title_id == title_id_.value() && info.disc_number == n;
   };
 
   // The discs of a title are usually named alike, differing in one digit
@@ -2912,8 +2923,8 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
         // not the UI thread, which is where GTK used to crash the process.
         XELOGI("DISC SWAP EXPERIMENT: asking for disc {} through the picker",
                wanted);
-        const std::filesystem::path picked = GetNewDiscPath(
-            fmt::format("Insert disc {} (experiment)", wanted));
+        const std::filesystem::path picked =
+            GetNewDiscPath(fmt::format("Insert disc {} (experiment)", wanted));
         XELOGI("DISC SWAP EXPERIMENT: picker returned '{}'", picked.string());
         return;
       }
@@ -2926,9 +2937,10 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
         path = FindSiblingDisc(wanted);
       }
       if (path.empty()) {
-        XELOGE("DISC SWAP EXPERIMENT: no playlist, no path and no disc {} "
-               "beside the current one",
-               wanted);
+        XELOGE(
+            "DISC SWAP EXPERIMENT: no playlist, no path and no disc {} "
+            "beside the current one",
+            wanted);
         return;
       }
       XELOGI("DISC SWAP EXPERIMENT: asking for disc {} from {}", wanted,
@@ -2950,8 +2962,7 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
       const int period = cvars::stats_log_seconds;
       uint64_t swaps = 0, audio = 0, silent = 0, xma = 0, cbs = 0, starved = 0,
                vblanks = 0;
-      uint64_t draws = 0, passes = 0, rtxfers = 0, resolves = 0,
-               resolve_px = 0;
+      uint64_t draws = 0, passes = 0, rtxfers = 0, resolves = 0, resolve_px = 0;
       uint64_t ui_calls = 0, ui_calls_queued = 0;
       uint64_t rtxfer_bound = 0;
       uint64_t rtxfer_pushed = 0;
@@ -2974,21 +2985,24 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
         uint64_t d = gpu::CommandProcessor::stats_draw_count_.load();
         uint64_t rp = gpu::CommandProcessor::stats_render_pass_count_.load();
         uint64_t tx = gpu::RenderTargetCache::stats_transfer_count_.load();
-        uint64_t txb = gpu::RenderTargetCache::stats_transfer_bounded_eligible_.load();
-        uint64_t txp = gpu::RenderTargetCache::stats_transfer_bounded_pushed_.load();
+        uint64_t txb =
+            gpu::RenderTargetCache::stats_transfer_bounded_eligible_.load();
+        uint64_t txp =
+            gpu::RenderTargetCache::stats_transfer_bounded_pushed_.load();
         uint64_t rv = gpu::RenderTargetCache::stats_resolve_count_.load();
         uint64_t rvp = gpu::RenderTargetCache::stats_resolve_pixels_.load();
         uint64_t gt = gpu::CommandProcessor::stats_gpu_total_ns_.load();
         uint64_t gx = gpu::CommandProcessor::stats_gpu_transfer_ns_.load();
         uint64_t gr = gpu::CommandProcessor::stats_gpu_resolve_ns_.load();
         uint64_t sca = gpu::CommandProcessor::stats_scissor_area_sum_.load();
-        uint64_t fi = gpu::CommandProcessor::stats_gpu_fragment_invocations_.load();
+        uint64_t fi =
+            gpu::CommandProcessor::stats_gpu_fragment_invocations_.load();
         uint64_t vb = gpu::GraphicsSystem::stats_vblank_count_.load();
         uint64_t uic = ui::WindowedAppContext::stats_ui_calls_executed_.load();
         uint64_t uiq = ui::WindowedAppContext::stats_ui_calls_queued_.load();
-        double t = std::chrono::duration<double>(
-                       std::chrono::steady_clock::now() - t0)
-                       .count();
+        double t =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+                .count();
         XELOGI(
             "STATS t={:.0f}s guest={:.1f}s vblanks +{} ({:.1f}/s) swaps +{} "
             "({:.1f}/s) audio_frames "
@@ -3090,16 +3104,17 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
         }
         if (ok && cvars::savestate_experiment_restore_seconds >
                       cvars::savestate_experiment_save_seconds) {
-          std::this_thread::sleep_for(std::chrono::seconds(
-              cvars::savestate_experiment_restore_seconds -
-              cvars::savestate_experiment_save_seconds));
-          for (int i = 0; i < std::max(1, cvars::savestate_experiment_restore_repeat);
+          std::this_thread::sleep_for(
+              std::chrono::seconds(cvars::savestate_experiment_restore_seconds -
+                                   cvars::savestate_experiment_save_seconds));
+          for (int i = 0;
+               i < std::max(1, cvars::savestate_experiment_restore_repeat);
                ++i) {
             if (i) {
               std::this_thread::sleep_for(std::chrono::seconds(20));
             }
-            XELOGI("SAVESTATE EXPERIMENT: restoring from {} (#{})", path.string(),
-                   i + 1);
+            XELOGI("SAVESTATE EXPERIMENT: restoring from {} (#{})",
+                   path.string(), i + 1);
             t0 = std::chrono::steady_clock::now();
             ok = RestoreFromFile(path);
             ms = std::chrono::duration_cast<std::chrono::milliseconds>(

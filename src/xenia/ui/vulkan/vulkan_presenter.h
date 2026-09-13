@@ -11,14 +11,14 @@
 #define XENIA_UI_VULKAN_VULKAN_PRESENTER_H_
 
 #include <algorithm>
-#include <atomic>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <utility>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "xenia/base/assert.h"
@@ -27,9 +27,9 @@
 #include "xenia/ui/vulkan/ui_samplers.h"
 #include "xenia/ui/vulkan/vulkan_device.h"
 #include "xenia/ui/vulkan/vulkan_dlss.h"
-#include "xenia/ui/vulkan/vulkan_reshade.h"
 #include "xenia/ui/vulkan/vulkan_gpu_completion_timeline.h"
 #include "xenia/ui/vulkan/vulkan_instance.h"
+#include "xenia/ui/vulkan/vulkan_reshade.h"
 
 namespace xe {
 namespace ui {
@@ -622,10 +622,8 @@ class VulkanPresenter final : public Presenter {
   // One-shot readback of an image into 8bpc RGBA, awaiting its own
   // submission.
   bool CaptureImage(VkImage image, VkExtent2D image_extent,
-                    VkImageLayout image_layout,
-                    VkAccessFlags image_access_mask,
-                    VkPipelineStageFlags image_stage_mask,
-                    RawImage& image_out);
+                    VkImageLayout image_layout, VkAccessFlags image_access_mask,
+                    VkPipelineStageFlags image_stage_mask, RawImage& image_out);
   // Parses a preset file into a desired stack; false if unreadable.
   static bool ParseReShadePresetFile(
       const std::string& file, std::vector<ReShadeDesiredEffect>& effects);

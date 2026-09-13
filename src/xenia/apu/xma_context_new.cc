@@ -290,8 +290,7 @@ void XmaContextNew::Release() {
 void XmaContextNew::SaveState(ByteStream* stream) {
   stream->Write<uint32_t>(1);
   stream->Write<int32_t>(av_context_ ? av_context_->sample_rate : 0);
-  stream->Write<int32_t>(av_context_ ? av_context_->ch_layout.nb_channels
-                                     : 0);
+  stream->Write<int32_t>(av_context_ ? av_context_->ch_layout.nb_channels : 0);
   stream->Write<uint8_t>(current_frame_remaining_subframes_);
   stream->Write<uint8_t>(loop_frame_output_limit_);
   stream->Write<uint8_t>(loop_start_skip_pending_ ? 1 : 0);

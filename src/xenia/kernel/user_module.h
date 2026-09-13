@@ -125,7 +125,6 @@ class UserModule : public XModule {
   bool is_attached_ = false;
 
  private:
-
   std::string name_;
   std::string path_;
   std::optional<uint64_t> hash_ = std::nullopt;

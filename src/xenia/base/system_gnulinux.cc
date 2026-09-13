@@ -8,10 +8,10 @@
  */
 
 #include <alloca.h>
-#include <sys/wait.h>
-#include <unistd.h>
 #include <dlfcn.h>
 #include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <cstring>
 
@@ -38,9 +38,7 @@ static void XdgOpen(const std::string& target) {
   }
 }
 
-void LaunchWebBrowser(const std::string_view url) {
-  XdgOpen(std::string(url));
-}
+void LaunchWebBrowser(const std::string_view url) { XdgOpen(std::string(url)); }
 
 void LaunchFileExplorer(const std::filesystem::path& path) {
   XdgOpen(path.string());

@@ -11,8 +11,8 @@
 
 #include "xenia/base/clock.h"
 
-#include "xenia/apu/audio_system.h"
 #include "third_party/soundtouch/include/SoundTouch.h"
+#include "xenia/apu/audio_system.h"
 
 #include <algorithm>
 
@@ -56,8 +56,12 @@ SDLAudioDriver::~SDLAudioDriver() = default;
 namespace {
 enum class ScaledAudioMode { kResample, kStretch, kMute };
 ScaledAudioMode ParseScaledAudioMode(const std::string& value) {
-  if (value == "stretch") return ScaledAudioMode::kStretch;
-  if (value == "mute") return ScaledAudioMode::kMute;
+  if (value == "stretch") {
+    return ScaledAudioMode::kStretch;
+  }
+  if (value == "mute") {
+    return ScaledAudioMode::kMute;
+  }
   return ScaledAudioMode::kResample;
 }
 }  // namespace
@@ -177,8 +181,8 @@ void SDLAudioDriver::SubmitFrame(float* frame) {
   // plays silence of the scaled duration. The number of device frames
   // charged to this guest frame is channel_samples_ / scalar either way so
   // the producer's slot is released at the right average rate.
-  const double scalar = std::clamp(Clock::guest_time_scalar(), kMinAudioScalar,
-                                   kMaxAudioScalar);
+  const double scalar =
+      std::clamp(Clock::guest_time_scalar(), kMinAudioScalar, kMaxAudioScalar);
   const float* out = converted;
   size_t out_frames = channel_samples_;
   size_t charged_frames = channel_samples_;
@@ -207,7 +211,8 @@ void SDLAudioDriver::SubmitFrame(float* frame) {
     }
     stretcher_->setTempo(scalar);
     stretcher_->putSamples(converted, channel_samples_);
-    out_frames = stretcher_->receiveSamples(scratch, uint32_t(scratch_capacity));
+    out_frames =
+        stretcher_->receiveSamples(scratch, uint32_t(scratch_capacity));
     out = scratch;
     resample_position_ = 0.0;
   } else if (scalar != 1.0 && mode == ScaledAudioMode::kMute) {
@@ -308,18 +313,21 @@ void SDLAudioDriver::SDLCallback(void* userdata, Uint8* stream, int len) {
     starved_callback_count_.fetch_add(1, std::memory_order_relaxed);
   }
   if (available) {
-    size_t first = std::min(available, driver->ring_.size() - driver->ring_read_);
+    size_t first =
+        std::min(available, driver->ring_.size() - driver->ring_read_);
     std::memcpy(out, driver->ring_.data() + driver->ring_read_,
                 first * sizeof(float));
     if (available > first) {
       std::memcpy(out + first, driver->ring_.data(),
                   (available - first) * sizeof(float));
     }
-    driver->ring_read_ = (driver->ring_read_ + available) % driver->ring_.size();
+    driver->ring_read_ =
+        (driver->ring_read_ + available) % driver->ring_.size();
     driver->ring_count_ -= available;
   }
   if (available < wanted_floats) {
-    std::memset(out + available, 0, (wanted_floats - available) * sizeof(float));
+    std::memset(out + available, 0,
+                (wanted_floats - available) * sizeof(float));
   }
 
   if (cvars::mute) {

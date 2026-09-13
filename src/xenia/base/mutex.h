@@ -90,8 +90,8 @@ using xe_mutex = xe_fast_mutex;
 // Fast recursive mutex for Linux using futex
 // Mimics Windows CRITICAL_SECTION behavior: spin before blocking
 class alignas(4096) xe_global_mutex {
-  std::atomic<uint32_t> state_{0};  // 0 = unlocked, 1 = locked, 2 = contended
-  std::atomic<uint64_t> owner_{0};  // pthread_self() of the owner, 0 = free
+  std::atomic<uint32_t> state_{0};   // 0 = unlocked, 1 = locked, 2 = contended
+  std::atomic<uint64_t> owner_{0};   // pthread_self() of the owner, 0 = free
   std::atomic<pid_t> owner_tid_{0};  // diagnostics only (see owner())
   uint32_t recursion_count_{0};
 

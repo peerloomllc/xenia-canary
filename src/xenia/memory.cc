@@ -1998,8 +1998,8 @@ bool PhysicalHeap::AllocRange(uint32_t low_address, uint32_t high_address,
   // allocation above page size on that heap on Linux while the same call
   // succeeded on Windows.
   const uint32_t host_alignment = std::min(
-      alignment, std::max(page_size_,
-                          uint32_t(xe::memory::allocation_granularity())));
+      alignment,
+      std::max(page_size_, uint32_t(xe::memory::allocation_granularity())));
   if ((address + host_address_offset_) % host_alignment != 0) {
     XELOGE(
         "PhysicalHeap::AllocRange translated address {:08X} misaligned for the "

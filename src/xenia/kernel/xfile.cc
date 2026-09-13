@@ -424,8 +424,8 @@ object_ref<XFile> XFile::Restore(KernelState* kernel_state,
               nullptr, remapped, vfs::FileDisposition::kOpen, access,
               is_directory, false, &vfs_file, &action);
           if (XSUCCEEDED(res)) {
-            XELOGW("XFile {:08X}: {} reopened as {} on restore",
-                   file->handle(), abs_path, remapped);
+            XELOGW("XFile {:08X}: {} reopened as {} on restore", file->handle(),
+                   abs_path, remapped);
           }
         }
       }

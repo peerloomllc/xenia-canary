@@ -463,8 +463,8 @@ bool CommandProcessor::Save(ByteStream* stream) {
   // The guest reads registers back (scratch/fence registers above all), so
   // the register file is part of the state.
   stream->Write<uint32_t>(uint32_t(RegisterFile::kRegisterCount));
-  stream->Write(register_file_->values,
-                sizeof(register_file_->values[0]) * RegisterFile::kRegisterCount);
+  stream->Write(register_file_->values, sizeof(register_file_->values[0]) *
+                                            RegisterFile::kRegisterCount);
 
   // Format 8: the EDRAM contents read back at the pause (empty when the
   // backend could not provide them).
@@ -498,8 +498,8 @@ bool CommandProcessor::Restore(ByteStream* stream, bool has_edram_snapshot) {
            register_count);
     return false;
   }
-  stream->Read(register_file_->values,
-               sizeof(register_file_->values[0]) * RegisterFile::kRegisterCount);
+  stream->Read(register_file_->values, sizeof(register_file_->values[0]) *
+                                           RegisterFile::kRegisterCount);
 
   std::vector<uint8_t>().swap(edram_snapshot_);
   if (has_edram_snapshot) {

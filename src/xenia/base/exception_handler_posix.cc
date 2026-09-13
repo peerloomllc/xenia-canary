@@ -54,8 +54,8 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
       if (exception_pc_slot_) {
         previous = *exception_pc_slot_;  // Nested fault inside a handler.
 #if XE_ARCH_AMD64
-        *exception_pc_slot_ = uint64_t(
-            static_cast<ucontext_t*>(ctx)->uc_mcontext.gregs[REG_RIP]);
+        *exception_pc_slot_ =
+            uint64_t(static_cast<ucontext_t*>(ctx)->uc_mcontext.gregs[REG_RIP]);
 #else
         *exception_pc_slot_ = 1;
 #endif

@@ -705,9 +705,10 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
   // entries and are never placed again - every call to them then came back
   // here, under the global lock, and the game slowed to a crawl.
   if (fn->address() == static_cast<uint32_t>(target_address)) {
-    auto backend = static_cast<X64Backend*>(thread_state->processor()->backend());
-    backend->code_cache()->AddIndirection(
-        static_cast<uint32_t>(target_address), static_cast<uint32_t>(addr));
+    auto backend =
+        static_cast<X64Backend*>(thread_state->processor()->backend());
+    backend->code_cache()->AddIndirection(static_cast<uint32_t>(target_address),
+                                          static_cast<uint32_t>(addr));
   }
   return addr;
 }

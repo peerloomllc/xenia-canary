@@ -179,9 +179,9 @@ bool XamState::Restore(ByteStream* stream) {
   if (saved_xuid != current_xuid) {
     XELOGW("Restore: saved with profile {:016X} in slot 0, now {:016X}",
            saved_xuid, current_xuid);
-    kernel_state_->emulator()->AddRestoreWarning(fmt::format(
-        "saved with profile {:016X}, {:016X} is signed in", saved_xuid,
-        current_xuid));
+    kernel_state_->emulator()->AddRestoreWarning(
+        fmt::format("saved with profile {:016X}, {:016X} is signed in",
+                    saved_xuid, current_xuid));
   }
   return true;
 }

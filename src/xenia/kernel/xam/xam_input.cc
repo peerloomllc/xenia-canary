@@ -102,8 +102,8 @@ dword_result_t XamInputGetCapabilities_entry(
   XELOGD(
       "XamInputGetCapabilities(user {}, flags {:08X}) from lr={:08X} -> {} "
       "type {} subtype {}",
-      uint32_t(user_index), uint32_t(flags), uint32_t(ctx->lr), uint32_t(result),
-      caps ? caps->type : 0, caps ? caps->sub_type : 0);
+      uint32_t(user_index), uint32_t(flags), uint32_t(ctx->lr),
+      uint32_t(result), caps ? caps->type : 0, caps ? caps->sub_type : 0);
   return result;
 }
 DECLARE_XAM_EXPORT1(XamInputGetCapabilities, kInput, kSketchy);

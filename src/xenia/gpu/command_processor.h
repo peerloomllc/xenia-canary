@@ -211,9 +211,7 @@ class CommandProcessor {
   // Save states (format 8): the EDRAM contents. The backend fills `out` with
   // its EDRAM layout (kEdramSizeBytes times the resolution scale) and
   // uploads it again; both run on the worker thread. Default: no EDRAM.
-  virtual bool CaptureEdramSnapshot(std::vector<uint8_t>& out) {
-    return false;
-  }
+  virtual bool CaptureEdramSnapshot(std::vector<uint8_t>& out) { return false; }
   virtual bool RestoreEdramSnapshotSized(const void* data, size_t size,
                                          uint32_t scale_x, uint32_t scale_y) {
     return false;
@@ -522,7 +520,6 @@ class CommandProcessor {
   // Set by the backend when resolution scale changes.
   uint32_t zpd_draw_resolution_scale_x_ = 1;
   uint32_t zpd_draw_resolution_scale_y_ = 1;
-
 
  public:
   // The resolution scale in use (Display > Advanced GPU options shows it

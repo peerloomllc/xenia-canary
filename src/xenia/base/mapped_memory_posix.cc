@@ -67,8 +67,7 @@ class PosixMappedMemory : public MappedMemory {
     // touching a mapped page past EOF raises SIGBUS on Linux. Windows'
     // CreateFileMapping grows the file for the caller, so callers (such as
     // Emulator::SaveToFile with its 2 GiB map of an empty file) expect this.
-    if (mode == Mode::kReadWrite &&
-        uint64_t(offset) + map_length > file_size) {
+    if (mode == Mode::kReadWrite && uint64_t(offset) + map_length > file_size) {
       if (ftruncate(file_descriptor, off_t(uint64_t(offset) + map_length))) {
         close(file_descriptor);
         return nullptr;

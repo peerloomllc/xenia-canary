@@ -1062,9 +1062,9 @@ void VulkanPipelineCache::TranslateShadersForStorage(
         thread_features.vertex_pipeline_stores_and_atomics) {
       thread_features.dirty_bbox_vertex_binding = 1;
     }
-    SpirvShaderTranslator translator(
-        thread_features, msaa_2x_attachments,
-        msaa_2x_no_attachments, edram_fsi_used, draw_res_x, draw_res_y);
+    SpirvShaderTranslator translator(thread_features, msaa_2x_attachments,
+                                     msaa_2x_no_attachments, edram_fsi_used,
+                                     draw_res_x, draw_res_y);
 
     while (true) {
       size_t index = translation_index.fetch_add(1);

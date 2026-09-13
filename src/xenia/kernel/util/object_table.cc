@@ -364,8 +364,7 @@ void ObjectTable::GetObjectsByType(XObject::Type type,
   auto global_lock = global_critical_region_.Acquire();
   auto add = [&](XObject* object) {
     if (object && object->type() == type &&
-        std::find(results->begin(), results->end(), object) ==
-            results->end()) {
+        std::find(results->begin(), results->end(), object) == results->end()) {
       object->Retain();
       results->push_back(object_ref<XObject>(object));
     }
