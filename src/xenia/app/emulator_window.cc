@@ -169,6 +169,15 @@ DEFINE_string(screenshot_burst_dir, "",
 DEFINE_int32(ui_experiment_seconds, 30,
              "Experiment: delay before --ui_experiment_dialog opens.",
              "General");
+DEFINE_bool(warn_when_no_controller, true,
+            "Say so on screen when no slot has a controller a few seconds "
+            "after start. Input failing silently is hard to tell from a game "
+            "ignoring the pad.",
+            "HID");
+DEFINE_int32(no_controller_warning_seconds, 8,
+             "How long after start to check for a controller for "
+             "--warn_when_no_controller.",
+             "HID");
 DEFINE_string(frame_advance_hotkey, "F7",
               "Key that runs one frame and pauses again: same key names as "
               "pause_hotkey, or empty to disable.",
@@ -1377,6 +1386,71 @@ bool EmulatorWindow::Initialize() {
         } else {
           XELOGE("RESHADE CAPTURE: capture failed");
         }
+      });
+    }).detach();
+  }
+
+  // Input that fails outright says nothing, which is the worst way for it to
+  // go wrong: on a Steam Deck the shortcut's Steam Input setting defaults to
+  // on, Steam then takes the pad and offers a substitute that the launcher's
+  // SDL ignore lists refuse, and a title runs with no controller at all while
+  // nothing on screen explains why (notes/84). Check once, a few seconds in,
+  // and name the thing doing the filtering if one is set.
+  if (cvars::warn_when_no_controller) {
+    std::thread([this]() {
+      xe::threading::set_name("No controller check");
+      std::this_thread::sleep_for(std::chrono::seconds(
+          std::max(1, cvars::no_controller_warning_seconds)));
+      auto* input_system = emulator()->input_system();
+      if (!input_system) {
+        return;
+      }
+      // Flags are a driver mask, so 0 matches no driver at all and would
+      // report nothing connected however much is plugged in. XamInput turns
+      // an empty request into gamepad plus keyboard; do the same, and take
+      // the lock it takes.
+      const uint32_t flags = X_INPUT_FLAG::X_INPUT_FLAG_GAMEPAD |
+                             X_INPUT_FLAG::X_INPUT_FLAG_KEYBOARD;
+      auto anything_connected = [input_system, flags]() {
+        X_INPUT_CAPABILITIES caps = {};
+        auto lock = input_system->lock();
+        for (uint32_t user_index = 0; user_index < XUserMaxUserCount;
+             ++user_index) {
+          if (input_system->GetCapabilities(user_index, flags, &caps) ==
+              X_ERROR_SUCCESS) {
+            return true;
+          }
+        }
+        return false;
+      };
+      // Sample rather than take one reading: a controller SDL has not
+      // enumerated yet is not a controller that is missing.
+      for (int attempt = 0; attempt < 5; ++attempt) {
+        if (anything_connected()) {
+          return;
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+      }
+      std::string filtered_by;
+      for (const char* variable : {"SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT",
+                                   "SDL_GAMECONTROLLER_IGNORE_DEVICES"}) {
+        const char* value = std::getenv(variable);
+        if (value && *value) {
+          filtered_by = std::string(variable) + "=" + value;
+          break;
+        }
+      }
+      XELOGW("No controller in any slot{}{}", filtered_by.empty() ? "" : "; ",
+             filtered_by);
+      std::string message = "Nothing is plugged in, or something is hiding it.";
+      if (!filtered_by.empty()) {
+        message = "Devices are being filtered by " + filtered_by +
+                  ". On a Steam Deck, set the entry's Steam Input to "
+                  "Disabled.";
+      }
+      app_context().CallInUIThreadDeferred([this, message]() {
+        new xe::ui::HostNotificationWindow(imgui_drawer(), "No controller",
+                                           message, 0);
       });
     }).detach();
   }

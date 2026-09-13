@@ -22,9 +22,16 @@ guitar_present() {
 }
 
 helper=""
-if guitar_present && [ -x "$HERE/gip-guitar.py" ]; then
+if [ -x "$HERE/gip-guitar.py" ]; then
+  # Start it whether or not a guitar is plugged in: it waits for one and
+  # reattaches, so a guitar connected after the emulator is already up works
+  # without restarting anything. Checking once here meant plugging in late
+  # did nothing for the whole session.
   "$HERE/gip-guitar.py" >> "${LOG%.log}-guitar.log" 2>&1 &
   helper=$!
+fi
+
+if guitar_present; then
   sleep 2
   # Hide the Deck's own pad while a guitar is plugged in, so the guitar is
   # player one. A slot goes to whichever controller claims it first and the
