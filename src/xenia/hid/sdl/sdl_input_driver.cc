@@ -20,6 +20,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/threading.h"
 #include "xenia/helper/sdl/sdl_helper.h"
+#include "xenia/hid/controller_subtype.h"
 #include "xenia/hid/hid_flags.h"
 #include "xenia/ui/virtual_key.h"
 #include "xenia/ui/window.h"
@@ -37,13 +38,17 @@ DEFINE_uint32(
 
 DEFINE_string(
     controller_subtypes, "",
-    "What kind of controller each slot is told to be, when the kind SDL "
+    "What kind of controller a device is told to be, when the kind SDL "
     "reports is not what the title wants: a comma separated list of "
-    "slot:kind, e.g. \"0:guitar\". Kinds: gamepad, guitar, guitar_bass, "
-    "guitar_alternate, drums, wheel, arcade_stick, flight_stick, dance_pad, "
-    "arcade_pad. Guitar Hero and Rock Band read this to decide whether they "
-    "are being played on an instrument or on a pad. Empty leaves every slot "
-    "as SDL reports it.",
+    "which:kind, e.g. \"crkd guitar:guitar\". Kinds: gamepad, guitar, "
+    "guitar_bass, guitar_alternate, drums, wheel, arcade_stick, "
+    "flight_stick, dance_pad, arcade_pad. Guitar Hero and Rock Band read "
+    "this to decide whether they are being played on an instrument or on a "
+    "pad. Name the device, not a slot: part of its name, matched "
+    "case-insensitively, e.g. \"guitar:guitar\". A plain number still means "
+    "that slot, but slots are handed out in the order devices are plugged "
+    "in, so a setting left over from another session lands on whatever is "
+    "there now. Empty leaves every device as SDL reports it.",
     "HID");
 DEFINE_bool(
     guitar_stick_click_as_back, true,
@@ -289,8 +294,12 @@ X_RESULT SDLInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
   static std::array<uint8_t, HID_SDL_USER_COUNT> logged_subtype = {};
   if (logged_subtype[user_index] != controller->caps.sub_type) {
     logged_subtype[user_index] = controller->caps.sub_type;
-    XELOGI("SDL HID: slot {} answers GetCapabilities with type {} subtype {}",
-           user_index, controller->caps.type, controller->caps.sub_type);
+    const char* name = SDL_GameControllerName(controller->sdl);
+    XELOGI(
+        "SDL HID: slot {} ('{}') answers GetCapabilities with type {} "
+        "subtype {}",
+        user_index, name ? name : "?", controller->caps.type,
+        controller->caps.sub_type);
   }
 
   return X_ERROR_SUCCESS;
@@ -874,45 +883,6 @@ bool SDLInputDriver::IsGuitarSubtype(uint8_t sub_type) {
          sub_type == XINPUT_DEVSUBTYPE_GUITAR_BASS;
 }
 
-std::optional<uint8_t> SDLInputDriver::ForcedSubtypeForSlot(size_t user_index) {
-  if (cvars::controller_subtypes.empty()) {
-    return std::nullopt;
-  }
-  static const std::unordered_map<std::string, uint8_t> kinds = {
-      {"gamepad", XINPUT_DEVSUBTYPE_GAMEPAD},
-      {"guitar", XINPUT_DEVSUBTYPE_GUITAR},
-      {"guitar_alternate", XINPUT_DEVSUBTYPE_GUITAR_ALTERNATE},
-      {"guitar_bass", XINPUT_DEVSUBTYPE_GUITAR_BASS},
-      {"drums", XINPUT_DEVSUBTYPE_DRUM_KIT},
-      {"wheel", XINPUT_DEVSUBTYPE_WHEEL},
-      {"arcade_stick", XINPUT_DEVSUBTYPE_ARCADE_STICK},
-      {"arcade_pad", XINPUT_DEVSUBTYPE_ARCADE_PAD},
-      {"flight_stick", XINPUT_DEVSUBTYPE_FLIGHT_STICK},
-      {"dance_pad", XINPUT_DEVSUBTYPE_DANCE_PAD},
-  };
-  for (const auto& entry : xe::utf8::split(cvars::controller_subtypes, ",")) {
-    const size_t colon = entry.find(':');
-    if (colon == std::string_view::npos) {
-      continue;
-    }
-    std::string slot(entry.substr(0, colon));
-    std::string kind(entry.substr(colon + 1));
-    slot.erase(0, slot.find_first_not_of(" "));
-    kind.erase(0, kind.find_first_not_of(" "));
-    if (slot.empty() || kind.empty() ||
-        size_t(std::atoi(slot.c_str())) != user_index) {
-      continue;
-    }
-    const auto it = kinds.find(xe::utf8::lower_ascii(kind));
-    if (it == kinds.end()) {
-      XELOGW("SDL HID: controller_subtypes: '{}' is not a kind I know", kind);
-      return std::nullopt;
-    }
-    return it->second;
-  }
-  return std::nullopt;
-}
-
 void SDLInputDriver::UpdateXCapabilities(ControllerState& state,
                                          size_t user_index) {
   assert(state.sdl);
@@ -955,7 +925,10 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state,
   // frets on the wrong notes. --controller_subtypes says otherwise.
   c.sub_type = static_cast<uint8_t>(SDL_JoystickGetType(
       SDL_GameControllerGetJoystick(state.sdl)));  // XINPUT_DEVSUBTYPE_GAMEPAD
-  if (auto forced = ForcedSubtypeForSlot(user_index)) {
+  const char* device_name = SDL_GameControllerName(state.sdl);
+  if (auto forced =
+          ForcedControllerSubtype(cvars::controller_subtypes, user_index,
+                                  device_name ? device_name : "")) {
     c.sub_type = *forced;
   }
   guitar_slot_[user_index] = IsGuitarSubtype(c.sub_type);
