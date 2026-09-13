@@ -85,7 +85,6 @@ class SDLInputDriver final : public InputDriver {
   bool TestSDLVersion() const;
   void UpdateXCapabilities(ControllerState& state, size_t user_index);
   // The kind --controller_subtypes says this slot is, if it says anything.
-  static std::optional<uint8_t> ForcedSubtypeForSlot(size_t user_index);
   static bool IsGuitarSubtype(uint8_t sub_type);
   // True when this slot's whammy bar is routed to the right stick.
   bool WhammyOnStick(size_t user_index) const;
