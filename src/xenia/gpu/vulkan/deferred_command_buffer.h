@@ -173,8 +173,8 @@ class DeferredCommandBuffer {
 
   void CmdVkWriteTimestamp(VkPipelineStageFlagBits pipeline_stage,
                            VkQueryPool query_pool, uint32_t query) {
-    auto& args = *reinterpret_cast<ArgsVkWriteTimestamp*>(WriteCommand(
-        Command::kVkWriteTimestamp, sizeof(ArgsVkWriteTimestamp)));
+    auto& args = *reinterpret_cast<ArgsVkWriteTimestamp*>(
+        WriteCommand(Command::kVkWriteTimestamp, sizeof(ArgsVkWriteTimestamp)));
     args.pipeline_stage = pipeline_stage;
     args.query_pool = query_pool;
     args.query = query;

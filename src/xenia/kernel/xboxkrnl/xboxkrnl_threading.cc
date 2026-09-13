@@ -15,12 +15,12 @@
 #include <string>
 #include <vector>
 
-#include "xenia/base/logging.h"
-#include "xenia/kernel/kernel_flags.h"
 #include "xenia/base/atomic.h"
 #include "xenia/base/clock.h"
+#include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
 #include "xenia/cpu/processor.h"
+#include "xenia/kernel/kernel_flags.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
 #include "xenia/kernel/xevent.h"
@@ -64,7 +64,6 @@ namespace xboxkrnl {
 //   lwz r11, 0x100(r13)
 //   stw r3, 0x160(r11)
 // }
-
 
 // ---------------------------------------------------------------------------
 // Event tracing (--trace_event_handles).
@@ -216,10 +215,9 @@ template <typename... Args>
 void EventTraceLine(std::string_view format, const Args&... args) {
   uint64_t seq = event_trace_seq_.fetch_add(1, std::memory_order_relaxed);
   std::string body = fmt::format(fmt::runtime(format), args...);
-  xe::logging::AppendLogLineFormat(xe::LogSrc::Kernel, xe::LogLevel::Info, 'E',
-                                   "EVT #{} t={} lr={:08X} {}", seq,
-                                   EventTraceMicros(), EventTraceGuestLR(),
-                                   body);
+  xe::logging::AppendLogLineFormat(
+      xe::LogSrc::Kernel, xe::LogLevel::Info, 'E', "EVT #{} t={} lr={:08X} {}",
+      seq, EventTraceMicros(), EventTraceGuestLR(), body);
 }
 
 }  // namespace
@@ -362,16 +360,15 @@ dword_result_t ExCreateThread_entry(lpdword_t handle_ptr, dword_t stack_size,
                                     lpvoid_t start_context,
                                     dword_t creation_flags) {
   dword_result_t result =
-      ExCreateThread(handle_ptr, stack_size, thread_id_ptr,
-                     xapi_thread_startup, start_address, start_context,
-                     creation_flags);
+      ExCreateThread(handle_ptr, stack_size, thread_id_ptr, xapi_thread_startup,
+                     start_address, start_context, creation_flags);
   if (EventTraceEnabled()) {
-    EventTraceLine("createthread h={:08X} flags={:08X} start={:08X} ctx={:08X} "
-                   "result={:08X}",
-                   handle_ptr ? static_cast<uint32_t>(*handle_ptr) : 0u,
-                   creation_flags.value(), start_address.guest_address(),
-                   start_context.guest_address(),
-                   static_cast<uint32_t>(result));
+    EventTraceLine(
+        "createthread h={:08X} flags={:08X} start={:08X} ctx={:08X} "
+        "result={:08X}",
+        handle_ptr ? static_cast<uint32_t>(*handle_ptr) : 0u,
+        creation_flags.value(), start_address.guest_address(),
+        start_context.guest_address(), static_cast<uint32_t>(result));
   }
   return result;
 }
@@ -474,7 +471,8 @@ dword_result_t NtSuspendThread_entry(dword_t handle,
 
         if (is_self_suspend) {
           XELOGD("Thread {:X} self-suspending", thread->handle());
-          suspend_count = thread->SelfSuspend(thread->TakeRestoredSelfSuspend());
+          suspend_count =
+              thread->SelfSuspend(thread->TakeRestoredSelfSuspend());
           result = X_STATUS_SUCCESS;
           XELOGD("Thread {:X} resumed", thread->handle());
         } else {
@@ -765,8 +763,8 @@ void KeInitializeEvent_entry(pointer_t<X_KEVENT> event_ptr, dword_t event_type,
   }
   if (EventTraceWants(ev.get())) {
     EventTraceLine("init h={:08X} native={:08X} type={} initial={}",
-                   ev->handle(), event_ptr.guest_address(),
-                   event_type.value(), initial_state.value());
+                   ev->handle(), event_ptr.guest_address(), event_type.value(),
+                   initial_state.value());
   }
 }
 DECLARE_XBOXKRNL_EXPORT1(KeInitializeEvent, kThreading, kImplemented);
@@ -873,8 +871,7 @@ uint32_t xeNtSetEvent(uint32_t handle, xe::be<uint32_t>* previous_state_ptr) {
       return X_STATUS_OBJECT_TYPE_MISMATCH;
     }
     if (EventTraceWants(handle)) {
-      EventTraceLine("set h={:08X} prev={}", handle,
-                     EventTraceState(ev.get()));
+      EventTraceLine("set h={:08X} prev={}", handle, EventTraceState(ev.get()));
     }
     int32_t was_signalled = ev->Set(0, false);
     if (previous_state_ptr) {

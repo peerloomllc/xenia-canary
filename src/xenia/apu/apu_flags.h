@@ -14,7 +14,7 @@
 DECLARE_bool(mute)
 
 #endif  // XENIA_APU_APU_FLAGS_H_
-DECLARE_string(fast_forward_audio);
+    DECLARE_string(fast_forward_audio);
 DECLARE_string(slow_motion_audio);
 
 namespace xe {

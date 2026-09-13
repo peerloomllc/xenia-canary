@@ -183,8 +183,8 @@ object_ref<XTimer> XTimer::Restore(KernelState* kernel_state,
                  ->LookupObject<XThread>(thread_handle)
                  .get();
   }
-  uint64_t now = xe::chrono::XSystemClock::to_file_time(
-      xe::chrono::XSystemClock::now());
+  uint64_t now =
+      xe::chrono::XSystemClock::to_file_time(xe::chrono::XSystemClock::now());
   if (armed && (period_ms || due > now)) {
     // Still pending (or periodic): arm it again at the saved guest time.
     timer->Arm(int64_t(due), period_ms, routine, routine_arg, thread);
@@ -193,9 +193,10 @@ object_ref<XTimer> XTimer::Restore(KernelState* kernel_state,
     // memory. Just signal.
     timer->timer_->SetOnceAfter(xe::chrono::hundrednanoseconds(0));
   }
-  XELOGI("XTimer {:08X} restored: type {} armed {} period {} due {} signaled {}",
-         timer->handle(), type, armed, period_ms,
-         armed ? (due > now ? "future" : "past") : "-", signaled);
+  XELOGI(
+      "XTimer {:08X} restored: type {} armed {} period {} due {} signaled {}",
+      timer->handle(), type, armed, period_ms,
+      armed ? (due > now ? "future" : "past") : "-", signaled);
   return object_ref<XTimer>(timer);
 }
 

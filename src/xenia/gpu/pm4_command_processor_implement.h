@@ -723,16 +723,17 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
   if (cvars::log_wait_reg_mem) {
     // Diagnostic (60 fps patches): what the guest makes the GPU wait on,
     // throttled to one line per second per poll address.
-    static std::map<uint32_t, std::pair<std::chrono::steady_clock::time_point,
-                                        uint32_t>>
+    static std::map<uint32_t,
+                    std::pair<std::chrono::steady_clock::time_point, uint32_t>>
         last_logged;
     auto& entry = last_logged[poll_reg_addr];
     ++entry.second;
     if (wait_started - entry.first > std::chrono::seconds(1)) {
-      XELOGI("WAIT_REG_MEM {} {:08X} mask={:08X} ref={:08X} wait_info={:X} "
-             "wait={:X} value_now={:08X} ({} in the last second)",
-             is_memory ? "mem" : "reg", poll_reg_addr, mask, ref, wait_info,
-             wait, uint32_t(value_ref), entry.second);
+      XELOGI(
+          "WAIT_REG_MEM {} {:08X} mask={:08X} ref={:08X} wait_info={:X} "
+          "wait={:X} value_now={:08X} ({} in the last second)",
+          is_memory ? "mem" : "reg", poll_reg_addr, mask, ref, wait_info, wait,
+          uint32_t(value_ref), entry.second);
       entry.first = wait_started;
       entry.second = 0;
     }
@@ -756,10 +757,11 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
         std::chrono::steady_clock::now() - wait_started >
             std::chrono::milliseconds(500)) {
       wait_logged = true;
-      XELOGW("WAIT_REG_MEM stalled >500 ms: {} {:08X} value={:08X} mask={:08X} "
-             "ref={:08X} wait_info={:08X} wait={:X} read_ptr={:X}",
-             is_memory ? "mem" : "reg", poll_reg_addr, value, mask, ref,
-             wait_info, wait, read_ptr_index_);
+      XELOGW(
+          "WAIT_REG_MEM stalled >500 ms: {} {:08X} value={:08X} mask={:08X} "
+          "ref={:08X} wait_info={:08X} wait={:X} read_ptr={:X}",
+          is_memory ? "mem" : "reg", poll_reg_addr, value, mask, ref, wait_info,
+          wait, read_ptr_index_);
     }
 
     if (!matched) {

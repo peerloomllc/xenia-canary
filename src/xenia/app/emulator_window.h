@@ -20,6 +20,7 @@
 #include "xenia/app/profile_dialogs.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/command_processor.h"
+#include "xenia/kernel/xconfig.h"
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
 #include "xenia/ui/immediate_drawer.h"
@@ -28,7 +29,6 @@
 #include "xenia/ui/window.h"
 #include "xenia/ui/window_listener.h"
 #include "xenia/ui/windowed_app_context.h"
-#include "xenia/kernel/xconfig.h"
 #include "xenia/xbox.h"
 
 namespace xe {
@@ -348,10 +348,10 @@ class EmulatorWindow {
   void* patches_combo_[kPatchCategoryCount] = {};   // GtkComboBoxText*
   void* patches_box_[kPatchCategoryCount] = {};     // GtkBox*: the entries
   void* patches_enable_[kPatchCategoryCount] = {};  // GtkCheckButton*
-  void* community_status_ = nullptr;    // GtkLabel*
-  void* community_box_ = nullptr;       // GtkBox*
-  void* community_show_all_ = nullptr;  // GtkCheckButton*
-  void* community_filter_ = nullptr;    // GtkEntry*
+  void* community_status_ = nullptr;                // GtkLabel*
+  void* community_box_ = nullptr;                   // GtkBox*
+  void* community_show_all_ = nullptr;              // GtkCheckButton*
+  void* community_filter_ = nullptr;                // GtkEntry*
   std::vector<uint32_t> patches_combo_title_ids_;
   uint32_t patches_selected_title_ = 0;
   bool patches_refreshing_ = false;
@@ -364,8 +364,8 @@ class EmulatorWindow {
   bool community_looked_up_ = false;
   bool community_lookup_running_ = false;
   int community_downloads_running_ = 0;
-  void* profiles_list_ = nullptr;   // GtkListBox*
-  void* profiles_status_ = nullptr;  // GtkLabel*
+  void* profiles_list_ = nullptr;                      // GtkListBox*
+  void* profiles_status_ = nullptr;                    // GtkLabel*
   std::unique_ptr<kernel::XConfigData> console_data_;  // edited copy
   std::vector<std::function<void()>> console_refreshers_;
   void* console_status_ = nullptr;  // GtkLabel*
@@ -404,8 +404,6 @@ class EmulatorWindow {
     double fps_ = 0.0;
   };
   void ToggleFpsOverlay();
-
-
 
   class KeyboardHotkeysDialog final : public ui::ImGuiDialog {
    public:
@@ -625,9 +623,9 @@ class EmulatorWindow {
   // Icons: the XDBF icon of a title, written to <storage>/library/icons/
   // <id>.png when it is launched, shown in the list's first column and in
   // the grid view (a GtkIconView over the same filtered rows).
-  void* dashboard_stack_ = nullptr;       // GtkStack*: "list" / "grid"
-  void* dashboard_grid_ = nullptr;        // GtkIconView*
-  void* dashboard_grid_store_ = nullptr;  // GtkListStore*
+  void* dashboard_stack_ = nullptr;            // GtkStack*: "list" / "grid"
+  void* dashboard_grid_ = nullptr;             // GtkIconView*
+  void* dashboard_grid_store_ = nullptr;       // GtkListStore*
   std::map<uint64_t, void*> dashboard_icons_;  // (id << 8 | size) -> GdkPixbuf*
   std::filesystem::path TitleIconPath(uint32_t title_id) const;
   void SaveTitleIcon();

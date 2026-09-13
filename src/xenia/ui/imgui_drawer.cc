@@ -169,8 +169,7 @@ void ImGuiDrawer::Initialize() {
   io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
   ui_scale_ = float(std::clamp(cvars::ui_scale, 0.5, 3.0));
-  const float font_size =
-      std::max((float)cvars::font_size, 8.f) * ui_scale_;
+  const float font_size = std::max((float)cvars::font_size, 8.f) * ui_scale_;
   const float title_font_size = font_size + 6.f * ui_scale_;
 
   InitializeFonts(font_size);

@@ -79,10 +79,8 @@ std::unique_ptr<VulkanDlss> VulkanDlss::TryCreate(const VulkanDevice* device) {
   const wchar_t* feature_paths[] = {dlss_folder.c_str(),
                                     executable_folder.c_str()};
   NVSDK_NGX_FeatureCommonInfo feature_common_info = {};
-  feature_common_info.PathListInfo.Path =
-      const_cast<wchar_t**>(feature_paths);
-  feature_common_info.PathListInfo.Length =
-      uint32_t(std::size(feature_paths));
+  feature_common_info.PathListInfo.Path = const_cast<wchar_t**>(feature_paths);
+  feature_common_info.PathListInfo.Length = uint32_t(std::size(feature_paths));
 
   const VulkanInstance* instance = device->vulkan_instance();
   const NVSDK_NGX_Result init_result = NVSDK_NGX_VULKAN_Init(
@@ -98,8 +96,7 @@ std::unique_ptr<VulkanDlss> VulkanDlss::TryCreate(const VulkanDevice* device) {
   dlss->ngx_initialized_ = true;
 
   NVSDK_NGX_Parameter* parameters = nullptr;
-  if (NVSDK_NGX_FAILED(
-          NVSDK_NGX_VULKAN_GetCapabilityParameters(&parameters))) {
+  if (NVSDK_NGX_FAILED(NVSDK_NGX_VULKAN_GetCapabilityParameters(&parameters))) {
     XELOGI("VulkanDlss: failed to get the NGX capability parameters");
     return nullptr;
   }
@@ -285,9 +282,8 @@ bool VulkanDlss::EnsureFeature(VkCommandBuffer command_buffer,
   }
 
   // Pick the DLSS quality mode closest to the scaling factor.
-  const float scale =
-      std::max(float(output_width) / float(input_width),
-               float(output_height) / float(input_height));
+  const float scale = std::max(float(output_width) / float(input_width),
+                               float(output_height) / float(input_height));
   NVSDK_NGX_PerfQuality_Value quality;
   if (scale < 1.05f) {
     quality = NVSDK_NGX_PerfQuality_Value_DLAA;
@@ -334,8 +330,7 @@ bool VulkanDlss::Evaluate(VkCommandBuffer command_buffer, VkImage input_image,
   if (!ngx_feature_) {
     return false;
   }
-  const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
-                                         1};
+  const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
   NVSDK_NGX_Resource_VK color_resource = NVSDK_NGX_Create_ImageView_Resource_VK(
       input_view, input_image, range, format, input_width_, input_height_,
       false);

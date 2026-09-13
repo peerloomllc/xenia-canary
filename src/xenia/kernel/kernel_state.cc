@@ -450,8 +450,7 @@ object_ref<UserModule> KernelState::GetExecutableModule() {
   return executable_module_;
 }
 
-void KernelState::SetExecutableModuleForRestore(
-    object_ref<UserModule> module) {
+void KernelState::SetExecutableModuleForRestore(object_ref<UserModule> module) {
   executable_module_ = std::move(module);
 }
 
@@ -924,31 +923,28 @@ void KernelState::TerminateTitle() {
         global_lock.unlock();
 
         if (thread->in_self_suspend()) {
-
           // Parked in its own NtSuspendThread: let it out of the condition
 
           // wait first (the host thread is suspended inside the wait; resume
 
           // it for a moment), then step and terminate it like any other.
 
-          XELOGI("TerminateTitle: thread {:08X} parked in NtSuspendThread, "
+          XELOGI(
+              "TerminateTitle: thread {:08X} parked in NtSuspendThread, "
 
-                 "releasing it first",
+              "releasing it first",
 
-                 thread->handle());
+              thread->handle());
 
           thread->AbortSelfSuspend();
 
           thread->thread()->Resume();
 
           for (int i = 0; i < 200 && thread->in_self_suspend(); ++i) {
-
             xe::threading::Sleep(std::chrono::milliseconds(1));
-
           }
 
           thread->thread()->Suspend();
-
         }
 
         // Bring it to a clean point if that is quick; a thread blocked on a
@@ -1348,13 +1344,13 @@ bool KernelState::Save(ByteStream* stream) {
   }
   std::string summary;
   for (auto& [type, count] : saved_by_type) {
-    summary += fmt::format(" {}={}", XObject::TypeName(XObject::Type(type)),
-                           count);
+    summary +=
+        fmt::format(" {}={}", XObject::TypeName(XObject::Type(type)), count);
   }
   std::string dropped;
   for (auto& [type, count] : dropped_by_type) {
-    dropped += fmt::format(" {}={}", XObject::TypeName(XObject::Type(type)),
-                           count);
+    dropped +=
+        fmt::format(" {}={}", XObject::TypeName(XObject::Type(type)), count);
   }
   XELOGI("KernelState::Save: {} objects saved:{}{}{}", num_objects, summary,
          dropped.empty() ? "" : "; NOT saved:", dropped);

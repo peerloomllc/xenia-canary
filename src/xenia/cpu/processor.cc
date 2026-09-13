@@ -8,10 +8,10 @@
  */
 
 #include <chrono>
-#include <fstream>
-#include <set>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <set>
 
 #include "xenia/cpu/processor.h"
 
@@ -27,17 +27,17 @@
 #include "xenia/base/literals.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/memory.h"
+#include "xenia/base/mutex.h"
 #include "xenia/base/platform.h"
 #include "xenia/base/profiling.h"
+#include "xenia/base/string_buffer.h"
 #include "xenia/base/threading.h"
-#include "xenia/base/mutex.h"
 #include "xenia/cpu/breakpoint.h"
 #include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/export_resolver.h"
 #include "xenia/cpu/module.h"
 #include "xenia/cpu/ppc/ppc_decode_data.h"
 #include "xenia/cpu/ppc/ppc_frontend.h"
-#include "xenia/base/string_buffer.h"
 #include "xenia/cpu/ppc/ppc_opcode_info.h"
 #include "xenia/cpu/stack_walker.h"
 #include "xenia/cpu/thread.h"
@@ -70,7 +70,8 @@ DEFINE_string(
     "CPU");
 DEFINE_string(
     find_guest_refs, "",
-    "Diagnostic: hex guest addresses (comma separated); on the first stack dump, scan the "
+    "Diagnostic: hex guest addresses (comma separated); on the first stack "
+    "dump, scan the "
     "executable (82000000-83400000) for lis/addis + d-form references to it "
     "and log each site.",
     "CPU");
@@ -755,11 +756,12 @@ bool Processor::OnThreadBreakpointHit(Exception* ex) {
     for (auto b : breakpoints_) {
       bps += fmt::format(" {:08X}", b->guest_address());
     }
-    XELOGI("OnThreadBreakpointHit: thread {} frames:{} breakpoints:{} "
-           "exception_pc={:X} ts_match={}",
-           thread_info->thread_id, desc, bps,
-           ThreadState::Get() ? ThreadState::Get()->current_exception_pc() : 0,
-           ThreadState::Get() == thread_info->thread->thread_state());
+    XELOGI(
+        "OnThreadBreakpointHit: thread {} frames:{} breakpoints:{} "
+        "exception_pc={:X} ts_match={}",
+        thread_info->thread_id, desc, bps,
+        ThreadState::Get() ? ThreadState::Get()->current_exception_pc() : 0,
+        ThreadState::Get() == thread_info->thread->thread_state());
   }
   Breakpoint* breakpoint = nullptr;
   for (size_t i = 0; i < thread_info->frames.size(); ++i) {
@@ -1030,8 +1032,12 @@ std::vector<std::string> SplitList(const std::string& list) {
   size_t start = 0;
   while (start <= list.size()) {
     size_t end = list.find(',', start);
-    if (end == std::string::npos) end = list.size();
-    if (end > start) out.push_back(list.substr(start, end - start));
+    if (end == std::string::npos) {
+      end = list.size();
+    }
+    if (end > start) {
+      out.push_back(list.substr(start, end - start));
+    }
     start = end + 1;
   }
   return out;
@@ -1043,7 +1049,9 @@ std::vector<uint32_t> ParseHexList(const std::string& list) {
   size_t start = 0;
   while (start <= list.size()) {
     size_t end = list.find(',', start);
-    if (end == std::string::npos) end = list.size();
+    if (end == std::string::npos) {
+      end = list.size();
+    }
     if (end > start) {
       out.push_back(uint32_t(
           std::strtoul(list.substr(start, end - start).c_str(), nullptr, 16)));
@@ -1110,7 +1118,8 @@ void DumpGuestBackChain(Memory* memory, uint32_t sp, int max_frames) {
     if (!frame || (frame & 3) || !GuestAddressReadable(memory, frame)) {
       break;
     }
-    uint32_t next = xe::load_and_swap<uint32_t>(memory->TranslateVirtual(frame));
+    uint32_t next =
+        xe::load_and_swap<uint32_t>(memory->TranslateVirtual(frame));
     if (next <= frame) {
       break;  // back chain must grow upward
     }
@@ -1149,7 +1158,8 @@ void DumpGuestDisasmWindow(Memory* memory, uint32_t guest_pc, int before,
     if (!GuestAddressReadable(memory, address)) {
       continue;
     }
-    uint32_t code = xe::load_and_swap<uint32_t>(memory->TranslateVirtual(address));
+    uint32_t code =
+        xe::load_and_swap<uint32_t>(memory->TranslateVirtual(address));
     StringBuffer buffer;
     if (!xe::cpu::ppc::DisasmPPC(address, code, &buffer)) {
       XELOGI("      {} {:08X}  {:08X}  <undecodable>",
@@ -1186,10 +1196,12 @@ void Processor::DumpThreadStacks() {
       if (dash == std::string::npos) {
         continue;
       }
-      uint32_t lo = uint32_t(std::strtoul(token.substr(0, dash).c_str(),
-                                          nullptr, 16)) & ~3u;
-      uint32_t hi = uint32_t(std::strtoul(token.substr(dash + 1).c_str(),
-                                          nullptr, 16)) & ~3u;
+      uint32_t lo =
+          uint32_t(std::strtoul(token.substr(0, dash).c_str(), nullptr, 16)) &
+          ~3u;
+      uint32_t hi =
+          uint32_t(std::strtoul(token.substr(dash + 1).c_str(), nullptr, 16)) &
+          ~3u;
       if (hi < lo) {
         continue;
       }
@@ -1204,22 +1216,27 @@ void Processor::DumpThreadStacks() {
     for (auto item_view : xe::utf8::split(cvars::find_guest_pattern, ",")) {
       std::string item(item_view);
       size_t colon = item.find(':');
-      uint32_t value = uint32_t(strtoul(std::string(item.substr(0, colon)).c_str(), nullptr, 16));
-      uint32_t mask = colon == std::string::npos
-                          ? 0xFFFFFFFFu
-                          : uint32_t(strtoul(std::string(item.substr(colon + 1)).c_str(), nullptr, 16));
+      uint32_t value = uint32_t(
+          strtoul(std::string(item.substr(0, colon)).c_str(), nullptr, 16));
+      uint32_t mask =
+          colon == std::string::npos
+              ? 0xFFFFFFFFu
+              : uint32_t(strtoul(std::string(item.substr(colon + 1)).c_str(),
+                                 nullptr, 16));
       uint32_t found = 0;
       for (uint32_t addr = 0x82000000; addr < 0x83400000; addr += 4) {
         if ((addr & 0xFFF) == 0 && !GuestAddressReadable(memory_, addr)) {
           addr += 0x1000 - 4;
           continue;
         }
-        uint32_t word = xe::load_and_swap<uint32_t>(memory_->TranslateVirtual(addr));
+        uint32_t word =
+            xe::load_and_swap<uint32_t>(memory_->TranslateVirtual(addr));
         if ((word & mask) != value) {
           continue;
         }
         if (++found <= 60) {
-          XELOGI("find_guest_pattern {:08X}:{:08X}: {:08X} = {:08X}", value, mask, addr, word);
+          XELOGI("find_guest_pattern {:08X}:{:08X}: {:08X} = {:08X}", value,
+                 mask, addr, word);
         }
       }
       XELOGI("find_guest_pattern {:08X}:{:08X}: {} hit(s)", value, mask, found);
@@ -1228,48 +1245,52 @@ void Processor::DumpThreadStacks() {
   if (!cvars::find_guest_refs.empty() && !refs_scanned) {
     refs_scanned = true;
     for (uint32_t target : ParseHexList(cvars::find_guest_refs)) {
-    // PPC materialises a 32-bit address as lis rA, hi; op rX, lo(rA), where
-    // hi = (target + 0x8000) >> 16 and lo = target - (hi << 16) (signed).
-    uint16_t hi = uint16_t((target + 0x8000) >> 16);
-    int16_t lo = int16_t(target - (uint32_t(hi) << 16));
-    uint32_t found = 0;
-    for (uint32_t addr = 0x82000000; addr < 0x83400000; addr += 4) {
-      if ((addr & 0xFFF) == 0 && !GuestAddressReadable(memory_, addr)) {
-        addr += 0x1000 - 4;
-        continue;
-      }
-      uint32_t code = xe::load_and_swap<uint32_t>(memory_->TranslateVirtual(addr));
-      // addis rD, 0, hi (lis).
-      if ((code >> 26) != 15 || ((code >> 16) & 31) != 0 ||
-          uint16_t(code & 0xFFFF) != hi) {
-        continue;
-      }
-      uint32_t rd = (code >> 21) & 31;
-      // Look ahead a few instructions for a d-form using rd with offset lo.
-      for (uint32_t k = 4; k <= 12 * 4; k += 4) {
-        if (!GuestAddressReadable(memory_, addr + k)) break;
-        uint32_t c2 =
-            xe::load_and_swap<uint32_t>(memory_->TranslateVirtual(addr + k));
-        uint32_t op = c2 >> 26;
-        uint32_t ra = (c2 >> 16) & 31;
-        uint32_t rt = (c2 >> 21) & 31;
-        int16_t d = int16_t(c2 & 0xFFFF);
-        // addi/lwz/stw/lhz/sth/lbz/stb/lfs/stfs... all use the d-form
-        // opcode range 14, 32-55; the site is one that has ra == rd, d == lo.
-        bool dform = op == 14 || (op >= 32 && op <= 55);
-        if (dform && ra == rd && d == lo) {
-          XELOGI("find_guest_refs {:08X}: {:08X} lis r{},{:04X}; {:08X} op{} "
-                 "r{},{}(r{})",
-                 target, addr, rd, hi, addr + k, op, rt, d, ra);
-          ++found;
-          break;
+      // PPC materialises a 32-bit address as lis rA, hi; op rX, lo(rA), where
+      // hi = (target + 0x8000) >> 16 and lo = target - (hi << 16) (signed).
+      uint16_t hi = uint16_t((target + 0x8000) >> 16);
+      int16_t lo = int16_t(target - (uint32_t(hi) << 16));
+      uint32_t found = 0;
+      for (uint32_t addr = 0x82000000; addr < 0x83400000; addr += 4) {
+        if ((addr & 0xFFF) == 0 && !GuestAddressReadable(memory_, addr)) {
+          addr += 0x1000 - 4;
+          continue;
         }
-        if (rt == rd && (op == 14 || op == 15 || (op >= 32 && op <= 47))) {
-          break;  // rd overwritten first
+        uint32_t code =
+            xe::load_and_swap<uint32_t>(memory_->TranslateVirtual(addr));
+        // addis rD, 0, hi (lis).
+        if ((code >> 26) != 15 || ((code >> 16) & 31) != 0 ||
+            uint16_t(code & 0xFFFF) != hi) {
+          continue;
+        }
+        uint32_t rd = (code >> 21) & 31;
+        // Look ahead a few instructions for a d-form using rd with offset lo.
+        for (uint32_t k = 4; k <= 12 * 4; k += 4) {
+          if (!GuestAddressReadable(memory_, addr + k)) {
+            break;
+          }
+          uint32_t c2 =
+              xe::load_and_swap<uint32_t>(memory_->TranslateVirtual(addr + k));
+          uint32_t op = c2 >> 26;
+          uint32_t ra = (c2 >> 16) & 31;
+          uint32_t rt = (c2 >> 21) & 31;
+          int16_t d = int16_t(c2 & 0xFFFF);
+          // addi/lwz/stw/lhz/sth/lbz/stb/lfs/stfs... all use the d-form
+          // opcode range 14, 32-55; the site is one that has ra == rd, d == lo.
+          bool dform = op == 14 || (op >= 32 && op <= 55);
+          if (dform && ra == rd && d == lo) {
+            XELOGI(
+                "find_guest_refs {:08X}: {:08X} lis r{},{:04X}; {:08X} op{} "
+                "r{},{}(r{})",
+                target, addr, rd, hi, addr + k, op, rt, d, ra);
+            ++found;
+            break;
+          }
+          if (rt == rd && (op == 14 || op == 15 || (op >= 32 && op <= 47))) {
+            break;  // rd overwritten first
+          }
         }
       }
-    }
-    XELOGI("find_guest_refs {:08X}: {} site(s)", target, found);
+      XELOGI("find_guest_refs {:08X}: {} site(s)", target, found);
     }
   }
   static bool calls_scanned = false;
@@ -1302,23 +1323,37 @@ void Processor::DumpThreadStacks() {
     static int dump_count = 0;
     static std::set<std::string> poked;
     ++dump_count;
-    int elapsed = dump_count * std::max(1, int(cvars::stack_dump_interval_seconds));
+    int elapsed =
+        dump_count * std::max(1, int(cvars::stack_dump_interval_seconds));
     for (const std::string& spec : SplitList(cvars::poke_guest_memory)) {
-      if (poked.count(spec)) continue;
+      if (poked.count(spec)) {
+        continue;
+      }
       size_t colon = spec.find(':'), at = spec.find('@');
-      if (colon == std::string::npos) continue;
+      if (colon == std::string::npos) {
+        continue;
+      }
       int when = at == std::string::npos ? 0 : std::atoi(spec.c_str() + at + 1);
-      if (elapsed < when) continue;
-      uint32_t address = uint32_t(std::strtoul(spec.substr(0, colon).c_str(), nullptr, 16));
-      uint32_t value = uint32_t(std::strtoul(spec.substr(colon + 1, at == std::string::npos ? std::string::npos : at - colon - 1).c_str(), nullptr, 16));
+      if (elapsed < when) {
+        continue;
+      }
+      uint32_t address =
+          uint32_t(std::strtoul(spec.substr(0, colon).c_str(), nullptr, 16));
+      uint32_t value = uint32_t(std::strtoul(
+          spec.substr(colon + 1, at == std::string::npos ? std::string::npos
+                                                         : at - colon - 1)
+              .c_str(),
+          nullptr, 16));
       poked.insert(spec);
       if (!GuestAddressReadable(memory_, address)) {
         XELOGI("poke {}: [{:08X}] unmapped", spec, address);
         continue;
       }
-      uint32_t before = xe::load_and_swap<uint32_t>(memory_->TranslateVirtual(address));
+      uint32_t before =
+          xe::load_and_swap<uint32_t>(memory_->TranslateVirtual(address));
       xe::store_and_swap<uint32_t>(memory_->TranslateVirtual(address), value);
-      XELOGI("poke {}: [{:08X}] {:08X} -> {:08X} at ~{} s", spec, address, before, value, elapsed);
+      XELOGI("poke {}: [{:08X}] {:08X} -> {:08X} at ~{} s", spec, address,
+             before, value, elapsed);
     }
   }
   for (const std::string& spec : SplitList(cvars::watch_guest_pointer)) {
@@ -1328,14 +1363,18 @@ void Processor::DumpThreadStacks() {
     bool ok = true;
     {
       size_t i = 0;
-      while (i < spec.size() && spec[i] != '>' && spec[i] != '+') ++i;
+      while (i < spec.size() && spec[i] != '>' && spec[i] != '+') {
+        ++i;
+      }
       watch = uint32_t(std::strtoul(spec.substr(0, i).c_str(), nullptr, 16));
       while (ok && i < spec.size()) {
         char op = spec[i++];
         size_t j = i;
-        while (j < spec.size() && spec[j] != '>' && spec[j] != '+') ++j;
-        uint32_t v = uint32_t(std::strtoul(spec.substr(i, j - i).c_str(),
-                                           nullptr, 16));
+        while (j < spec.size() && spec[j] != '>' && spec[j] != '+') {
+          ++j;
+        }
+        uint32_t v =
+            uint32_t(std::strtoul(spec.substr(i, j - i).c_str(), nullptr, 16));
         i = j;
         if (op == '>') {
           if (!GuestAddressReadable(memory_, watch)) {
@@ -1639,8 +1678,7 @@ bool Processor::StepToGuestAddress(uint32_t thread_id, uint32_t pc,
 
   bool hit = false;
   bool gave_up = false;
-  for (int waited_ms = 0; waited_ms < kStepTimeoutMs && !hit;
-       waited_ms += 50) {
+  for (int waited_ms = 0; waited_ms < kStepTimeoutMs && !hit; waited_ms += 50) {
     hit = fence.WaitFor(std::chrono::milliseconds(50));
     if (!hit && give_up && give_up()) {
       gave_up = true;
@@ -1668,9 +1706,10 @@ bool Processor::StepToGuestAddress(uint32_t thread_id, uint32_t pc,
     // The thread never reached the breakpoint (blocked, or on a different
     // path). Park it again so the caller can give up on it cleanly.
     if (gave_up) {
-      XELOGI("StepToGuestAddress: thread {} will not reach {:08X} (caller's "
-             "condition); giving up the step",
-             thread_id, pc);
+      XELOGI(
+          "StepToGuestAddress: thread {} will not reach {:08X} (caller's "
+          "condition); giving up the step",
+          thread_id, pc);
     } else {
       XELOGE("StepToGuestAddress: thread {} did not reach {:08X} in {} ms",
              thread_id, pc, kStepTimeoutMs);
@@ -1778,9 +1817,10 @@ uint32_t Processor::StepIntoGuestBranchTarget(uint32_t thread_id, uint32_t pc) {
       execution_state_ = ExecutionState::kRunning;
     }
     if (!hit) {
-      XELOGE("StepIntoGuestBranchTarget: thread {} did not reach either "
-             "target of {:08X} in {} ms",
-             thread_id, pc, kStepTimeoutMs);
+      XELOGE(
+          "StepIntoGuestBranchTarget: thread {} did not reach either "
+          "target of {:08X} in {} ms",
+          thread_id, pc, kStepTimeoutMs);
       thread->thread()->Suspend(nullptr);
       return 0;
     }
@@ -1813,10 +1853,9 @@ std::string Processor::DescribeGlobalLockOwner() {
 #endif
 }
 
-uint32_t Processor::StepToGuestSafePoint(uint32_t thread_id, bool ignore_host,
-                                         uint32_t guest_suspend_count,
-                                         bool* out_parked_in_self_suspend,
-    const std::function<bool()>& give_up,
+uint32_t Processor::StepToGuestSafePoint(
+    uint32_t thread_id, bool ignore_host, uint32_t guest_suspend_count,
+    bool* out_parked_in_self_suspend, const std::function<bool()>& give_up,
     std::pair<uint32_t, int32_t>* out_memory_fixup) {
   // This cannot be done if we're the calling thread!
   if (thread_id == ThreadState::GetThreadID()) {
@@ -1984,11 +2023,12 @@ uint32_t Processor::StepToGuestSafePoint(uint32_t thread_id, bool ignore_host,
         if (stub) {
           thunk_func = stub;
           export_data = const_cast<cpu::Export*>(ts->current_export());
-          XELOGI("StepToGuestSafePoint: thread {} inside export {} via stub "
-                 "{:08X} ({})",
-                 thread_id, export_data->name, stub->address(),
-                 (export_data->tags & cpu::ExportTag::kBlocking) ? "blocking"
-                                                                 : "non-blocking");
+          XELOGI(
+              "StepToGuestSafePoint: thread {} inside export {} via stub "
+              "{:08X} ({})",
+              thread_id, export_data->name, stub->address(),
+              (export_data->tags & cpu::ExportTag::kBlocking) ? "blocking"
+                                                              : "non-blocking");
         }
       }
     }
@@ -2003,9 +2043,10 @@ uint32_t Processor::StepToGuestSafePoint(uint32_t thread_id, bool ignore_host,
         auto fn = backend_->code_cache()->LookupFunction(rip);
         if (fn) {
           first_pc = fn->MapMachineCodeToGuestAddress(rip);
-          XELOGI("StepToGuestSafePoint: thread {} in MMIO handler at host "
-                 "{:X} -> guest {:08X}",
-                 thread_id, rip, first_pc);
+          XELOGI(
+              "StepToGuestSafePoint: thread {} in MMIO handler at host "
+              "{:X} -> guest {:08X}",
+              thread_id, rip, first_pc);
         }
       }
     }
@@ -2024,7 +2065,8 @@ uint32_t Processor::StepToGuestSafePoint(uint32_t thread_id, bool ignore_host,
     // Re-issuing the wait on restore is safe because the event/semaphore
     // states are part of the saved memory image.
     if (export_data && !(export_data->tags & cpu::ExportTag::kBlocking) &&
-        export_data->name && !std::strcmp(export_data->name, "NtSuspendThread") &&
+        export_data->name &&
+        !std::strcmp(export_data->name, "NtSuspendThread") &&
         guest_suspend_count > 0) {
       // Parked in its own NtSuspendThread until another thread resumes it:
       // it never returns on its own, so save it like a blocking wait (the
@@ -2037,8 +2079,7 @@ uint32_t Processor::StepToGuestSafePoint(uint32_t thread_id, bool ignore_host,
         *out_parked_in_self_suspend = true;
       }
       pc = thunk_func->address();
-    } else if (export_data &&
-               (export_data->tags & cpu::ExportTag::kBlocking)) {
+    } else if (export_data && (export_data->tags & cpu::ExportTag::kBlocking)) {
       pc = thunk_func->address();
     } else if (export_data && export_data->name &&
                !std::strcmp(export_data->name, "RtlEnterCriticalSection")) {
@@ -2056,10 +2097,11 @@ uint32_t Processor::StepToGuestSafePoint(uint32_t thread_id, bool ignore_host,
                    std::chrono::steady_clock::now() - started >
                        std::chrono::milliseconds(300);
           })) {
-        uint32_t cs = static_cast<uint32_t>(
-            thread->thread_state()->context()->r[3]);
+        uint32_t cs =
+            static_cast<uint32_t>(thread->thread_state()->context()->r[3]);
         XELOGI(
-            "StepToGuestSafePoint: thread {} waiting in RtlEnterCriticalSection "
+            "StepToGuestSafePoint: thread {} waiting in "
+            "RtlEnterCriticalSection "
             "on {:08X}; saved at the call, re-issued on restore, lock count "
             "adjusted in the image",
             thread_id, cs);
@@ -2082,12 +2124,13 @@ uint32_t Processor::StepToGuestSafePoint(uint32_t thread_id, bool ignore_host,
       uint32_t code =
           xe::load_and_swap<uint32_t>(memory()->TranslateVirtual(first_pc));
       auto& opcode_info = xe::cpu::ppc::LookupOpcodeInfo(code);
-      XELOGI("StepToGuestSafePoint: thread {} host frame over guest {:08X} "
-             "({}), {}",
-             thread_id, first_pc, static_cast<int>(opcode_info.type),
-             opcode_info.type == xe::cpu::ppc::PPCOpcodeType::kSync
-                 ? "sync - saving here"
-                 : "stepping to next instruction");
+      XELOGI(
+          "StepToGuestSafePoint: thread {} host frame over guest {:08X} "
+          "({}), {}",
+          thread_id, first_pc, static_cast<int>(opcode_info.type),
+          opcode_info.type == xe::cpu::ppc::PPCOpcodeType::kSync
+              ? "sync - saving here"
+              : "stepping to next instruction");
       if (opcode_info.type == xe::cpu::ppc::PPCOpcodeType::kSync) {
         // Good to go.
         pc = first_pc;
@@ -2125,12 +2168,14 @@ uint32_t Processor::StepToGuestSafePoint(uint32_t thread_id, bool ignore_host,
       int sleep_us = 200 << (9 - nudge_attempts_remaining_);
       xe::threading::Sleep(std::chrono::microseconds(sleep_us));
       thread->thread()->Suspend(&before_suspend);
-      XELOGI("StepToGuestSafePoint: thread {} - no guest frame (exception pc "
-             "{:X}), nudged {} us ({} left; counts {}->{})",
-             thread_id,
-             thread->thread_state() ? thread->thread_state()->current_exception_pc()
-                                    : 0,
-             sleep_us, nudge_attempts_remaining_, before_resume, before_suspend);
+      XELOGI(
+          "StepToGuestSafePoint: thread {} - no guest frame (exception pc "
+          "{:X}), nudged {} us ({} left; counts {}->{})",
+          thread_id,
+          thread->thread_state()
+              ? thread->thread_state()->current_exception_pc()
+              : 0,
+          sleep_us, nudge_attempts_remaining_, before_resume, before_suspend);
       return StepToGuestSafePoint(thread_id, false, guest_suspend_count,
                                   out_parked_in_self_suspend);
     } else {

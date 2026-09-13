@@ -147,9 +147,8 @@ bool GTKWindow::OpenImpl() {
       monitor_index < gdk_display_get_n_monitors(gdk_display);
   if (monitor_chosen) {
     GdkRectangle geometry;
-    gdk_monitor_get_geometry(gdk_display_get_monitor(gdk_display,
-                                                     monitor_index),
-                             &geometry);
+    gdk_monitor_get_geometry(
+        gdk_display_get_monitor(gdk_display, monitor_index), &geometry);
     int window_width = 0, window_height = 0;
     gtk_window_get_size(GTK_WINDOW(window_), &window_width, &window_height);
     gtk_window_move(GTK_WINDOW(window_),

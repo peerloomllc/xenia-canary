@@ -313,7 +313,8 @@ void SetupConfig(const std::filesystem::path& config_folder) {
 }
 
 std::filesystem::path GameConfigPath(const std::string_view title_id) {
-  return config_folder / "config" / (std::string(title_id) + game_config_suffix);
+  return config_folder / "config" /
+         (std::string(title_id) + game_config_suffix);
 }
 
 namespace {

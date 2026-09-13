@@ -18,9 +18,9 @@
 #include "xenia/base/profiling.h"
 #include "xenia/base/threading.h"
 #include "xenia/config.h"
+#include "xenia/emulator.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/gpu_flags.h"
-#include "xenia/emulator.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/ui/graphics_provider.h"
 #include "xenia/ui/window.h"
@@ -220,8 +220,8 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
                 // the time scalar stretches, so 2x there really is twice the
                 // vblanks. This branch sleeps in host time; apply the scalar
                 // here so fast-forward and slow-motion work on Linux too.
-                const double scalar = std::clamp(Clock::guest_time_scalar(),
-                                                 1.0 / 16.0, 16.0);
+                const double scalar =
+                    std::clamp(Clock::guest_time_scalar(), 1.0 / 16.0, 16.0);
                 sleep_duration_ns =
                     static_cast<uint64_t>(sleep_duration_ns / scalar);
                 if (!cvars::vblank_deadline_pacing) {

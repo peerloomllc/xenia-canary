@@ -352,8 +352,8 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
       auto& context = *contexts_[context_id];
       uint32_t k = ++kicks_per_context[context_id];
       if (k <= 2 || k == 10 || k == 100 || (k % 1000) == 0) {
-        XELOGI("XMA: kick context {} (#{}) allocated={} enabled={}",
-               context_id, k, context.is_allocated(), context.is_enabled());
+        XELOGI("XMA: kick context {} (#{}) allocated={} enabled={}", context_id,
+               k, context.is_allocated(), context.is_enabled());
       }
       context.Enable();
       if (!cvars::use_dedicated_xma_thread) {
@@ -511,11 +511,12 @@ bool XmaDecoder::Restore(ByteStream* stream) {
       context.RestoreState(stream, 0);
     }
   }
-  XELOGI("XmaDecoder::Restore: {} contexts allocated, {} enabled, {} "
-         "allocation(s) changed, decoder state {}",
-         allocated, enabled, changed,
-         has_context_state ? (ok ? "restored" : "PARTLY restored")
-                           : "not in file, reset");
+  XELOGI(
+      "XmaDecoder::Restore: {} contexts allocated, {} enabled, {} "
+      "allocation(s) changed, decoder state {}",
+      allocated, enabled, changed,
+      has_context_state ? (ok ? "restored" : "PARTLY restored")
+                        : "not in file, reset");
   return true;
 }
 

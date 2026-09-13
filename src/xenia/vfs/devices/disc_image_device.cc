@@ -158,8 +158,9 @@ bool DiscImageDevice::ReadEntry(ParseState* state, const uint8_t* buffer,
   uint8_t name_length = xe::load<uint8_t>(p + 13);
   auto name_buffer = reinterpret_cast<const char*>(p + 14);
   if (p + 14 + name_length > image_end) {
-    XELOGE("DiscImageDevice: entry name out of bounds in '{}' (malformed image)",
-           xe::path_to_utf8(host_path_));
+    XELOGE(
+        "DiscImageDevice: entry name out of bounds in '{}' (malformed image)",
+        xe::path_to_utf8(host_path_));
     return false;
   }
 

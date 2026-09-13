@@ -11,9 +11,9 @@
 #define XENIA_APU_SDL_SDL_AUDIO_DRIVER_H_
 
 #include <atomic>
-#include <mutex>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <queue>
 #include <stack>
 #include <vector>

@@ -11,8 +11,8 @@
 #define XENIA_CPU_PROCESSOR_H_
 
 #include <atomic>
-#include <map>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -198,11 +198,12 @@ class Processor {
   // guest_suspend_count / out_parked_in_self_suspend: a thread parked in its
   // own NtSuspendThread (count > 0) is saved at the call, to be re-issued on
   // restore, and reported through the out parameter.
-  uint32_t StepToGuestSafePoint(uint32_t thread_id, bool ignore_host = false,
-                                uint32_t guest_suspend_count = 0,
-                                bool* out_parked_in_self_suspend = nullptr,
-                                const std::function<bool()>& give_up = nullptr,
-                                std::pair<uint32_t, int32_t>* out_memory_fixup = nullptr);
+  uint32_t StepToGuestSafePoint(
+      uint32_t thread_id, bool ignore_host = false,
+      uint32_t guest_suspend_count = 0,
+      bool* out_parked_in_self_suspend = nullptr,
+      const std::function<bool()>& give_up = nullptr,
+      std::pair<uint32_t, int32_t>* out_memory_fixup = nullptr);
   // out_memory_fixup: (guest address, delta) to add to an int32 in the saved
   // memory image only. A thread saved inside RtlEnterCriticalSection's wait
   // has counted itself in the section's lock_count; the call is re-issued on
@@ -313,7 +314,7 @@ class Processor {
 
   // TODO(benvanik): cleanup/change structures.
   std::vector<Breakpoint*> breakpoints_;
-  int nudge_attempts_remaining_ = 0;  // StepToGuestSafePoint retry budget.
+  int nudge_attempts_remaining_ = 0;    // StepToGuestSafePoint retry budget.
   bool in_step_to_safe_point_ = false;  // Set for the recursive calls.
 
   Irql irql_;

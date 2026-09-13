@@ -51,7 +51,7 @@ bool xe_global_mutex::try_lock() {
   if (TryAcquireSRWLockExclusive(&srwlock_)) {
     owner_thread_ = self;
     recursion_count_ = 1;
-  threading::BeginSuspendDeferral();
+    threading::BeginSuspendDeferral();
     return true;
   }
   return false;
@@ -132,7 +132,7 @@ void xe_global_mutex::lock() {
     owner_.store(self, std::memory_order_relaxed);
     owner_tid_.store(current_tid(), std::memory_order_relaxed);
     recursion_count_ = 1;
-  threading::BeginSuspendDeferral();
+    threading::BeginSuspendDeferral();
     return;
   }
 
@@ -152,9 +152,9 @@ void xe_global_mutex::lock_slow() {
                                        std::memory_order_relaxed)) {
       owner_.store(self, std::memory_order_relaxed);
       owner_tid_.store(current_tid(), std::memory_order_relaxed);
-    owner_tid_.store(current_tid(), std::memory_order_relaxed);
+      owner_tid_.store(current_tid(), std::memory_order_relaxed);
       recursion_count_ = 1;
-  threading::BeginSuspendDeferral();
+      threading::BeginSuspendDeferral();
       return;
     }
   }
@@ -167,9 +167,9 @@ void xe_global_mutex::lock_slow() {
       // We got the lock while marking contended
       owner_.store(self, std::memory_order_relaxed);
       owner_tid_.store(current_tid(), std::memory_order_relaxed);
-    owner_tid_.store(current_tid(), std::memory_order_relaxed);
+      owner_tid_.store(current_tid(), std::memory_order_relaxed);
       recursion_count_ = 1;
-  threading::BeginSuspendDeferral();
+      threading::BeginSuspendDeferral();
       return;
     }
 
@@ -182,9 +182,9 @@ void xe_global_mutex::lock_slow() {
                                        std::memory_order_relaxed)) {
       owner_.store(self, std::memory_order_relaxed);
       owner_tid_.store(current_tid(), std::memory_order_relaxed);
-    owner_tid_.store(current_tid(), std::memory_order_relaxed);
+      owner_tid_.store(current_tid(), std::memory_order_relaxed);
       recursion_count_ = 1;
-  threading::BeginSuspendDeferral();
+      threading::BeginSuspendDeferral();
       return;
     }
   }
@@ -223,7 +223,7 @@ bool xe_global_mutex::try_lock() {
     owner_.store(self, std::memory_order_relaxed);
     owner_tid_.store(current_tid(), std::memory_order_relaxed);
     recursion_count_ = 1;
-  threading::BeginSuspendDeferral();
+    threading::BeginSuspendDeferral();
     return true;
   }
   return false;

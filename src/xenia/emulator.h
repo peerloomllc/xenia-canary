@@ -22,9 +22,9 @@
 #include "xenia/base/delegate.h"
 #include "xenia/base/exception_handler.h"
 #include "xenia/kernel/kernel_state.h"
-#include "xenia/kernel/xthread.h"
 #include "xenia/kernel/util/game_info_database.h"
 #include "xenia/kernel/util/xlast.h"
+#include "xenia/kernel/xthread.h"
 #include "xenia/memory.h"
 #include "xenia/patcher/patcher.h"
 #include "xenia/patcher/plugin_loader.h"
@@ -79,10 +79,10 @@ constexpr uint32_t kSaveStateFirstVersionWithTimers = 4;
 struct SaveStateFileInfo {
   uint32_t version = 0;  // 1 = legacy raw stream, 2+ = container
   uint32_t title_id = 0;
-  uint32_t media_id = 0;     // format 3+, else 0
-  uint8_t disc_number = 0;   // format 3+, else 0
-  uint8_t disc_count = 0;    // format 3+, else 0
-  uint64_t raw_size = 0;     // format 2+, else 0
+  uint32_t media_id = 0;    // format 3+, else 0
+  uint8_t disc_number = 0;  // format 3+, else 0
+  uint8_t disc_count = 0;   // format 3+, else 0
+  uint64_t raw_size = 0;    // format 2+, else 0
   bool has_disc_info() const { return version >= 3; }
 };
 static constexpr std::string_view kDefaultGameSymbolicLink = "GAME:";
@@ -528,7 +528,8 @@ class Emulator {
   std::atomic<bool> frame_advance_pending_{false};
   std::atomic<bool> frame_advance_hold_{false};
   std::atomic<bool> frame_advance_reached_{false};
-  // The guest clock at Pause(); Resume() sets it back (pause_rewinds_guest_clock).
+  // The guest clock at Pause(); Resume() sets it back
+  // (pause_rewinds_guest_clock).
   uint64_t pause_guest_tick_count_ = 0;
   // Guest threads Pause() suspended, so Resume() undoes exactly that.
   std::vector<kernel::object_ref<kernel::XThread>> paused_threads_;

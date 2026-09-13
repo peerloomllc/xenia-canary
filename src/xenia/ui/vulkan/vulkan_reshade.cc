@@ -297,7 +297,8 @@ std::unique_ptr<VulkanReShade::Effect> VulkanReShade::CompileEffect(
     uniform.default_value.assign(
         reinterpret_cast<const uint8_t*>(u.initializer_value.as_float),
         reinterpret_cast<const uint8_t*>(u.initializer_value.as_float) +
-            std::min<uint32_t>(u.size, uint32_t(sizeof(u.initializer_value.as_float))));
+            std::min<uint32_t>(u.size,
+                               uint32_t(sizeof(u.initializer_value.as_float))));
     if (const auto* a = FindAnnotation(u, "ui_label")) {
       uniform.ui_label = a->value.string_data;
     }
@@ -372,7 +373,8 @@ std::unique_ptr<VulkanReShade::Effect> VulkanReShade::CompileEffect(
   }
 
   // Assemble per-entry-point SPIR-V once, keyed by entry point name.
-  auto spirv_for = [&](const std::string& entry_point) -> std::vector<uint32_t> {
+  auto spirv_for =
+      [&](const std::string& entry_point) -> std::vector<uint32_t> {
     if (entry_point.empty()) {
       return {};
     }
@@ -491,10 +493,9 @@ std::unique_ptr<VulkanReShade::Effect> VulkanReShade::CompileEffect(
     }
   }
 
-  XELOGI(
-      "VulkanReShade: compiled '{}' - {} uniform(s) ({} bytes), {} pass(es)",
-      effect->name, effect->uniforms.size(), effect->uniform_size,
-      effect->passes.size());
+  XELOGI("VulkanReShade: compiled '{}' - {} uniform(s) ({} bytes), {} pass(es)",
+         effect->name, effect->uniforms.size(), effect->uniform_size,
+         effect->passes.size());
   return effect;
 }
 
@@ -718,8 +719,7 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
     ubo_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     ubo_binding.descriptorCount = 1;
     ubo_binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT |
-                             VK_SHADER_STAGE_FRAGMENT_BIT |
-                             extra_compute_stage;
+                             VK_SHADER_STAGE_FRAGMENT_BIT | extra_compute_stage;
     VkDescriptorSetLayoutCreateInfo ci = {
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     ci.bindingCount = 1;
@@ -744,9 +744,8 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     ci.bindingCount = uint32_t(bindings.size());
     ci.pBindings = bindings.empty() ? nullptr : bindings.data();
-    if (dfn.vkCreateDescriptorSetLayout(device, &ci, nullptr,
-                                        &effect.set_layout_samplers) !=
-        VK_SUCCESS) {
+    if (dfn.vkCreateDescriptorSetLayout(
+            device, &ci, nullptr, &effect.set_layout_samplers) != VK_SUCCESS) {
       XELOGE("VulkanReShade: failed to create the sampler set layout");
       DestroyRuntime(effect);
       return false;
@@ -754,7 +753,8 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
   }
   if (effect.has_compute) {
     // Set 2: storage images (RWTexture2D) a compute pass writes.
-    std::vector<VkDescriptorSetLayoutBinding> bindings(std::max(1u, max_storages));
+    std::vector<VkDescriptorSetLayoutBinding> bindings(
+        std::max(1u, max_storages));
     for (uint32_t i = 0; i < bindings.size(); ++i) {
       bindings[i].binding = i;
       bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -765,9 +765,8 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     ci.bindingCount = uint32_t(bindings.size());
     ci.pBindings = bindings.data();
-    if (dfn.vkCreateDescriptorSetLayout(device, &ci, nullptr,
-                                        &effect.set_layout_storages) !=
-        VK_SUCCESS) {
+    if (dfn.vkCreateDescriptorSetLayout(
+            device, &ci, nullptr, &effect.set_layout_storages) != VK_SUCCESS) {
       XELOGE("VulkanReShade: failed to create the storage set layout");
       DestroyRuntime(effect);
       return false;
@@ -802,8 +801,7 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
     VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ici.imageType = VK_IMAGE_TYPE_2D;
     ici.format = texture.format;
-    ici.extent = {std::max(1u, texture.width), std::max(1u, texture.height),
-                  1};
+    ici.extent = {std::max(1u, texture.width), std::max(1u, texture.height), 1};
     ici.mipLevels = texture.levels;
     ici.arrayLayers = 1;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -820,9 +818,9 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
     }
     ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (!util::CreateDedicatedAllocationImage(
-            device_, ici, util::MemoryPurpose::kDeviceLocal, texture.image,
-            texture.memory)) {
+    if (!util::CreateDedicatedAllocationImage(device_, ici,
+                                              util::MemoryPurpose::kDeviceLocal,
+                                              texture.image, texture.memory)) {
       XELOGE("VulkanReShade: failed to create render-target texture '{}'",
              texture.name);
       DestroyRuntime(effect);
@@ -836,8 +834,7 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
     vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, texture.levels, 0, 1};
     if (dfn.vkCreateImageView(device, &vci, nullptr, &texture.view) !=
         VK_SUCCESS) {
-      XELOGE("VulkanReShade: failed to create the view for '{}'",
-             texture.name);
+      XELOGE("VulkanReShade: failed to create the view for '{}'", texture.name);
       DestroyRuntime(effect);
       return false;
     }
@@ -890,8 +887,8 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
     vci.format = format;
     vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     if (!util::CreateDedicatedAllocationImage(
-            device_, ici, util::MemoryPurpose::kDeviceLocal,
-            effect.chain_image, effect.chain_memory)) {
+            device_, ici, util::MemoryPurpose::kDeviceLocal, effect.chain_image,
+            effect.chain_memory)) {
       XELOGE("VulkanReShade: failed to create the ping-pong image");
       DestroyRuntime(effect);
       return false;
@@ -919,8 +916,8 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
   }
   std::memset(effect.uniform_mapped, 0, size_t(ubo_size));
   for (const Uniform& u : effect.uniforms) {
-    if (!u.default_value.empty() && u.offset + u.default_value.size() <=
-                                        size_t(ubo_size)) {
+    if (!u.default_value.empty() &&
+        u.offset + u.default_value.size() <= size_t(ubo_size)) {
       std::memcpy(static_cast<uint8_t*>(effect.uniform_mapped) + u.offset,
                   u.default_value.data(), u.default_value.size());
     }
@@ -933,9 +930,11 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
     sizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[0].descriptorCount = std::max(1u, pass_count);
     sizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    sizes[1].descriptorCount = std::max(1u, pass_count * std::max(1u, max_samplers));
+    sizes[1].descriptorCount =
+        std::max(1u, pass_count * std::max(1u, max_samplers));
     sizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    sizes[2].descriptorCount = std::max(1u, pass_count * std::max(1u, max_storages));
+    sizes[2].descriptorCount =
+        std::max(1u, pass_count * std::max(1u, max_storages));
     VkDescriptorPoolCreateInfo ci = {
         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     // Up to three sets per pass (ubo, samplers, storages).
@@ -980,8 +979,7 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
       DestroyRuntime(effect);
       return false;
     }
-    const bool has_depth =
-        effect.stencil_format != VK_FORMAT_S8_UINT;
+    const bool has_depth = effect.stencil_format != VK_FORMAT_S8_UINT;
     VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ici.imageType = VK_IMAGE_TYPE_2D;
     ici.format = effect.stencil_format;
@@ -1189,9 +1187,8 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
         ds.samples = VK_SAMPLE_COUNT_1_BIT;
         ds.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         ds.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        ds.stencilLoadOp = pass.stencil_clear
-                               ? VK_ATTACHMENT_LOAD_OP_CLEAR
-                               : VK_ATTACHMENT_LOAD_OP_LOAD;
+        ds.stencilLoadOp = pass.stencil_clear ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                                              : VK_ATTACHMENT_LOAD_OP_LOAD;
         ds.stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
         ds.initialLayout =
             pass.stencil_clear
@@ -1208,10 +1205,11 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
       VkSubpassDependency dependencies[2] = {};
       dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
       dependencies[0].dstSubpass = 0;
-      dependencies[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-                                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-      dependencies[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT |
-                                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+      dependencies[0].srcStageMask =
+          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+      dependencies[0].srcAccessMask =
+          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
       dependencies[0].dstStageMask =
           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
       dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
@@ -1245,7 +1243,8 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
         dependencies[1].dstAccessMask |=
             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
       }
-      VkRenderPassCreateInfo rp_ci = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+      VkRenderPassCreateInfo rp_ci = {
+          VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
       rp_ci.attachmentCount = total_attachments;
       rp_ci.pAttachments = attachments;
       rp_ci.subpassCount = 1;
@@ -1285,8 +1284,8 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
       fb_ci.width = fb_width;
       fb_ci.height = fb_height;
       fb_ci.layers = 1;
-      if (dfn.vkCreateFramebuffer(device, &fb_ci, nullptr,
-                                  &pass.framebuffer) != VK_SUCCESS) {
+      if (dfn.vkCreateFramebuffer(device, &fb_ci, nullptr, &pass.framebuffer) !=
+          VK_SUCCESS) {
         XELOGE("VulkanReShade: failed to create the framebuffer for '{}'",
                pass.name);
         DestroyRuntime(effect);
@@ -1435,8 +1434,7 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
     int tw = 0, th = 0, tc = 0;
     stbi_uc* pixels = stbi_load(texture.source_file.c_str(), &tw, &th, &tc, 4);
     if (!pixels) {
-      XELOGW("VulkanReShade: could not load texture '{}'",
-             texture.source_file);
+      XELOGW("VulkanReShade: could not load texture '{}'", texture.source_file);
       continue;
     }
     const VkDeviceSize data_size = VkDeviceSize(tw) * th * 4;
@@ -1451,9 +1449,9 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
     ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (!util::CreateDedicatedAllocationImage(
-            device_, ici, util::MemoryPurpose::kDeviceLocal, texture.image,
-            texture.memory)) {
+    if (!util::CreateDedicatedAllocationImage(device_, ici,
+                                              util::MemoryPurpose::kDeviceLocal,
+                                              texture.image, texture.memory)) {
       stbi_image_free(pixels);
       continue;
     }
@@ -1529,8 +1527,8 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
       si.commandBufferCount = 1;
       si.pCommandBuffers = &cb;
       {
-        auto q = device_->AcquireQueue(
-            device_->queue_family_graphics_compute(), 0);
+        auto q =
+            device_->AcquireQueue(device_->queue_family_graphics_compute(), 0);
         dfn.vkQueueSubmit(q.queue(), 1, &si, fence);
       }
       dfn.vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
@@ -1566,8 +1564,8 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
       barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
       barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
       barrier.image = texture.image;
-      barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
-                                  texture.levels, 0, 1};
+      barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, texture.levels,
+                                  0, 1};
       barriers.push_back(barrier);
     }
     if (!barriers.empty()) {
@@ -1588,8 +1586,8 @@ bool VulkanReShade::CreateRuntime(Effect& effect, VkFormat format,
       bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
       dfn.vkBeginCommandBuffer(cb, &bi);
       dfn.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
-                               0, nullptr, uint32_t(barriers.size()),
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                               nullptr, uint32_t(barriers.size()),
                                barriers.data());
       const VkClearColorValue clear_color = {};
       for (VkImageMemoryBarrier& barrier : barriers) {
@@ -1633,9 +1631,9 @@ namespace {
 // Regenerate a texture's mip chain by blitting each level down into the next.
 // Level 0 (and levels 1..n-1) are expected in SHADER_READ_ONLY_OPTIMAL on
 // entry; all levels are left in SHADER_READ_ONLY_OPTIMAL.
-void GenerateTextureMips(const VulkanDevice::Functions& dfn,
-                         VkCommandBuffer cb, VkImage image, uint32_t width,
-                         uint32_t height, uint32_t levels) {
+void GenerateTextureMips(const VulkanDevice::Functions& dfn, VkCommandBuffer cb,
+                         VkImage image, uint32_t width, uint32_t height,
+                         uint32_t levels) {
   if (levels <= 1 || image == VK_NULL_HANDLE) {
     return;
   }
@@ -1763,14 +1761,12 @@ bool VulkanReShade::Render(VkCommandBuffer command_buffer, Effect& effect,
               }
             }
           }
-          image_infos[i].sampler =
-              (i < pass.slot_samplers.size() &&
-               pass.slot_samplers[i] != VK_NULL_HANDLE)
-                  ? pass.slot_samplers[i]
-                  : runtime_sampler_;
+          image_infos[i].sampler = (i < pass.slot_samplers.size() &&
+                                    pass.slot_samplers[i] != VK_NULL_HANDLE)
+                                       ? pass.slot_samplers[i]
+                                       : runtime_sampler_;
           image_infos[i].imageView = slot_view;
-          image_infos[i].imageLayout =
-              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+          image_infos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
           writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
           writes[i].dstSet = pass.sampler_descriptor_set;
           writes[i].dstBinding = i;
@@ -1826,8 +1822,7 @@ bool VulkanReShade::Render(VkCommandBuffer command_buffer, Effect& effect,
       uint32_t groups_y =
           pass.dispatch_height
               ? pass.dispatch_height
-              : (extent.height + pass.num_threads[1] - 1) /
-                    pass.num_threads[1];
+              : (extent.height + pass.num_threads[1] - 1) / pass.num_threads[1];
       uint32_t groups_z = pass.dispatch_depth;
       dfn.vkCmdDispatch(command_buffer, std::max(1u, groups_x),
                         std::max(1u, groups_y), std::max(1u, groups_z));
@@ -1901,11 +1896,10 @@ bool VulkanReShade::Render(VkCommandBuffer command_buffer, Effect& effect,
             }
           }
         }
-        image_infos[i].sampler =
-            (i < pass.slot_samplers.size() &&
-             pass.slot_samplers[i] != VK_NULL_HANDLE)
-                ? pass.slot_samplers[i]
-                : runtime_sampler_;
+        image_infos[i].sampler = (i < pass.slot_samplers.size() &&
+                                  pass.slot_samplers[i] != VK_NULL_HANDLE)
+                                     ? pass.slot_samplers[i]
+                                     : runtime_sampler_;
         image_infos[i].imageView = slot_view;
         image_infos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -1940,9 +1934,12 @@ bool VulkanReShade::Render(VkCommandBuffer command_buffer, Effect& effect,
     // shader targets Direct3D clip space, so without this the output is
     // vertically mirrored under Vulkan (confirmed with a UV probe). Applied
     // to every pass so intermediate textures stay in one orientation.
-    VkViewport viewport = {0.0f, float(pass_extent.height),
+    VkViewport viewport = {0.0f,
+                           float(pass_extent.height),
                            float(pass_extent.width),
-                           -float(pass_extent.height), 0.0f, 1.0f};
+                           -float(pass_extent.height),
+                           0.0f,
+                           1.0f};
     VkRect2D scissor = {{0, 0}, pass_extent};
     dfn.vkCmdSetViewport(command_buffer, 0, 1, &viewport);
     dfn.vkCmdSetScissor(command_buffer, 0, 1, &scissor);

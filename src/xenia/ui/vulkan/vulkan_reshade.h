@@ -224,8 +224,8 @@ class VulkanReShade {
   // Compiles a .fx file for the given output size. Returns the effect (with
   // per-entry-point SPIR-V and reflected uniforms/passes) or nullptr on
   // failure, logging the compiler errors.
-  std::unique_ptr<Effect> CompileEffect(const std::string& path,
-                                        uint32_t width, uint32_t height);
+  std::unique_ptr<Effect> CompileEffect(const std::string& path, uint32_t width,
+                                        uint32_t height);
 
   // Builds the Vulkan pipelines/descriptors for the effect, targeting the
   // given output format, and uploads the uniform defaults. `sampler` is used

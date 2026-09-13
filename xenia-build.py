@@ -646,6 +646,32 @@ def get_clang_format_binary():
     """
     clang_format_version_min = 19
 
+    # A pinned version wins over a newer one. CI installs exactly one
+    # clang-format and lints the whole tree with it, while this function
+    # otherwise picks the newest installed: anyone with a newer one then
+    # reformats files in ways CI rejects, and the check goes red for everyone
+    # on changes they did not make. .clang-format-version, next to
+    # .clang-format, says which one the tree is formatted with.
+    pinned_path = os.path.join(self_path, ".clang-format-version")
+    if os.path.exists(pinned_path):
+        with open(pinned_path) as f:
+            pinned = f.read().strip()
+        if pinned:
+            binary = f"clang-format-{pinned}"
+            for candidate in (binary, "clang-format"):
+                if not has_bin(candidate):
+                    continue
+                try:
+                    out = subprocess.check_output([candidate, "--version"], text=True)
+                    if out.split("version ")[1].split(".")[0] == pinned:
+                        print(out)
+                        return candidate
+                except:
+                    continue
+            print(f"WARNING: clang-format {pinned} is pinned in "
+                  f".clang-format-version but is not on PATH. Formatting with "
+                  f"another version will drift the tree away from CI.")
+
     # Build list of all potential clang-format binaries
     all_binaries = []
 

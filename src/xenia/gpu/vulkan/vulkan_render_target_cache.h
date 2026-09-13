@@ -11,12 +11,12 @@
 #define XENIA_GPU_VULKAN_VULKAN_RENDER_TARGET_CACHE_H_
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
-#include <functional>
 #include <deque>
+#include <functional>
 #include <memory>
-#include <chrono>
 #include <unordered_map>
 
 #include "xenia/base/hash.h"
@@ -381,8 +381,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   VkSampler reshade_depth_resolve_sampler_ = VK_NULL_HANDLE;
   VkDescriptorPool reshade_depth_resolve_descriptor_pool_ = VK_NULL_HANDLE;
   static constexpr uint32_t kReShadeDepthResolveSets = 3;
-  VkDescriptorSet
-      reshade_depth_resolve_sets_[kReShadeDepthResolveSets] = {};
+  VkDescriptorSet reshade_depth_resolve_sets_[kReShadeDepthResolveSets] = {};
   uint32_t reshade_depth_resolve_set_index_ = 0;
   VkFramebuffer reshade_depth_resolve_framebuffer_ = VK_NULL_HANDLE;
   VkImageView reshade_depth_resolve_fb_view_ = VK_NULL_HANDLE;
@@ -404,8 +403,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   uint32_t reshade_depth_snapshot_width_ = 0;
   uint32_t reshade_depth_snapshot_height_ = 0;
   VkFormat reshade_depth_snapshot_format_ = VK_FORMAT_UNDEFINED;
-  VkSampleCountFlagBits reshade_depth_snapshot_samples_ =
-      VK_SAMPLE_COUNT_1_BIT;
+  VkSampleCountFlagBits reshade_depth_snapshot_samples_ = VK_SAMPLE_COUNT_1_BIT;
   bool reshade_depth_snapshot_valid_ = false;
   uint64_t reshade_depth_snapshot_best_area_ = 0;
   // Snapshot holding images retired on a size/format change, kept until the

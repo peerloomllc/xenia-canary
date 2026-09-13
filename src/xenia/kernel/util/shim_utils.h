@@ -19,8 +19,8 @@
 #include "xenia/base/memory.h"
 #include "xenia/base/string_buffer.h"
 #include "xenia/cpu/export_resolver.h"
-#include "xenia/cpu/thread_state.h"
 #include "xenia/cpu/ppc/ppc_context.h"
+#include "xenia/cpu/thread_state.h"
 #include "xenia/kernel/kernel_flags.h"
 #include "xenia/kernel/kernel_state.h"
 
@@ -554,9 +554,9 @@ struct ExportRegistrerHelper {
         // The make_tuple order is undefined per the C++ standard and
         // cause inconsitencies between msvc and clang.
         std::tuple<Ps...> params = {Ps(init)...};
-        cpu::ThreadState::ExportScope export_scope(
-            ppc_context->thread_state, export_entry,
-            __builtin_return_address(0));
+        cpu::ThreadState::ExportScope export_scope(ppc_context->thread_state,
+                                                   export_entry,
+                                                   __builtin_return_address(0));
         if (TAGS & xe::cpu::ExportTag::kLog &&
             (!(TAGS & xe::cpu::ExportTag::kHighFrequency) ||
              cvars::log_high_frequency_kernel_calls)) {
@@ -590,9 +590,9 @@ struct ExportRegistrerHelper {
             0,
         };
         std::tuple<Ps...> params = {Ps(init)...};
-        cpu::ThreadState::ExportScope export_scope(
-            ppc_context->thread_state, export_entry,
-            __builtin_return_address(0));
+        cpu::ThreadState::ExportScope export_scope(ppc_context->thread_state,
+                                                   export_entry,
+                                                   __builtin_return_address(0));
         if constexpr (std::is_void<R>::value) {
           KernelTrampoline(fn, std::forward<std::tuple<Ps...>>(params),
                            std::make_index_sequence<sizeof...(Ps)>());

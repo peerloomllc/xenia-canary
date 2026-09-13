@@ -129,7 +129,6 @@ class Fence {
     return true;
   }
 
-
  private:
   using state_t_ = uint_fast32_t;
   static constexpr state_t_ SIGMASK_ = state_t_(1)
