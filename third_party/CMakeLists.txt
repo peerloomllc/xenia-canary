@@ -224,6 +224,16 @@ else()
   set(XE_HAS_NVIDIA_DLSS OFF CACHE INTERNAL "NVIDIA DLSS SDK available")
 endif()
 
+# lz4 (BSD-2-Clause: block compression for save states)
+# ==============================================================================
+# Vendored rather than taken from the system: save states compress with it and
+# emulator.cc includes <lz4.h> unconditionally, so a system-only dependency
+# left the Windows build unable to find the header at all. 1.10.0, the same
+# version Fedora ships, so existing save files stay byte-compatible.
+add_library(lz4 STATIC ${CMAKE_CURRENT_SOURCE_DIR}/lz4/lz4.c)
+target_include_directories(lz4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/lz4)
+set_target_properties(lz4 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # reshade-fx (BSD-3-Clause: ReShade FX shader compiler -> SPIR-V, for the
 # native ReShade-style post-process runtime in the Vulkan presenter)
 # ==============================================================================

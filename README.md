@@ -97,7 +97,7 @@ needs.
 To build from source on Fedora (44):
 
 ```sh
-sudo dnf install clang cmake ninja-build python3 gtk3-devel lz4-devel sdl2-compat-devel \
+sudo dnf install clang cmake ninja-build python3 gtk3-devel sdl2-compat-devel \
     vulkan-loader-devel spirv-tools glslang libunwind-devel alsa-lib-devel libX11-devel
 git clone --recursive -b linux-native-work https://github.com/peerloomllc/xenia-canary.git
 cd xenia-canary
