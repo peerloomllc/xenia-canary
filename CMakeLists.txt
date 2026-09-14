@@ -265,7 +265,7 @@ else()
     if(XENIA_STDCXXFS_LIBRARY)
       link_libraries(stdc++fs)
     endif()
-    link_libraries(dl lz4 pthread rt)
+    link_libraries(dl pthread rt)
 
     # Link groups for executables (resolves circular deps)
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--start-group")

@@ -494,8 +494,22 @@ class XThread : public XObject, public cpu::Thread {
   // parked in when it was saved; the guest suspend count in the restored
   // memory already includes it.
   uint32_t SelfSuspend(bool already_counted = false);
+#endif
+
+  // Title termination: a thread waiting in SelfSuspend must leave the wait
+  // before it is terminated (killing it inside pthread_cond_wait leaves the
+  // suspend mutex taken and corrupts the thread object). Callers are
+  // platform-neutral (kernel_state.cc), so these are declared everywhere.
+  // Windows has no such wait to leave: nothing parks there, so the flag is
+  // always false and the abort is a no-op.
+  bool in_self_suspend() const { return in_self_suspend_; }
+  void AbortSelfSuspend();
+
   // Save states (format 9): the thread was saved parked in its own
-  // NtSuspendThread; the call is re-issued on restore.
+  // NtSuspendThread; the call is re-issued on restore. The flags exist on
+  // every platform, because saving and restoring do, so these are outside
+  // the block above - which excludes the POSIX self-suspend implementation,
+  // not the state that describes it.
   void set_saved_in_self_suspend(bool value) { saved_in_self_suspend_ = value; }
   bool restored_self_suspend_pending() const {
     return restored_self_suspend_pending_;
@@ -505,12 +519,6 @@ class XThread : public XObject, public cpu::Thread {
     restored_self_suspend_pending_ = false;
     return pending;
   }
-  // Title termination: a thread waiting in SelfSuspend must leave the wait
-  // before it is terminated (killing it inside pthread_cond_wait leaves the
-  // suspend mutex taken and corrupts the thread object).
-  bool in_self_suspend() const { return in_self_suspend_; }
-  void AbortSelfSuspend();
-#endif
 
   xe::threading::Thread* thread() { return thread_.get(); }
 

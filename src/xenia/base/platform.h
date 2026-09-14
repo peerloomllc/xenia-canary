@@ -164,6 +164,15 @@
 #define XE_RESTRICT
 #endif
 
+// The address this function will return to. MSVC has no
+// __builtin_return_address; _ReturnAddress() is its intrinsic, declared in
+// <intrin.h>, which this header already includes there.
+#if XE_COMPILER_MSVC == 1 && XE_COMPILER_CLANG_CL == 0
+#define XE_RETURN_ADDRESS() _ReturnAddress()
+#else
+#define XE_RETURN_ADDRESS() __builtin_return_address(0)
+#endif
+
 #if XE_ARCH_AMD64 == 1
 #define XE_HOST_CACHE_LINE_SIZE 64
 #elif XE_ARCH_ARM64 == 1

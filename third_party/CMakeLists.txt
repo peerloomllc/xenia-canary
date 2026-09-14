@@ -224,6 +224,16 @@ else()
   set(XE_HAS_NVIDIA_DLSS OFF CACHE INTERNAL "NVIDIA DLSS SDK available")
 endif()
 
+# lz4 (BSD-2-Clause: block compression for save states)
+# ==============================================================================
+# Vendored rather than taken from the system: save states compress with it and
+# emulator.cc includes <lz4.h> unconditionally, so a system-only dependency
+# left the Windows build unable to find the header at all. 1.10.0, the same
+# version Fedora ships, so existing save files stay byte-compatible.
+add_library(lz4 STATIC ${CMAKE_CURRENT_SOURCE_DIR}/lz4/lz4.c)
+target_include_directories(lz4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/lz4)
+set_target_properties(lz4 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # reshade-fx (BSD-3-Clause: ReShade FX shader compiler -> SPIR-V, for the
 # native ReShade-style post-process runtime in the Vulkan presenter)
 # ==============================================================================
@@ -240,6 +250,16 @@ target_include_directories(reshade-fx PUBLIC
 target_include_directories(reshade-fx PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/reshade-fx/include)
 set_target_properties(reshade-fx PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# This code predates C++20, where std::filesystem::path::u8string() changed
+# from returning std::string to std::u8string. It assigns the result to a
+# std::string in eight places, which MSVC then rejects. The file works around
+# the same problem on Linux by defining u8string() to string(), which is only
+# correct there because the native encoding is already UTF-8. /Zc:char8_t-
+# keeps the C++17 meaning of u8 literals and u8string() for this library
+# alone, so the vendored source stays as upstream ReShade ships it.
+if(MSVC)
+  target_compile_options(reshade-fx PRIVATE /Zc:char8_t-)
+endif()
 
 # snappy
 # ==============================================================================
