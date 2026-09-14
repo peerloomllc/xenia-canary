@@ -1452,7 +1452,8 @@ bool EmulatorWindow::Initialize() {
       // an empty request into gamepad plus keyboard; do the same, and take
       // the lock it takes.
       const uint32_t flags = X_INPUT_FLAG::X_INPUT_FLAG_GAMEPAD |
-                             X_INPUT_FLAG::X_INPUT_FLAG_KEYBOARD;
+                             X_INPUT_FLAG::X_INPUT_FLAG_KEYBOARD |
+                             X_INPUT_FLAG::X_INPUT_FLAG_HOST_UI;
       auto anything_connected = [input_system, flags]() {
         X_INPUT_CAPABILITIES caps = {};
         auto lock = input_system->lock();
@@ -9360,7 +9361,12 @@ void EmulatorWindow::PollGamepadUi() {
     auto lock = input_system->lock();
     for (uint32_t i = 0; i < XUserMaxUserCount; ++i) {
       hid::X_INPUT_STATE slot_state = {};
-      if (input_system->GetState(i, hid::X_INPUT_FLAG::X_INPUT_FLAG_GAMEPAD,
+      // The host-UI bit is what lets a --ui_only_controllers pad answer at
+      // all; without it the driver reports that slot as unplugged, which is
+      // what a title is told.
+      if (input_system->GetState(i,
+                                 hid::X_INPUT_FLAG::X_INPUT_FLAG_GAMEPAD |
+                                     hid::X_INPUT_FLAG::X_INPUT_FLAG_HOST_UI,
                                  &slot_state) != X_ERROR_SUCCESS) {
         continue;
       }

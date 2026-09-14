@@ -33,18 +33,18 @@ fi
 
 if guitar_present; then
   sleep 2
-  # Hide the Deck's own pad while a guitar is plugged in, so the guitar is
-  # player one. A slot goes to whichever controller claims it first and the
-  # Deck's pad claims slot 0, which leaves a band game looking at a gamepad in
-  # player one's seat and asking for the rest of the band (notes/81). Steam
-  # already sets this variable, so add to it rather than replacing it.
-  # Steam's own value ends with a comma, and appending after it leaves an
-  # empty entry that SDL stops on, so trim it first.
-  ignore="${SDL_GAMECONTROLLER_IGNORE_DEVICES%,}"
-  export SDL_GAMECONTROLLER_IGNORE_DEVICES="${ignore:+$ignore,}0x28de/0x1205"
-  # Stronger and not dependent on that list parsing: show the guitar only.
-  export SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT="0x0351/0x4161,0x0351/0x1300"
-  # Steam also tells SDL to add its virtual pad whatever the lists say.
+  # The Deck's own pad used to be hidden from the emulator entirely while a
+  # guitar was attached, so the guitar would be player one: a slot goes to
+  # whichever controller claims it first and the Deck's pad claims slot 0,
+  # which left a band game looking at a gamepad in player one's seat and
+  # asking for the rest of the band (notes/81). The cost was that the Deck's
+  # own buttons could not work the emulator's menus or game library at all.
+  #
+  # --ui_only_controllers below does the same job without that cost: the
+  # Deck's pad drives the menus and the library, is given the last slot, and
+  # is never reported to a title, so the guitar is still player one.
+  # Steam also tells SDL to add its virtual pad whatever the lists say, and
+  # that one is a duplicate of the Deck's own controls.
   export SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD=0
 fi
 
@@ -57,6 +57,7 @@ fi
 # XENIA_LOG_LEVEL=3 turns on the per-slot guitar diagnostic, which logs what a
 # title actually receives once a second.
 "$XENIA" --apu=sdl --gamepad_ui_button=back+start \
+  --ui_only_controllers="steam deck,steam controller,steam virtual gamepad" \
   ${XENIA_LOG_LEVEL:+--log_level=$XENIA_LOG_LEVEL} "$@" > "$LOG" 2>&1
 status=$?
 

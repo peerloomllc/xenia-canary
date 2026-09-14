@@ -35,7 +35,11 @@ enum X_INPUT_FLAG {
   X_INPUT_FLAG_UNKNOWN2 = 0x00000008,
   X_INPUT_FLAG_MIC = 0x00000020,
   X_INPUT_FLAG_ANYDEVICE = 0x000000FF,
-  X_INPUT_FLAG_ANY_USER = 1 << 30
+  X_INPUT_FLAG_ANY_USER = 1 << 30,
+  // Not from the console: set by the emulator's own UI when it reads a pad,
+  // so a controller marked --ui_only_controllers answers it while staying
+  // invisible to the title.
+  X_INPUT_FLAG_HOST_UI = 1u << 31
 };
 
 enum X_INPUT_DEVTYPE {

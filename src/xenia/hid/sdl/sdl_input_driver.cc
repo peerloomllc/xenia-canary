@@ -37,6 +37,15 @@ DEFINE_uint32(
     "HID");
 
 DEFINE_string(
+    ui_only_controllers, "",
+    "Controllers that drive the emulator's own menus and game library but are "
+    "never offered to the title: a comma separated list of name fragments, "
+    "matched case-insensitively, e.g. \"steam deck\". For a handheld with a "
+    "guitar plugged in, this keeps the built-in pad for navigating while the "
+    "guitar stays player one. They are also given the last slots, so a title "
+    "still finds a real controller at slot 0.",
+    "HID");
+DEFINE_string(
     controller_subtypes, "",
     "What kind of controller a device is told to be, when the kind SDL "
     "reports is not what the title wants: a comma separated list of "
@@ -590,9 +599,32 @@ void SDLInputDriver::OnControllerDeviceAdded(const SDL_Event& event) {
       controllers_.at(user_id).sdl) {
     user_id = -1;
   }
+  // SDL's player index is the order things were plugged in, which is exactly
+  // what --ui_only_controllers exists to override: with a handheld's own pad
+  // opened first, the pad SDL calls player two is the one a title should see
+  // as player one. Fill from the bottom instead while that setting is in
+  // use, and leave upstream's behaviour alone when it is not.
+  if (!cvars::ui_only_controllers.empty()) {
+    user_id = -1;
+  }
 #endif
+  // A controller the titles must not see fills from the back, so whatever a
+  // title is meant to use still lands at slot 0 whichever order they were
+  // plugged in. On a handheld with a guitar attached, that is the difference
+  // between a band game finding its instrument and asking for the rest of
+  // the band.
+  const bool ui_only = IsUiOnlyName(SDL_GameControllerName(controller));
+  if (ui_only) {
+    user_id = -1;
+    for (int i = static_cast<int>(controllers_.size()) - 1; i >= 0; --i) {
+      if (!controllers_.at(i).sdl) {
+        user_id = i;
+        break;
+      }
+    }
+  }
   // No player index or already taken, just take the first free slot.
-  if (user_id < 0) {
+  if (user_id < 0 && !ui_only) {
     for (size_t i = 0; i < controllers_.size(); i++) {
       if (!controllers_.at(i).sdl) {
         user_id = static_cast<int>(i);
@@ -606,6 +638,13 @@ void SDLInputDriver::OnControllerDeviceAdded(const SDL_Event& event) {
   if (user_id >= 0) {
     auto& state = controllers_.at(user_id);
     state = {controller, {}};
+    ui_only_slot_[user_id] = ui_only;
+    if (ui_only) {
+      XELOGI(
+          "SDL OnControllerDeviceAdded: \"{}\" drives the emulator's own "
+          "menus only; titles are not told about it",
+          SDL_GameControllerName(controller));
+    }
     // XInput seems to start with packet_number = 1 .
     state.state_changed = true;
     UpdateXCapabilities(state, size_t(user_id));
@@ -870,6 +909,30 @@ bool SDLInputDriver::TranslateGuitarButton(ControllerState& controller,
       // both, so they go through the ordinary path.
       return false;
   }
+}
+
+bool SDLInputDriver::IsUiOnlySlot(uint32_t user_index) const {
+  return user_index < ui_only_slot_.size() && ui_only_slot_[user_index];
+}
+
+bool SDLInputDriver::IsUiOnlyName(const char* name) {
+  if (cvars::ui_only_controllers.empty() || !name) {
+    return false;
+  }
+  const std::string haystack = xe::utf8::lower_ascii(name);
+  for (const auto& raw : xe::utf8::split(cvars::ui_only_controllers, ",")) {
+    std::string needle(raw);
+    const size_t first = needle.find_first_not_of(" \t");
+    if (first == std::string::npos) {
+      continue;
+    }
+    needle = needle.substr(first, needle.find_last_not_of(" \t") - first + 1);
+    if (!needle.empty() &&
+        haystack.find(xe::utf8::lower_ascii(needle)) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
 }
 
 bool SDLInputDriver::WhammyOnStick(size_t user_index) const {
