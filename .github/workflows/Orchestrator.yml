@@ -88,13 +88,13 @@ jobs:
   # ===========================================================================
   release:
     name: Create Release
-    needs: [build-windows, build-linux]
+    needs: [build-linux]
     if: |-
       always() &&
       github.repository == 'xenia-canary/xenia-canary' &&
       github.event_name == 'push' &&
       github.ref == 'refs/heads/canary_experimental' &&
-      (needs.build-windows.result == 'success' && needs.build-linux.result == 'success')
+      needs.build-linux.result == 'success'
     uses: ./.github/workflows/Create_release.yml
     permissions:
       contents: write
