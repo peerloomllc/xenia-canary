@@ -48,9 +48,16 @@ if guitar_present; then
   export SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD=0
 fi
 
+# The guide button opens the emulator's menus everywhere else, but on a Deck
+# Steam takes it for its own overlay and the emulator never sees it. View and
+# Menu pressed together is free, works whether or not Steam Input is on, and
+# cannot collide with what a title reads, since a title sees nothing at all
+# while those menus are up.
+#
 # XENIA_LOG_LEVEL=3 turns on the per-slot guitar diagnostic, which logs what a
 # title actually receives once a second.
-"$XENIA" --apu=sdl ${XENIA_LOG_LEVEL:+--log_level=$XENIA_LOG_LEVEL} "$@" > "$LOG" 2>&1
+"$XENIA" --apu=sdl --gamepad_ui_button=back+start \
+  ${XENIA_LOG_LEVEL:+--log_level=$XENIA_LOG_LEVEL} "$@" > "$LOG" 2>&1
 status=$?
 
 [ -n "$helper" ] && kill "$helper" 2>/dev/null
