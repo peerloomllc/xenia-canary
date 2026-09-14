@@ -167,6 +167,18 @@ DEFINE_string(screenshot_burst_dir, "",
               "Diagnostic: folder for --screenshot_burst_seconds (default "
               "<exe folder>/screenshots/<title id>/burst).",
               "UI");
+DEFINE_bool(
+    check_for_updates, true,
+    "When running as an AppImage, ask this fork's releases page on start "
+    "whether a newer build exists and say so on screen. One request for the "
+    "release list; nothing is sent and nothing is downloaded until asked.",
+    "General");
+DEFINE_bool(update_experiment_force, false,
+            "Experiment: treat the newest release as newer than this build, "
+            "so the download, the checksum check and the replacement can be "
+            "exercised without waiting for a release. Point APPIMAGE at a "
+            "copy, not at anything you want to keep.",
+            "General");
 DEFINE_bool(gamepad_ui, true,
             "Let a controller open and navigate the emulator's own menus and "
             "game library. The button that opens them is "
@@ -1309,6 +1321,13 @@ bool EmulatorWindow::Initialize() {
     help_menu->AddChild(MenuItem::Create(
         MenuItem::Type::kString, "Build commit on GitHub...", "F2",
         std::bind(&EmulatorWindow::ShowBuildCommit, this)));
+#if XE_PLATFORM_LINUX
+    // Replacing an AppImage in place, which is what this does, is a Linux
+    // shape of thing; the implementation lives with the other GTK code.
+    help_menu->AddChild(
+        MenuItem::Create(MenuItem::Type::kString, "Install update...",
+                         std::bind(&EmulatorWindow::InstallUpdate, this)));
+#endif
     help_menu->AddChild(MenuItem::Create(
         MenuItem::Type::kString, "Recent changes on GitHub...", []() {
           // This fork's commits live on the fork, not upstream.
@@ -1416,6 +1435,7 @@ bool EmulatorWindow::Initialize() {
   // The menus and the library it drives are GTK, as is the dashboard built
   // above, so this goes with them rather than into the shared path.
   StartGamepadUi();
+  CheckForUpdates();
 #endif
 
   if (cvars::warn_when_no_controller) {
@@ -10409,6 +10429,412 @@ void EmulatorWindow::LookupCommunityPatches() {
       community_looked_up_ = true;
       XELOGI("Patches: community list has {} files", files.size());
       RefreshCommunityPatchList();
+    });
+  }).detach();
+}
+
+// Updating an AppImage from the couch.
+//
+// A Steam Deck has no comfortable way to fetch a new build: the installer
+// that first put it there does update it, but only through desktop mode, a
+// browser and the right-click dance to mark a downloaded file executable.
+// So the emulator asks the releases page itself, says when there is
+// something newer, and can replace itself on request.
+//
+// Only when running as an AppImage. A build from source has no release to
+// compare against and replacing it would be wrong.
+namespace {
+
+struct ReleaseInfo {
+  std::string tag;
+  std::string appimage_url;
+  std::string sha256_url;
+  std::string notes;
+};
+
+// The notes come back as one JSON string carrying the markdown we wrote.
+// Unescape what JSON escapes and take the heading and bold markers off, so a
+// dialog shows text rather than source.
+std::string ReadableNotes(const std::string& raw) {
+  std::string text;
+  text.reserve(raw.size());
+  for (size_t i = 0; i < raw.size(); ++i) {
+    if (raw[i] == '\\' && i + 1 < raw.size()) {
+      const char next = raw[i + 1];
+      if (next == 'n') {
+        text += '\n';
+        ++i;
+        continue;
+      }
+      if (next == 'r' || next == 't') {
+        text += next == 't' ? ' ' : ' ';
+        ++i;
+        continue;
+      }
+      if (next == '"' || next == '\\' || next == '/') {
+        text += next;
+        ++i;
+        continue;
+      }
+      if (next == 'u' && i + 5 < raw.size()) {
+        text += '?';
+        i += 5;
+        continue;
+      }
+    }
+    text += raw[i];
+  }
+  std::string out;
+  size_t start = 0;
+  while (start <= text.size()) {
+    const size_t end = text.find('\n', start);
+    std::string line = text.substr(
+        start, end == std::string::npos ? std::string::npos : end - start);
+    const size_t hash = line.find_first_not_of('#');
+    if (hash != std::string::npos && hash > 0 && hash <= 6 &&
+        line.size() > hash && line[hash] == ' ') {
+      line = line.substr(hash + 1);
+    }
+    std::string stripped;
+    for (size_t i = 0; i < line.size(); ++i) {
+      if (line[i] == '*' && i + 1 < line.size() && line[i + 1] == '*') {
+        ++i;
+        continue;
+      }
+      if (line[i] == '`') {
+        continue;
+      }
+      stripped += line[i];
+    }
+    out += stripped;
+    if (end == std::string::npos) {
+      break;
+    }
+    out += '\n';
+    start = end + 1;
+  }
+  return out;
+}
+
+// The release list is newest first, so the first entry whose tag is one of
+// ours is the newest. Scanning is bounded to that entry, so the assets read
+// belong to it and not to an older release further down.
+bool ParseNewestRelease(const std::string& json, ReleaseInfo* out) {
+  const std::string tag_key = "\"tag_name\":";
+  size_t at = 0;
+  while (true) {
+    size_t tag_pos = json.find(tag_key, at);
+    if (tag_pos == std::string::npos) {
+      return false;
+    }
+    size_t quote = json.find('"', tag_pos + tag_key.size());
+    if (quote == std::string::npos) {
+      return false;
+    }
+    size_t quote_end = json.find('"', quote + 1);
+    if (quote_end == std::string::npos) {
+      return false;
+    }
+    const std::string tag = json.substr(quote + 1, quote_end - quote - 1);
+    const size_t next_tag = json.find(tag_key, quote_end);
+    if (tag.rfind("linux-native-", 0) == 0) {
+      const std::string block = json.substr(
+          quote_end,
+          (next_tag == std::string::npos ? json.size() : next_tag) - quote_end);
+      const std::string url_key = "\"browser_download_url\":";
+      size_t url_at = 0;
+      while (true) {
+        size_t url_pos = block.find(url_key, url_at);
+        if (url_pos == std::string::npos) {
+          break;
+        }
+        size_t u1 = block.find('"', url_pos + url_key.size());
+        size_t u2 = u1 == std::string::npos ? std::string::npos
+                                            : block.find('"', u1 + 1);
+        if (u1 == std::string::npos || u2 == std::string::npos) {
+          break;
+        }
+        const std::string url = block.substr(u1 + 1, u2 - u1 - 1);
+        if (url.size() > 9 &&
+            url.compare(url.size() - 9, 9, ".AppImage") == 0) {
+          out->appimage_url = url;
+        } else if (url.size() > 16 &&
+                   url.compare(url.size() - 16, 16, ".AppImage.sha256") == 0) {
+          out->sha256_url = url;
+        }
+        url_at = u2;
+      }
+      const std::string body_key = "\"body\":";
+      const size_t body_pos = block.find(body_key);
+      if (body_pos != std::string::npos) {
+        const size_t b1 = block.find('"', body_pos + body_key.size());
+        if (b1 != std::string::npos) {
+          size_t b2 = b1 + 1;
+          while (b2 < block.size()) {
+            if (block[b2] == '\\') {
+              b2 += 2;
+              continue;
+            }
+            if (block[b2] == '"') {
+              break;
+            }
+            ++b2;
+          }
+          if (b2 < block.size()) {
+            out->notes = ReadableNotes(block.substr(b1 + 1, b2 - b1 - 1));
+          }
+        }
+      }
+      out->tag = tag;
+      return !out->appimage_url.empty();
+    }
+    at = next_tag == std::string::npos ? json.size() : next_tag;
+    if (at >= json.size()) {
+      return false;
+    }
+  }
+}
+
+// Tags are linux-native-YYYY.MM.DD, sometimes with a .N for a second release
+// the same day. Compared against this build's own date, which is all a
+// source-built binary knows about itself.
+bool TagIsNewerThanThisBuild(const std::string& tag) {
+  int year = 0, month = 0, day = 0;
+  if (std::sscanf(tag.c_str(), "linux-native-%d.%d.%d", &year, &month, &day) !=
+      3) {
+    return false;
+  }
+  static const char* kMonths[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+  char month_name[8] = {};
+  int build_day = 0, build_year = 0;
+  if (std::sscanf(XE_BUILD_DATE, "%7s %d %d", month_name, &build_day,
+                  &build_year) != 3) {
+    return false;
+  }
+  int build_month = 0;
+  for (int i = 0; i < 12; ++i) {
+    if (std::strcmp(month_name, kMonths[i]) == 0) {
+      build_month = i + 1;
+      break;
+    }
+  }
+  if (!build_month) {
+    return false;
+  }
+  const int theirs = year * 10000 + month * 100 + day;
+  const int ours = build_year * 10000 + build_month * 100 + build_day;
+  return theirs > ours;
+}
+
+}  // namespace
+
+void EmulatorWindow::CheckForUpdates() {
+  const char* appimage = std::getenv("APPIMAGE");
+  if (!cvars::check_for_updates || !appimage || !*appimage) {
+    return;
+  }
+  std::thread([this]() {
+    xe::threading::set_name("Update check");
+    int code = 0;
+    const std::string json = RunCommandCapture(
+        "curl -sSfL --max-time 20 -H 'User-Agent: xenia-canary' "
+        "'https://api.github.com/repos/peerloomllc/xenia-canary/"
+        "releases?per_page=5' 2>/dev/null",
+        &code);
+    if (code != 0 || json.empty()) {
+      XELOGI("Update check: could not reach the releases page");
+      return;
+    }
+    ReleaseInfo release;
+    if (!ParseNewestRelease(json, &release)) {
+      XELOGI("Update check: no release found in the reply");
+      return;
+    }
+    if (!cvars::update_experiment_force &&
+        !TagIsNewerThanThisBuild(release.tag)) {
+      XELOGI("Update check: {} is not newer than this build ({})", release.tag,
+             XE_BUILD_DATE);
+      return;
+    }
+    XELOGI("Update check: {} is newer than this build ({})", release.tag,
+           XE_BUILD_DATE);
+    PostToUIThread([this, release]() {
+      pending_update_ = release.tag;
+      pending_update_url_ = release.appimage_url;
+      pending_update_sha_url_ = release.sha256_url;
+      ShowUpdateDialog(release.tag, release.notes);
+    });
+  }).detach();
+}
+
+void EmulatorWindow::ShowUpdateDialog(const std::string& tag,
+                                      const std::string& notes) {
+  auto* gtk_main = dynamic_cast<ui::GTKWindow*>(window_.get());
+  GtkWidget* parent = gtk_main ? gtk_main->window() : nullptr;
+  // No buttons passed here: GTK puts them in its action area, which
+  // right-aligns them and whose alignment is only reachable through an API
+  // deprecated since 3.12. They go in a centred box of our own below.
+  GtkWidget* dialog = gtk_dialog_new();
+  gtk_window_set_title(GTK_WINDOW(dialog), "Update available");
+  if (parent) {
+    gtk_window_set_transient_for(GTK_WINDOW(dialog), GTK_WINDOW(parent));
+    gtk_window_set_destroy_with_parent(GTK_WINDOW(dialog), TRUE);
+  }
+  gtk_window_set_default_size(GTK_WINDOW(dialog), 640, 460);
+  GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+  gtk_container_set_border_width(GTK_CONTAINER(content), 12);
+  gtk_box_set_spacing(GTK_BOX(content), 8);
+
+  GtkWidget* heading = gtk_label_new(nullptr);
+  gtk_label_set_markup(GTK_LABEL(heading),
+                       fmt::format("<span weight=\"bold\" size=\"larger\">"
+                                   "{} is available</span>\n"
+                                   "This build is from {}.",
+                                   tag, XE_BUILD_DATE)
+                           .c_str());
+  gtk_label_set_xalign(GTK_LABEL(heading), 0.0f);
+  gtk_label_set_line_wrap(GTK_LABEL(heading), TRUE);
+  gtk_box_pack_start(GTK_BOX(content), heading, FALSE, FALSE, 0);
+
+  // What changed, straight from the release, so the choice is informed
+  // rather than a version number and a shrug.
+  GtkWidget* scroller = gtk_scrolled_window_new(nullptr, nullptr);
+  gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroller),
+                                 GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+  GtkWidget* view = gtk_text_view_new();
+  gtk_text_view_set_editable(GTK_TEXT_VIEW(view), FALSE);
+  gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(view), FALSE);
+  gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(view), GTK_WRAP_WORD);
+  gtk_text_view_set_left_margin(GTK_TEXT_VIEW(view), 8);
+  gtk_text_view_set_right_margin(GTK_TEXT_VIEW(view), 8);
+  gtk_text_view_set_top_margin(GTK_TEXT_VIEW(view), 8);
+  const std::string body =
+      notes.empty() ? "The release does not say what changed." : notes;
+  gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(view)),
+                           body.c_str(), -1);
+  gtk_container_add(GTK_CONTAINER(scroller), view);
+  gtk_box_pack_start(GTK_BOX(content), scroller, TRUE, TRUE, 0);
+
+  GtkWidget* buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+  gtk_widget_set_halign(buttons, GTK_ALIGN_CENTER);
+  GtkWidget* later = gtk_button_new_with_label("Later");
+  GtkWidget* now = gtk_button_new_with_label("Update now");
+  for (GtkWidget* b : {later, now}) {
+    gtk_widget_set_size_request(b, 160, 40);
+    gtk_box_pack_start(GTK_BOX(buttons), b, FALSE, FALSE, 0);
+  }
+  g_signal_connect(later, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer data) {
+                     gtk_dialog_response(GTK_DIALOG(data), GTK_RESPONSE_CLOSE);
+                   }),
+                   dialog);
+  g_signal_connect(now, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer data) {
+                     gtk_dialog_response(GTK_DIALOG(data), GTK_RESPONSE_ACCEPT);
+                   }),
+                   dialog);
+  gtk_box_pack_start(GTK_BOX(content), buttons, FALSE, FALSE, 4);
+
+  gtk_widget_show_all(dialog);
+  // Start on the button, not in the notes. A pad has no pointer, and focus
+  // landing in the read-only text meant a press of A did nothing at all;
+  // the notes can still be reached with a Tab to scroll them.
+  gtk_widget_grab_focus(now);
+
+  // Not gtk_dialog_run(): a nested loop would sit inside whatever dispatched
+  // this, and a GLib source cannot be dispatched while its own callback is
+  // still running, which is how the pad froze once before (notes/85).
+  g_signal_connect(dialog, "response",
+                   G_CALLBACK(+[](GtkDialog* d, gint response, gpointer data) {
+                     gtk_widget_destroy(GTK_WIDGET(d));
+                     if (response == GTK_RESPONSE_ACCEPT) {
+                       static_cast<EmulatorWindow*>(data)->InstallUpdate();
+                     }
+                   }),
+                   this);
+}
+
+void EmulatorWindow::InstallUpdate() {
+  const char* appimage = std::getenv("APPIMAGE");
+  if (!appimage || !*appimage) {
+    new xe::ui::HostNotificationWindow(
+        imgui_drawer(), "Update",
+        "This is not an AppImage, so there is nothing to replace. Rebuild "
+        "from source instead.",
+        0);
+    return;
+  }
+  if (pending_update_url_.empty()) {
+    new xe::ui::HostNotificationWindow(
+        imgui_drawer(), "Update",
+        "Nothing to install: no newer release was found on start.", 0);
+    return;
+  }
+  const std::string target(appimage);
+  const std::string temp = target + ".new";
+  const std::string url = pending_update_url_;
+  const std::string sha_url = pending_update_sha_url_;
+  const std::string tag = pending_update_;
+  new xe::ui::HostNotificationWindow(imgui_drawer(), "Update",
+                                     "Downloading " + tag + "...", 0);
+  std::thread([this, target, temp, url, sha_url, tag]() {
+    xe::threading::set_name("Update download");
+    auto fail = [this](const std::string& why) {
+      PostToUIThread([this, why]() {
+        new xe::ui::HostNotificationWindow(imgui_drawer(), "Update failed", why,
+                                           0);
+      });
+    };
+    int code = 0;
+    RunCommandCapture(fmt::format("curl -sSfL --max-time 900 -o {} {} 2>&1",
+                                  ShellQuote(temp), ShellQuote(url)),
+                      &code);
+    if (code != 0) {
+      std::error_code ec;
+      std::filesystem::remove(temp, ec);
+      fail("The download did not finish.");
+      return;
+    }
+    // Check it against the published checksum before trusting it: a
+    // truncated download would otherwise replace a working emulator with a
+    // file that cannot start.
+    if (!sha_url.empty()) {
+      const std::string published = RunCommandCapture(
+          fmt::format("curl -sSfL --max-time 60 {} 2>/dev/null",
+                      ShellQuote(sha_url)),
+          &code);
+      const std::string actual = RunCommandCapture(
+          fmt::format("sha256sum {} 2>/dev/null", ShellQuote(temp)), &code);
+      const std::string want = published.substr(0, published.find(' '));
+      const std::string got = actual.substr(0, actual.find(' '));
+      if (want.size() != 64 || got != want) {
+        std::error_code ec;
+        std::filesystem::remove(temp, ec);
+        fail("The download did not match its published checksum.");
+        return;
+      }
+    }
+    std::error_code ec;
+    std::filesystem::permissions(temp,
+                                 std::filesystem::perms::owner_all |
+                                     std::filesystem::perms::group_read |
+                                     std::filesystem::perms::group_exec |
+                                     std::filesystem::perms::others_read |
+                                     std::filesystem::perms::others_exec,
+                                 ec);
+    // Renaming over a running executable is allowed: this process keeps the
+    // file it started from until it exits, and the new one is in place for
+    // the relaunch.
+    std::filesystem::rename(temp, target, ec);
+    if (ec) {
+      std::filesystem::remove(temp, ec);
+      fail("Could not replace the current build: " + ec.message());
+      return;
+    }
+    PostToUIThread([this, tag]() {
+      XELOGI("Update: installed {}, relaunching", tag);
+      new xe::ui::HostNotificationWindow(imgui_drawer(), "Update",
+                                         tag + " installed. Restarting...", 0);
+      RelaunchProcess("");
     });
   }).detach();
 }
