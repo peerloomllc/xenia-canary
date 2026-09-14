@@ -92,6 +92,15 @@ class SDLInputDriver final : public InputDriver {
   static bool TranslateGuitarButton(ControllerState& controller,
                                     uint8_t sdl_button, bool pressed);
   // Slots a guitar kind was asked for, so the state translation can match.
+  // Slots whose controller drives the emulator's own UI and is never
+  // reported to a title (--ui_only_controllers).
+  std::array<bool, HID_SDL_USER_COUNT> ui_only_slot_ = {};
+  static bool IsUiOnlyName(const char* name);
+
+ public:
+  bool IsUiOnlySlot(uint32_t user_index) const override;
+
+ private:
   std::array<bool, HID_SDL_USER_COUNT> guitar_slot_ = {};
   // Slots whose whammy bar arrives as a trigger rather than on the stick.
   std::array<bool, HID_SDL_USER_COUNT> whammy_on_trigger_ = {};
