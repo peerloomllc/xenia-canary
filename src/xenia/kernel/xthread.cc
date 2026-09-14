@@ -988,6 +988,10 @@ void XThread::AbortSelfSuspend() {
   self_suspend_abort_ = true;
   suspend_cv_.notify_all();
 }
+#else
+// Windows suspends through the host API and never parks a thread in the
+// condition variable above, so there is no wait to abort.
+void XThread::AbortSelfSuspend() {}
 #endif  // !XE_PLATFORM_WIN32
 
 X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable,
