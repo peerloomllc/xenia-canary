@@ -801,6 +801,13 @@ class EmulatorWindow {
   void ShowCompatibility();
   void ShowFAQ();
   void ShowBuildCommit();
+  // Self-update, AppImage only. Checked once on start, installed on request.
+  void CheckForUpdates();
+  void ShowUpdateDialog(const std::string& tag, const std::string& notes);
+  void InstallUpdate();
+  std::string pending_update_;
+  std::string pending_update_url_;
+  std::string pending_update_sha_url_;
 
   EmulatorWindow::ControllerHotKey ProcessControllerHotkey(int buttons);
   void VibrateController(xe::hid::InputSystem* input_sys, uint32_t user_index,
