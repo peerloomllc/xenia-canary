@@ -122,6 +122,12 @@ dword_result_t XamInputGetState_entry(dword_t user_index, dword_t flags,
     return X_ERROR_SUCCESS;
   }
 
+  // The host UI has the pad: the title sees a connected controller with
+  // nothing pressed, rather than the presses driving the menu.
+  if (kernel_state()->emulator()->input_system()->ui_holds_pad()) {
+    return X_ERROR_SUCCESS;
+  }
+
   // Games call this with a NULL state ptr, probably as a query.
 
   uint32_t actual_user_index = user_index;
@@ -178,6 +184,12 @@ dword_result_t XamInputGetKeystroke_entry(
 
   if (!keystroke) {
     return X_ERROR_BAD_ARGUMENTS;
+  }
+
+  // As above: while the host UI has the pad the title is told nothing was
+  // pressed, rather than being handed the navigation presses.
+  if (kernel_state()->emulator()->input_system()->ui_holds_pad()) {
+    return X_ERROR_EMPTY;
   }
 
   uint32_t actual_user_index = user_index;

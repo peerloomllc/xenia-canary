@@ -624,6 +624,7 @@ class EmulatorWindow {
   // <id>.png when it is launched, shown in the list's first column and in
   // the grid view (a GtkIconView over the same filtered rows).
   void* dashboard_stack_ = nullptr;            // GtkStack*: "list" / "grid"
+  void* dashboard_list_ = nullptr;             // GtkTreeView*
   void* dashboard_grid_ = nullptr;             // GtkIconView*
   void* dashboard_grid_store_ = nullptr;       // GtkListStore*
   std::map<uint64_t, void*> dashboard_icons_;  // (id << 8 | size) -> GdkPixbuf*
@@ -640,6 +641,30 @@ class EmulatorWindow {
   void* dashboard_banner_ = nullptr;  // GtkBox* holding it, with the notice
   void* dashboard_banner_label_ = nullptr;  // GtkLabel*
   int dashboard_menu_index_ = -1;
+
+  // Gamepad navigation of the host UI: the menu bar and the game library.
+  // GTK only, like the dashboard these drive.
+  // GTK navigates itself from key events, so the pad is translated into them
+  // rather than each widget being driven by hand.
+  void StartGamepadUi();
+  void PollGamepadUi();
+  bool GamepadUiHotkey(uint16_t buttons, uint16_t pressed) const;
+  void OpenMenuBarFromPad();
+  void CloseMenuBarFromPad();
+  void SendUiKey(unsigned int keyval, unsigned int modifiers = 0);
+  // GtkWidget* / GtkWidget*, as void* like the rest of the GTK members here,
+  // so this header stays free of gtk.h.
+  void* ActiveUiToplevel() const;
+  static bool HasNotebook(void* widget);
+  void SetPadHoldsUi(bool holds);
+
+  ui::MenuItem* main_menu_for_pad_ = nullptr;  // owned by the window
+  unsigned int pad_ui_timer_ = 0;
+  uint16_t pad_ui_prev_buttons_ = 0;
+  uint64_t pad_ui_repeat_after_ms_ = 0;
+  unsigned int pad_ui_repeat_key_ = 0;
+  bool pad_ui_menu_open_ = false;
+  bool pad_ui_holds_pad_ = false;
   // Fullscreen was turned off to show the library and is owed back.
   bool dashboard_suspended_fullscreen_ = false;
   std::chrono::steady_clock::time_point session_start_;
