@@ -9164,6 +9164,16 @@ void* EmulatorWindow::ActiveUiToplevel() const {
   // test sent every press to the main window. Order instead by how much a
   // window is in the way: a modal dialog first, then any other window of
   // ours, then the main one.
+  // An open drop-down or popup holds a GTK grab, and it is a window of its
+  // own. It is what the player is looking at, so it comes first.
+  GtkWidget* grab = gtk_grab_get_current();
+  if (grab) {
+    GtkWidget* grab_toplevel = gtk_widget_get_toplevel(grab);
+    if (grab_toplevel && gtk_widget_is_toplevel(grab_toplevel) &&
+        gtk_widget_get_visible(grab_toplevel)) {
+      return grab_toplevel;
+    }
+  }
   auto* gtk_window = dynamic_cast<ui::GTKWindow*>(window_.get());
   GtkWidget* main_window = gtk_window ? gtk_window->window() : nullptr;
   GtkWidget* modal = nullptr;
@@ -9407,14 +9417,21 @@ void EmulatorWindow::PollGamepadUi() {
   // the selected tab.
   GtkWidget* pad_main_window =
       gtk_window_for_pad ? gtk_window_for_pad->window() : nullptr;
+  // Tab moves between the controls of a settings window, but an open
+  // drop-down inside one is a list again and only arrows move its
+  // highlight - Tab does nothing there, so the selection could not be
+  // changed at all.
+  const bool popup_open = gtk_grab_get_current() != nullptr;
   const bool in_a_form =
-      !pad_ui_menu_open_ &&
+      !pad_ui_menu_open_ && !popup_open &&
       static_cast<GtkWidget*>(ActiveUiToplevel()) != pad_main_window;
   unsigned int key = 0;
-  unsigned int mods = 0;
+  const unsigned int mods = 0;
   if ((buttons & hid::X_INPUT_GAMEPAD_DPAD_UP) || thumb_y > kStickOn) {
-    key = in_a_form ? GDK_KEY_Tab : GDK_KEY_Up;
-    mods = in_a_form ? GDK_SHIFT_MASK : 0;
+    // Backwards Tab is its own keysym, which is what a keyboard actually
+    // sends and what GTK binds. Tab with the shift bit set is not it, and
+    // moved focus nowhere at all.
+    key = in_a_form ? GDK_KEY_ISO_Left_Tab : GDK_KEY_Up;
   } else if ((buttons & hid::X_INPUT_GAMEPAD_DPAD_DOWN) ||
              thumb_y < -kStickOn) {
     key = in_a_form ? GDK_KEY_Tab : GDK_KEY_Down;
@@ -9454,6 +9471,12 @@ void EmulatorWindow::PollGamepadUi() {
   if (pressed & hid::X_INPUT_GAMEPAD_B) {
     auto* gtk_window = dynamic_cast<ui::GTKWindow*>(window_.get());
     GtkWidget* active = static_cast<GtkWidget*>(ActiveUiToplevel());
+    if (gtk_grab_get_current()) {
+      // A drop-down is open: Escape closes it and leaves the window behind
+      // it alone, which closing the toplevel would not.
+      SendUiKey(GDK_KEY_Escape);
+      return;
+    }
     if (active && gtk_window && active != gtk_window->window()) {
       // One of our own windows is up. Escape closes a GtkDialog but not a
       // plain GtkWindow, which is what Preferences is, so close it.
