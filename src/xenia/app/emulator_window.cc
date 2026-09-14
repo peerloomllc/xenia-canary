@@ -9152,9 +9152,71 @@ void EmulatorWindow::ShowDashboard(bool show) {
 // including through submenus and a scrolling list. So the pad is translated
 // into those key events rather than each widget being driven by hand, which
 // keeps one path for the keyboard, the mouse and the controller.
-void EmulatorWindow::SendUiKey(unsigned int keyval) {
+void* EmulatorWindow::ActiveUiToplevel() const {
+  // Whichever of our windows the user is looking at, which is not always the
+  // main one: Preferences, the content list and the pickers are each their
+  // own toplevel, and keys sent to the main window while one of those is up
+  // go nowhere visible.
+  //
+  // Deliberately not "the window the window manager says is active". A pad
+  // is used from a sofa with the pointer parked somewhere else entirely, and
+  // with focus on another application no window of ours is active, so that
+  // test sent every press to the main window. Order instead by how much a
+  // window is in the way: a modal dialog first, then any other window of
+  // ours, then the main one.
   auto* gtk_window = dynamic_cast<ui::GTKWindow*>(window_.get());
-  GtkWidget* toplevel = gtk_window ? gtk_window->window() : nullptr;
+  GtkWidget* main_window = gtk_window ? gtk_window->window() : nullptr;
+  GtkWidget* modal = nullptr;
+  GtkWidget* other = nullptr;
+  GList* toplevels = gtk_window_list_toplevels();
+  for (GList* it = toplevels; it; it = it->next) {
+    if (!GTK_IS_WINDOW(it->data)) {
+      continue;
+    }
+    GtkWidget* candidate = GTK_WIDGET(it->data);
+    if (!gtk_widget_get_visible(candidate) || candidate == main_window) {
+      continue;
+    }
+    if (gtk_window_get_modal(GTK_WINDOW(candidate))) {
+      modal = candidate;
+      break;
+    }
+    if (!other) {
+      other = candidate;
+    }
+  }
+  g_list_free(toplevels);
+  if (modal) {
+    return modal;
+  }
+  if (other) {
+    return other;
+  }
+  return main_window;
+}
+
+bool EmulatorWindow::HasNotebook(void* widget_ptr) {
+  GtkWidget* widget = static_cast<GtkWidget*>(widget_ptr);
+  if (!widget) {
+    return false;
+  }
+  if (GTK_IS_NOTEBOOK(widget)) {
+    return true;
+  }
+  if (!GTK_IS_CONTAINER(widget)) {
+    return false;
+  }
+  bool found = false;
+  GList* children = gtk_container_get_children(GTK_CONTAINER(widget));
+  for (GList* it = children; it && !found; it = it->next) {
+    found = HasNotebook(GTK_WIDGET(it->data));
+  }
+  g_list_free(children);
+  return found;
+}
+
+void EmulatorWindow::SendUiKey(unsigned int keyval, unsigned int modifiers) {
+  GtkWidget* toplevel = static_cast<GtkWidget*>(ActiveUiToplevel());
   GdkWindow* gdk_window = toplevel ? gtk_widget_get_window(toplevel) : nullptr;
   if (!gdk_window) {
     return;
@@ -9176,7 +9238,7 @@ void EmulatorWindow::SendUiKey(unsigned int keyval) {
     event->key.window = GDK_WINDOW(g_object_ref(gdk_window));
     event->key.send_event = TRUE;
     event->key.time = GDK_CURRENT_TIME;
-    event->key.state = 0;
+    event->key.state = modifiers;
     event->key.keyval = keyval;
     event->key.hardware_keycode = hardware_keycode;
     event->key.group = 0;
@@ -9184,7 +9246,16 @@ void EmulatorWindow::SendUiKey(unsigned int keyval) {
     if (keyboard) {
       gdk_event_set_device(event, keyboard);
     }
-    gtk_main_do_event(event);
+    // Queued, not delivered inline. gtk_main_do_event() runs the whole
+    // handler chain right here, and a key that lands on a combo box in
+    // Preferences changes a setting, which raises a modal "restart now?"
+    // dialog through gtk_dialog_run(). That nested loop then sits inside
+    // this timer callback, and GLib will not dispatch a source that is
+    // already running, so the pad went dead until the dialog was dismissed
+    // by hand - with no way to dismiss it, since dismissing it needs the
+    // pad. Queueing hands the event to the main loop instead, so the
+    // callback returns and the next poll happens whatever the event opened.
+    gdk_display_put_event(display, event);
     gdk_event_free(event);
   }
 }
@@ -9288,8 +9359,22 @@ void EmulatorWindow::PollGamepadUi() {
       static_cast<uint16_t>(buttons & ~pad_ui_prev_buttons_);
   pad_ui_prev_buttons_ = buttons;
 
-  auto* gtk_window = dynamic_cast<ui::GTKWindow*>(window_.get());
-  const bool library_shown = gtk_window && gtk_window->idle_widget_shown();
+  auto* gtk_window_for_pad = dynamic_cast<ui::GTKWindow*>(window_.get());
+  const bool library_shown =
+      gtk_window_for_pad && gtk_window_for_pad->idle_widget_shown();
+
+  // GTK closes the menus itself when an item is activated, so ask the shell
+  // rather than trusting our own flag. Left stale, it kept up and down as
+  // arrow keys after a menu had opened a settings window, and an arrow key
+  // on a combo box there silently changes the setting under it.
+  if (pad_ui_menu_open_) {
+    auto* open_menu = dynamic_cast<ui::GTKMenuItem*>(main_menu_for_pad_);
+    GtkWidget* menubar = open_menu ? open_menu->handle() : nullptr;
+    if (!menubar || !GTK_IS_MENU_SHELL(menubar) ||
+        !gtk_menu_shell_get_selected_item(GTK_MENU_SHELL(menubar))) {
+      pad_ui_menu_open_ = false;
+    }
+  }
 
   if (GamepadUiHotkey(buttons, pressed)) {
     if (pad_ui_menu_open_) {
@@ -9312,12 +9397,27 @@ void EmulatorWindow::PollGamepadUi() {
   const int16_t thumb_x = state.gamepad.thumb_lx;
   const int16_t thumb_y = state.gamepad.thumb_ly;
   const int16_t kStickOn = 16000;
+  // Up and down mean different things depending on what is in front of the
+  // player. In a menu and in the games list they are arrow keys, which is
+  // how GTK moves through both. In a settings window they have to be Tab and
+  // Shift+Tab: arrow keys only move focus inside one container there, so
+  // pressing down on the tab strip of Preferences moved focus into the page
+  // and lost it, with nothing focused at all afterwards. Left and right stay
+  // arrows everywhere, since that is what changes a combo box, a slider or
+  // the selected tab.
+  GtkWidget* pad_main_window =
+      gtk_window_for_pad ? gtk_window_for_pad->window() : nullptr;
+  const bool in_a_form =
+      !pad_ui_menu_open_ &&
+      static_cast<GtkWidget*>(ActiveUiToplevel()) != pad_main_window;
   unsigned int key = 0;
+  unsigned int mods = 0;
   if ((buttons & hid::X_INPUT_GAMEPAD_DPAD_UP) || thumb_y > kStickOn) {
-    key = GDK_KEY_Up;
+    key = in_a_form ? GDK_KEY_Tab : GDK_KEY_Up;
+    mods = in_a_form ? GDK_SHIFT_MASK : 0;
   } else if ((buttons & hid::X_INPUT_GAMEPAD_DPAD_DOWN) ||
              thumb_y < -kStickOn) {
-    key = GDK_KEY_Down;
+    key = in_a_form ? GDK_KEY_Tab : GDK_KEY_Down;
   } else if ((buttons & hid::X_INPUT_GAMEPAD_DPAD_LEFT) ||
              thumb_x < -kStickOn) {
     key = GDK_KEY_Left;
@@ -9338,10 +9438,10 @@ void EmulatorWindow::PollGamepadUi() {
     if (key != pad_ui_repeat_key_) {
       pad_ui_repeat_key_ = key;
       pad_ui_repeat_after_ms_ = now_ms + kFirstRepeatMs;
-      SendUiKey(key);
+      SendUiKey(key, mods);
     } else if (now_ms >= pad_ui_repeat_after_ms_) {
       pad_ui_repeat_after_ms_ = now_ms + kRepeatMs;
-      SendUiKey(key);
+      SendUiKey(key, mods);
     }
   } else {
     pad_ui_repeat_key_ = 0;
@@ -9352,6 +9452,14 @@ void EmulatorWindow::PollGamepadUi() {
     SendUiKey(GDK_KEY_Return);
   }
   if (pressed & hid::X_INPUT_GAMEPAD_B) {
+    auto* gtk_window = dynamic_cast<ui::GTKWindow*>(window_.get());
+    GtkWidget* active = static_cast<GtkWidget*>(ActiveUiToplevel());
+    if (active && gtk_window && active != gtk_window->window()) {
+      // One of our own windows is up. Escape closes a GtkDialog but not a
+      // plain GtkWindow, which is what Preferences is, so close it.
+      gtk_window_close(GTK_WINDOW(active));
+      return;
+    }
     if (pad_ui_menu_open_) {
       SendUiKey(GDK_KEY_Escape);
       // Escape closes one level; the shell tells us when it is all the way
@@ -9366,12 +9474,17 @@ void EmulatorWindow::PollGamepadUi() {
       SendUiKey(GDK_KEY_Escape);
     }
   }
-  // Shoulders page through a long list.
+  // Shoulders page a long list, or move between tabs on a window that has
+  // them - Preferences is a notebook of GPU, CPU, Audio and the rest, and
+  // reaching its tab strip by arrow keys alone is painful.
+  const bool tabbed = HasNotebook(ActiveUiToplevel());
   if (pressed & hid::X_INPUT_GAMEPAD_LEFT_SHOULDER) {
-    SendUiKey(GDK_KEY_Page_Up);
+    SendUiKey(tabbed ? GDK_KEY_Page_Up : GDK_KEY_Page_Up,
+              tabbed ? GDK_CONTROL_MASK : 0);
   }
   if (pressed & hid::X_INPUT_GAMEPAD_RIGHT_SHOULDER) {
-    SendUiKey(GDK_KEY_Page_Down);
+    SendUiKey(tabbed ? GDK_KEY_Page_Down : GDK_KEY_Page_Down,
+              tabbed ? GDK_CONTROL_MASK : 0);
   }
 }
 

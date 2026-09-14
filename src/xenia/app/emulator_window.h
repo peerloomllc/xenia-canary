@@ -651,7 +651,11 @@ class EmulatorWindow {
   bool GamepadUiHotkey(uint16_t buttons, uint16_t pressed) const;
   void OpenMenuBarFromPad();
   void CloseMenuBarFromPad();
-  void SendUiKey(unsigned int keyval);
+  void SendUiKey(unsigned int keyval, unsigned int modifiers = 0);
+  // GtkWidget* / GtkWidget*, as void* like the rest of the GTK members here,
+  // so this header stays free of gtk.h.
+  void* ActiveUiToplevel() const;
+  static bool HasNotebook(void* widget);
   void SetPadHoldsUi(bool holds);
 
   ui::MenuItem* main_menu_for_pad_ = nullptr;  // owned by the window
