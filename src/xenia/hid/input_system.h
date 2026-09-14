@@ -10,6 +10,7 @@
 #ifndef XENIA_HID_INPUT_SYSTEM_H_
 #define XENIA_HID_INPUT_SYSTEM_H_
 
+#include <atomic>
 #include <bitset>
 #include <memory>
 #include <vector>
@@ -56,6 +57,14 @@ class InputSystem {
 
   uint32_t GetLastUsedSlot() const { return last_used_slot; }
 
+  // The host UI (the menus and the game library, opened from a controller)
+  // takes the pad while it is up, so a d-pad press that moves the menu
+  // selection does not also reach the running title. Separate from XAM's own
+  // dialog flag, which belongs to the guest's dialogs and must not be
+  // cleared by ours.
+  void set_ui_holds_pad(bool value) { ui_holds_pad_.store(value); }
+  bool ui_holds_pad() const { return ui_holds_pad_.load(); }
+
   Portal* GetPortal() { return portal_.get(); }
 
   std::unique_lock<xe_unlikely_mutex> lock();
@@ -70,6 +79,8 @@ class InputSystem {
   void UpdateUsedSlot(InputDriver* driver, uint8_t slot, bool connected);
   void AdjustDeadzoneLevels(const uint8_t slot, X_INPUT_GAMEPAD* gamepad);
   X_INPUT_VIBRATION ModifyVibrationLevel(X_INPUT_VIBRATION* vibration);
+
+  std::atomic<bool> ui_holds_pad_{false};
 
   std::vector<InputDriver*> FilterDrivers(uint32_t flags);
 

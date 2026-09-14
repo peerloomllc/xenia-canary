@@ -167,6 +167,17 @@ DEFINE_string(screenshot_burst_dir, "",
               "Diagnostic: folder for --screenshot_burst_seconds (default "
               "<exe folder>/screenshots/<title id>/burst).",
               "UI");
+DEFINE_bool(gamepad_ui, true,
+            "Let a controller open and navigate the emulator's own menus and "
+            "game library. The button that opens them is "
+            "--gamepad_ui_button; the d-pad and left stick move, A or X "
+            "select, B backs out and the shoulders page.",
+            "HID");
+DEFINE_string(gamepad_ui_button, "guide",
+              "Controller button that opens the emulator's menus: guide, "
+              "back, back+start or shoulders. Titles do not use guide, so it "
+              "is the one that cannot collide with what is being played.",
+              "HID");
 DEFINE_int32(ui_experiment_seconds, 30,
              "Experiment: delay before --ui_experiment_dialog opens.",
              "General");
@@ -1316,6 +1327,9 @@ bool EmulatorWindow::Initialize() {
   }
   main_menu->AddChild(std::move(help_menu));
 
+  // Kept so the gamepad can open the menu bar: the window's own accessor for
+  // it is protected, and this is the last point where we own the pointer.
+  main_menu_for_pad_ = main_menu.get();
   window_->SetMainMenu(std::move(main_menu));
 
   if (cvars::screenshot_burst_seconds > 0) {
@@ -1398,6 +1412,12 @@ bool EmulatorWindow::Initialize() {
   // SDL ignore lists refuse, and a title runs with no controller at all while
   // nothing on screen explains why (notes/84). Check once, a few seconds in,
   // and name the thing doing the filtering if one is set.
+#if XE_PLATFORM_LINUX
+  // The menus and the library it drives are GTK, as is the dashboard built
+  // above, so this goes with them rather than into the shared path.
+  StartGamepadUi();
+#endif
+
   if (cvars::warn_when_no_controller) {
     std::thread([this]() {
       xe::threading::set_name("No controller check");
@@ -8717,6 +8737,7 @@ void EmulatorWindow::BuildDashboard() {
   gtk_widget_set_margin_bottom(status, 4);
   gtk_box_pack_start(GTK_BOX(box), status, FALSE, FALSE, 0);
 
+  dashboard_list_ = view;
   dashboard_widget_ = box;
   dashboard_store_ = store;
   dashboard_filter_ = filter;
@@ -9079,6 +9100,18 @@ void EmulatorWindow::ShowDashboard(bool show) {
     RefreshDashboard();
   }
   gtk_main->ShowIdleWidget(show);
+  if (show) {
+    // Put focus on the games themselves. Without this it starts on whatever
+    // the window last focused, so an arrow key or a d-pad press changed a
+    // filter combo instead of moving through the list, and reaching the list
+    // took seven presses of Tab.
+    const bool grid = cvars::library_view == "grid";
+    GtkWidget* target =
+        static_cast<GtkWidget*>(grid ? dashboard_grid_ : dashboard_list_);
+    if (target) {
+      gtk_widget_grab_focus(target);
+    }
+  }
   if (show && dashboard_stack_) {
     // GTK ignores a stack's visible child while that child is not visible
     // itself, and the children are only shown on the line above, so the view
@@ -9110,6 +9143,249 @@ void EmulatorWindow::ShowDashboard(bool show) {
     gtk_widget_set_visible(GTK_WIDGET(dashboard_banner_), running);
   }
   UpdateDashboardFullscreen(show);
+}
+
+// Gamepad navigation of the host UI.
+//
+// The menu bar and the game library are GTK, and GTK already navigates
+// itself from key events: arrows move, Return activates, Escape backs out,
+// including through submenus and a scrolling list. So the pad is translated
+// into those key events rather than each widget being driven by hand, which
+// keeps one path for the keyboard, the mouse and the controller.
+void EmulatorWindow::SendUiKey(unsigned int keyval) {
+  auto* gtk_window = dynamic_cast<ui::GTKWindow*>(window_.get());
+  GtkWidget* toplevel = gtk_window ? gtk_window->window() : nullptr;
+  GdkWindow* gdk_window = toplevel ? gtk_widget_get_window(toplevel) : nullptr;
+  if (!gdk_window) {
+    return;
+  }
+  GdkDisplay* display = gdk_window_get_display(gdk_window);
+  GdkKeymapKey* keys = nullptr;
+  gint key_count = 0;
+  guint16 hardware_keycode = 0;
+  if (gdk_keymap_get_entries_for_keyval(gdk_keymap_get_for_display(display),
+                                        keyval, &keys, &key_count) &&
+      key_count > 0) {
+    hardware_keycode = static_cast<guint16>(keys[0].keycode);
+  }
+  g_free(keys);
+  GdkSeat* seat = gdk_display_get_default_seat(display);
+  GdkDevice* keyboard = seat ? gdk_seat_get_keyboard(seat) : nullptr;
+  for (int press = 1; press >= 0; --press) {
+    GdkEvent* event = gdk_event_new(press ? GDK_KEY_PRESS : GDK_KEY_RELEASE);
+    event->key.window = GDK_WINDOW(g_object_ref(gdk_window));
+    event->key.send_event = TRUE;
+    event->key.time = GDK_CURRENT_TIME;
+    event->key.state = 0;
+    event->key.keyval = keyval;
+    event->key.hardware_keycode = hardware_keycode;
+    event->key.group = 0;
+    event->key.is_modifier = 0;
+    if (keyboard) {
+      gdk_event_set_device(event, keyboard);
+    }
+    gtk_main_do_event(event);
+    gdk_event_free(event);
+  }
+}
+
+void EmulatorWindow::SetPadHoldsUi(bool holds) {
+  if (pad_ui_holds_pad_ == holds) {
+    return;
+  }
+  pad_ui_holds_pad_ = holds;
+  if (emulator_ && emulator_->input_system()) {
+    emulator_->input_system()->set_ui_holds_pad(holds);
+  }
+}
+
+void EmulatorWindow::OpenMenuBarFromPad() {
+  auto* menu = dynamic_cast<ui::GTKMenuItem*>(main_menu_for_pad_);
+  GtkWidget* menubar = menu ? menu->handle() : nullptr;
+  if (!menubar || !GTK_IS_MENU_SHELL(menubar)) {
+    return;
+  }
+  gtk_widget_grab_focus(menubar);
+  gtk_menu_shell_select_first(GTK_MENU_SHELL(menubar), TRUE);
+  pad_ui_menu_open_ = true;
+  SetPadHoldsUi(true);
+  XELOGI("Gamepad UI: menus opened");
+}
+
+void EmulatorWindow::CloseMenuBarFromPad() {
+  auto* menu = dynamic_cast<ui::GTKMenuItem*>(main_menu_for_pad_);
+  GtkWidget* menubar = menu ? menu->handle() : nullptr;
+  if (menubar && GTK_IS_MENU_SHELL(menubar)) {
+    gtk_menu_shell_deactivate(GTK_MENU_SHELL(menubar));
+  }
+  pad_ui_menu_open_ = false;
+  auto* gtk_window = dynamic_cast<ui::GTKWindow*>(window_.get());
+  SetPadHoldsUi(gtk_window && gtk_window->idle_widget_shown());
+  XELOGI("Gamepad UI: menus closed");
+}
+
+bool EmulatorWindow::GamepadUiHotkey(uint16_t buttons, uint16_t pressed) const {
+  const std::string which = xe::utf8::lower_ascii(cvars::gamepad_ui_button);
+  if (which == "back") {
+    return (pressed & hid::X_INPUT_GAMEPAD_BACK) != 0;
+  }
+  if (which == "back+start") {
+    return (buttons & hid::X_INPUT_GAMEPAD_BACK) &&
+           (buttons & hid::X_INPUT_GAMEPAD_START) &&
+           (pressed & (hid::X_INPUT_GAMEPAD_BACK | hid::X_INPUT_GAMEPAD_START));
+  }
+  if (which == "shoulders") {
+    return (buttons & hid::X_INPUT_GAMEPAD_LEFT_SHOULDER) &&
+           (buttons & hid::X_INPUT_GAMEPAD_RIGHT_SHOULDER) &&
+           (pressed & (hid::X_INPUT_GAMEPAD_LEFT_SHOULDER |
+                       hid::X_INPUT_GAMEPAD_RIGHT_SHOULDER));
+  }
+  return (pressed & hid::X_INPUT_GAMEPAD_GUIDE) != 0;
+}
+
+void EmulatorWindow::PollGamepadUi() {
+  if (!cvars::gamepad_ui) {
+    return;
+  }
+  auto* input_system = emulator_ ? emulator_->input_system() : nullptr;
+  if (!input_system) {
+    return;
+  }
+  // Every connected pad drives the UI, not just the one in slot 0: the pad a
+  // player picks up is not always the first the emulator found.
+  hid::X_INPUT_STATE state = {};
+  bool have_pad = false;
+  {
+    auto lock = input_system->lock();
+    for (uint32_t i = 0; i < XUserMaxUserCount; ++i) {
+      hid::X_INPUT_STATE slot_state = {};
+      if (input_system->GetState(i, hid::X_INPUT_FLAG::X_INPUT_FLAG_GAMEPAD,
+                                 &slot_state) != X_ERROR_SUCCESS) {
+        continue;
+      }
+      have_pad = true;
+      state.gamepad.buttons = static_cast<uint16_t>(
+          static_cast<uint16_t>(state.gamepad.buttons) |
+          static_cast<uint16_t>(slot_state.gamepad.buttons));
+      if (std::abs(static_cast<int>(slot_state.gamepad.thumb_lx)) >
+          std::abs(static_cast<int>(state.gamepad.thumb_lx))) {
+        state.gamepad.thumb_lx = slot_state.gamepad.thumb_lx;
+      }
+      if (std::abs(static_cast<int>(slot_state.gamepad.thumb_ly)) >
+          std::abs(static_cast<int>(state.gamepad.thumb_ly))) {
+        state.gamepad.thumb_ly = slot_state.gamepad.thumb_ly;
+      }
+    }
+  }
+  if (!have_pad) {
+    pad_ui_prev_buttons_ = 0;
+    SetPadHoldsUi(false);
+    return;
+  }
+
+  const uint16_t buttons = state.gamepad.buttons;
+  const uint16_t pressed =
+      static_cast<uint16_t>(buttons & ~pad_ui_prev_buttons_);
+  pad_ui_prev_buttons_ = buttons;
+
+  auto* gtk_window = dynamic_cast<ui::GTKWindow*>(window_.get());
+  const bool library_shown = gtk_window && gtk_window->idle_widget_shown();
+
+  if (GamepadUiHotkey(buttons, pressed)) {
+    if (pad_ui_menu_open_) {
+      CloseMenuBarFromPad();
+    } else {
+      OpenMenuBarFromPad();
+    }
+    return;
+  }
+
+  // The library is the whole screen when it is up, so the pad drives it
+  // without asking; the menus have to be opened first.
+  const bool driving = pad_ui_menu_open_ || library_shown;
+  SetPadHoldsUi(driving);
+  if (!driving) {
+    return;
+  }
+
+  // A direction, from the d-pad or the left stick.
+  const int16_t thumb_x = state.gamepad.thumb_lx;
+  const int16_t thumb_y = state.gamepad.thumb_ly;
+  const int16_t kStickOn = 16000;
+  unsigned int key = 0;
+  if ((buttons & hid::X_INPUT_GAMEPAD_DPAD_UP) || thumb_y > kStickOn) {
+    key = GDK_KEY_Up;
+  } else if ((buttons & hid::X_INPUT_GAMEPAD_DPAD_DOWN) ||
+             thumb_y < -kStickOn) {
+    key = GDK_KEY_Down;
+  } else if ((buttons & hid::X_INPUT_GAMEPAD_DPAD_LEFT) ||
+             thumb_x < -kStickOn) {
+    key = GDK_KEY_Left;
+  } else if ((buttons & hid::X_INPUT_GAMEPAD_DPAD_RIGHT) ||
+             thumb_x > kStickOn) {
+    key = GDK_KEY_Right;
+  }
+
+  const uint64_t now_ms = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+  if (key) {
+    // Held: one move, then a pause, then a steady repeat, the way a key
+    // repeats. Without it a single press runs the whole list past.
+    const uint64_t kFirstRepeatMs = 400;
+    const uint64_t kRepeatMs = 110;
+    if (key != pad_ui_repeat_key_) {
+      pad_ui_repeat_key_ = key;
+      pad_ui_repeat_after_ms_ = now_ms + kFirstRepeatMs;
+      SendUiKey(key);
+    } else if (now_ms >= pad_ui_repeat_after_ms_) {
+      pad_ui_repeat_after_ms_ = now_ms + kRepeatMs;
+      SendUiKey(key);
+    }
+  } else {
+    pad_ui_repeat_key_ = 0;
+  }
+
+  if (pressed & (hid::X_INPUT_GAMEPAD_A | hid::X_INPUT_GAMEPAD_X |
+                 hid::X_INPUT_GAMEPAD_START)) {
+    SendUiKey(GDK_KEY_Return);
+  }
+  if (pressed & hid::X_INPUT_GAMEPAD_B) {
+    if (pad_ui_menu_open_) {
+      SendUiKey(GDK_KEY_Escape);
+      // Escape closes one level; the shell tells us when it is all the way
+      // out rather than guessing here.
+      auto* menu = dynamic_cast<ui::GTKMenuItem*>(main_menu_for_pad_);
+      GtkWidget* menubar = menu ? menu->handle() : nullptr;
+      if (menubar && GTK_IS_MENU_SHELL(menubar) &&
+          !gtk_menu_shell_get_selected_item(GTK_MENU_SHELL(menubar))) {
+        CloseMenuBarFromPad();
+      }
+    } else {
+      SendUiKey(GDK_KEY_Escape);
+    }
+  }
+  // Shoulders page through a long list.
+  if (pressed & hid::X_INPUT_GAMEPAD_LEFT_SHOULDER) {
+    SendUiKey(GDK_KEY_Page_Up);
+  }
+  if (pressed & hid::X_INPUT_GAMEPAD_RIGHT_SHOULDER) {
+    SendUiKey(GDK_KEY_Page_Down);
+  }
+}
+
+void EmulatorWindow::StartGamepadUi() {
+  if (pad_ui_timer_ || !cvars::gamepad_ui) {
+    return;
+  }
+  pad_ui_timer_ = g_timeout_add(
+      33,
+      +[](gpointer data) -> gboolean {
+        static_cast<EmulatorWindow*>(data)->PollGamepadUi();
+        return G_SOURCE_CONTINUE;
+      },
+      this);
 }
 
 void EmulatorWindow::UpdateDashboardFullscreen(bool dashboard_shown) {
