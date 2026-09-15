@@ -261,6 +261,11 @@ std::unique_ptr<VulkanReShade::Effect> VulkanReShade::CompileEffect(
   std::filesystem::path fs_path(path);
   pp.add_include_path(fs_path.parent_path());
 
+  std::error_code exists_ec;
+  if (!std::filesystem::exists(fs_path, exists_ec)) {
+    XELOGE("VulkanReShade: effect file '{}' does not exist", path);
+    return nullptr;
+  }
   if (!pp.append_file(fs_path)) {
     XELOGE("VulkanReShade: preprocess of '{}' failed: {}", path, pp.errors());
     return nullptr;

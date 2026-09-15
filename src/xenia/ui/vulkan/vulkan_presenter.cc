@@ -3554,6 +3554,23 @@ bool VulkanPresenter::ParseReShadePresetFile(
       std::getline(tokens, path);
       const size_t begin = path.find_first_not_of(' ');
       path = begin == std::string::npos ? "" : path.substr(begin);
+      // A preset keeps absolute paths, so moving the shader folder leaves
+      // them pointing at nothing and every effect fails to compile (its
+      // Enabled box unchecks itself). Fall back to the same file name in
+      // the current shader folder.
+      std::error_code ec;
+      if (!path.empty() && !std::filesystem::exists(path, ec) &&
+          !cvars::reshade_shader_dir.empty()) {
+        std::filesystem::path moved =
+            std::filesystem::path(cvars::reshade_shader_dir) /
+            std::filesystem::path(path).filename();
+        if (std::filesystem::exists(moved, ec)) {
+          XELOGI("VulkanPresenter: ReShade preset effect '{}' not found, "
+                 "using '{}'",
+                 path, moved.string());
+          path = moved.string();
+        }
+      }
       effects.emplace_back();
       current = &effects.back();
       current->path = path;
