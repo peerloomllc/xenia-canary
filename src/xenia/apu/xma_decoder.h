@@ -44,6 +44,8 @@ class XmaDecoder {
   uint32_t AllocateContext();
   void ReleaseContext(uint32_t guest_ptr);
   bool BlockOnContext(uint32_t guest_ptr, bool poll);
+  void OnPhysicalRange(const char* op, uint32_t physical_address,
+                       uint32_t size);
 
   uint32_t ReadRegister(uint32_t addr);
   void WriteRegister(uint32_t addr, uint32_t value);

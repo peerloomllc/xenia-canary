@@ -85,7 +85,14 @@ XmaDecoder::XmaDecoder(cpu::Processor* processor)
 
 XmaDecoder::~XmaDecoder() = default;
 
+// Counts ffmpeg warnings and errors, so a decoder can tell that the frame it
+// just sent produced one.
+std::atomic<uint32_t> ffmpeg_warning_count{0};
+
 void av_log_callback(void* avcl, int level, const char* fmt, va_list va) {
+  if (level <= AV_LOG_WARNING) {
+    ffmpeg_warning_count.fetch_add(1, std::memory_order_relaxed);
+  }
   if (!cvars::ffmpeg_verbose && level > AV_LOG_WARNING) {
     return;
   }
@@ -131,9 +138,53 @@ void av_log_callback(void* avcl, int level, const char* fmt, va_list va) {
                                    "ffmpeg: {}", buff.to_string_view());
 }
 
+// Diagnostic: warn when guest physical memory is allocated, decommitted or
+// released over an allocated context's input buffer.
+static XmaDecoder* physical_range_decoder = nullptr;
+
+void XmaDecoder::OnPhysicalRange(const char* op, uint32_t physical_address,
+                                 uint32_t size) {
+  static std::atomic<uint32_t> reports{0};
+  const uint64_t range_end = uint64_t(physical_address) + size;
+  for (uint32_t i = 0; i < kContextCount; ++i) {
+    XmaContext* context = contexts_[i];
+    if (!context || !context->is_allocated()) {
+      continue;
+    }
+    XMA_CONTEXT_DATA data(memory_->TranslateVirtual(context->guest_ptr()));
+    for (uint32_t b = 0; b < 2; ++b) {
+      const uint32_t ptr = data.GetInputBufferAddress(b) & 0x1FFFFFFF;
+      const uint32_t count = data.GetInputBufferPacketCount(b);
+      if (!ptr || !count) {
+        continue;
+      }
+      const uint64_t buffer_end = uint64_t(ptr) + count * 2048;
+      if (physical_address >= buffer_end || range_end <= ptr) {
+        continue;
+      }
+      if (reports.fetch_add(1, std::memory_order_relaxed) >= 300) {
+        return;
+      }
+      XELOGW(
+          "XMA BUFFER OVERLAP: {} {:08X}-{:08X} over context {} buffer {} "
+          "{:08X}-{:08X} valid {} current {} read offset {} enabled {}",
+          op, physical_address, uint32_t(range_end), i, b, ptr,
+          uint32_t(buffer_end), uint32_t(data.IsInputBufferValid(b)),
+          uint32_t(data.current_buffer),
+          uint32_t(data.input_buffer_read_offset), context->is_enabled());
+    }
+  }
+}
+
 X_STATUS XmaDecoder::Setup(kernel::KernelState* kernel_state) {
   // Setup ffmpeg logging callback
   av_log_set_callback(av_log_callback);
+
+  physical_range_decoder = this;
+  physical_range_hook = [](const char* op, uint32_t physical_address,
+                           uint32_t size) {
+    physical_range_decoder->OnPhysicalRange(op, physical_address, size);
+  };
 
   // Let the processor know we want register access callbacks.
   memory_->AddVirtualMappedRange(

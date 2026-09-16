@@ -14,6 +14,10 @@
 #include "xenia/base/platform.h"
 #include "xenia/base/profiling.h"
 
+#include <atomic>
+#include <filesystem>
+#include <fstream>
+
 extern "C" {
 #if XE_COMPILER_MSVC
 #pragma warning(push)
@@ -32,6 +36,8 @@ extern "C" {
 
 namespace xe {
 namespace apu {
+
+extern std::atomic<uint32_t> ffmpeg_warning_count;
 
 XmaContextNew::XmaContextNew() = default;
 
@@ -499,6 +505,34 @@ void XmaContextNew::Decode(XMA_CONTEXT_DATA* data) {
 
   uint8_t* current_input_buffer = GetCurrentInputBuffer(data);
 
+  DecodeStep& step = decode_history_[decode_history_next_++ %
+                                     decode_history_.size()];
+  step = {};
+  step.buffer_ptr = data->GetCurrentInputBufferAddress();
+  step.packet_count = data->GetCurrentInputBufferPacketCount();
+  step.offset_in = data->input_buffer_read_offset;
+  step.buffer_in = uint8_t(data->current_buffer);
+  step.valid_in =
+      uint8_t(data->input_buffer_0_valid | (data->input_buffer_1_valid << 1));
+  step.loop_count = uint8_t(data->loop_count);
+  step.packet_index = -1;
+  bool dump_history = false;
+  struct StepEnd {
+    XmaContextNew* context;
+    XMA_CONTEXT_DATA* data;
+    DecodeStep& step;
+    bool& dump;
+    ~StepEnd() {
+      step.offset_out = data->input_buffer_read_offset;
+      step.buffer_out = uint8_t(data->current_buffer);
+      step.valid_out = uint8_t(data->input_buffer_0_valid |
+                               (data->input_buffer_1_valid << 1));
+      if (dump) {
+        context->DumpDecodeHistory(data);
+      }
+    }
+  } step_end{this, data, step, dump_history};
+
   input_buffer_.fill(0);
 
   // Detect if we're about to decode the loop end frame (before
@@ -510,6 +544,7 @@ void XmaContextNew::Decode(XMA_CONTEXT_DATA* data) {
   }
 
   UpdateLoopStatus(data);
+  step.offset_after_loop = data->input_buffer_read_offset;
 
   if (!data->output_buffer_block_count) {
     XELOGE("XmaContext {}: Error - Received 0 for output_buffer_block_count!",
@@ -541,7 +576,9 @@ void XmaContextNew::Decode(XMA_CONTEXT_DATA* data) {
   const int16_t packet_index =
       GetPacketNumber(current_input_size, data->input_buffer_read_offset);
 
+  step.packet_index = packet_index;
   if (packet_index == -1) {
+    step.result = 'i';
     XELOGE("XmaContext {}: Invalid packet index. Input read offset: {}", id(),
            data->input_buffer_read_offset);
     return;
@@ -566,11 +603,14 @@ void XmaContextNew::Decode(XMA_CONTEXT_DATA* data) {
     relative_offset = packet_first_frame_offset;
   }
   const uint8_t skip_count = xma::GetPacketSkipCount(packet);
+  step.first_frame_offset = packet_first_frame_offset;
+  step.skip_count = skip_count;
 
   // Full packet skip — no new frames begin in this packet (XMA2: 0xFF,
   // XMA1: lower 8 bits of 0x7FF also reads as 0xFF).  Advance to the
   // next sequential packet instead of trying to parse frames.
   if (skip_count == 0xFF) {
+    step.result = 'F';
     XELOGAPU("XmaContext {}: Full packet skip (0xFF) at packet {}/{}", id(),
              packet_index, current_input_packet_count);
     const uint32_t next_packet_index_skip = packet_index + 1;
@@ -608,6 +648,7 @@ void XmaContextNew::Decode(XMA_CONTEXT_DATA* data) {
           "XmaContext {}: Split frame header at packet {}, next buffer "
           "unavailable — swapping input buffer",
           id(), packet_index);
+      step.result = 'h';
       SwapInputBuffer(data);
       return;
     }
@@ -627,6 +668,7 @@ void XmaContextNew::Decode(XMA_CONTEXT_DATA* data) {
           "setting error_status=4",
           id());
       // Matching split-body error handling below; correct error code unknown.
+      step.result = 'H';
       data->error_status = 4;
       return;
     }
@@ -638,8 +680,12 @@ void XmaContextNew::Decode(XMA_CONTEXT_DATA* data) {
   // handled below). Copying it would underflow the bit count in
   // BitStream::Copy and fault in memcpy. Drop the rest of this packet and
   // resume at the next one.
+  step.frame = packet_info.current_frame_;
+  step.frame_count = packet_info.frame_count_;
+  step.frame_size = packet_info.current_frame_size_;
   if (packet_info.current_frame_size_ != 0 &&
       packet_info.current_frame_size_ < kBitsPerFrameHeader) {
+    step.result = 'S';
     XELOGW(
         "XmaContext {}: Invalid frame size {} at offset {} in packet {}/{}, "
         "skipping to the next packet",
@@ -665,6 +711,7 @@ void XmaContextNew::Decode(XMA_CONTEXT_DATA* data) {
 
   if (bits_to_copy == 0) {
     XELOGE("XmaContext {}: There is no bits to copy!", id());
+    step.result = 'z';
     SwapInputBuffer(data);
     return;
   }
@@ -679,6 +726,7 @@ void XmaContextNew::Decode(XMA_CONTEXT_DATA* data) {
         // Error path
         // Decoder probably should return error here
         // Not sure what error code should be returned
+        step.result = 'n';
         data->error_status = 4;
         return;
       }
@@ -712,7 +760,16 @@ void XmaContextNew::Decode(XMA_CONTEXT_DATA* data) {
 
   PrepareDecoder(data->sample_rate, bool(data->is_stereo));
   PreparePacket(packet_info.current_frame_size_, padding_start);
-  if (DecodePacket(av_context_, av_packet_, av_frame_)) {
+  step.padding_start = padding_start;
+  const uint32_t ffmpeg_warnings =
+      ffmpeg_warning_count.load(std::memory_order_relaxed);
+  const bool decoded = DecodePacket(av_context_, av_packet_, av_frame_);
+  step.result = decoded ? 'd' : 'e';
+  if (ffmpeg_warning_count.load(std::memory_order_relaxed) != ffmpeg_warnings) {
+    step.result = decoded ? 'w' : 'E';
+    dump_history = true;
+  }
+  if (decoded) {
     // dump_raw(av_frame_, id());
     ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data),
                  bool(data->is_stereo), raw_frame_.data());
@@ -1094,10 +1151,95 @@ bool XmaContextNew::DecodePacket(AVCodecContext* av_context,
   return true;
 }
 
+void XmaContextNew::DumpDecodeHistory(XMA_CONTEXT_DATA* data) {
+  static std::atomic<uint32_t> dumps{0};
+  const uint32_t dump = dumps.fetch_add(1, std::memory_order_relaxed);
+  if (dump >= 24) {
+    return;
+  }
+  XELOGW(
+      "XMA DESYNC {}: context {} ffmpeg warning, last steps oldest first "
+      "(buf ptr/packets, offset in>after loop>out, packet, first frame off, "
+      "skip, frame/count size pad, buffer in>out valid in>out, loops, result)",
+      dump, id());
+  for (size_t i = 0; i < decode_history_.size(); ++i) {
+    const DecodeStep& s =
+        decode_history_[(decode_history_next_ + i) % decode_history_.size()];
+    if (!s.buffer_ptr) {
+      continue;
+    }
+    XELOGW(
+        "XMA DESYNC {}:   {:08X}/{} {}>{}>{} p{} ff{} sk{} f{}/{} {} pad{} "
+        "b{}>{} v{}>{} l{} {}",
+        dump, s.buffer_ptr, s.packet_count, s.offset_in, s.offset_after_loop,
+        s.offset_out, s.packet_index, s.first_frame_offset, s.skip_count,
+        s.frame, s.frame_count, s.frame_size, s.padding_start, s.buffer_in,
+        s.buffer_out, s.valid_in, s.valid_out, s.loop_count,
+        s.result ? s.result : '?');
+  }
+  XELOGW(
+      "XMA DESYNC {}: loop start {} end {} count {} subframe end {} skip {}, "
+      "rate {} stereo {}, buffers {:08X}/{} {:08X}/{}",
+      dump, uint32_t(data->loop_start), uint32_t(data->loop_end),
+      uint32_t(data->loop_count), uint32_t(data->loop_subframe_end),
+      uint32_t(data->loop_subframe_skip), uint32_t(data->sample_rate),
+      uint32_t(data->is_stereo), uint32_t(data->input_buffer_0_ptr),
+      uint32_t(data->input_buffer_0_packet_count),
+      uint32_t(data->input_buffer_1_ptr),
+      uint32_t(data->input_buffer_1_packet_count));
+  const std::filesystem::path path =
+      std::filesystem::temp_directory_path() /
+      fmt::format("xenia-xma-desync-{}-ctx{}.bin", dump, id());
+  std::ofstream out(path, std::ios::binary);
+  for (uint32_t b = 0; b < 2; ++b) {
+    const uint32_t ptr = data->GetInputBufferAddress(b);
+    const uint32_t count = data->GetInputBufferPacketCount(b);
+    const uint32_t header[2] = {ptr, count};
+    out.write(reinterpret_cast<const char*>(header), sizeof(header));
+    if (ptr && count) {
+      out.write(reinterpret_cast<const char*>(memory()->TranslatePhysical(ptr)),
+                count * kBytesPerPacket);
+    }
+  }
+  XELOGW("XMA DESYNC {}: input buffers written to {}", dump, path.string());
+}
+
 void XmaContextNew::StoreContextMerged(const XMA_CONTEXT_DATA& data,
                                        const XMA_CONTEXT_DATA& initial_data,
                                        uint8_t* context_ptr) {
   XMA_CONTEXT_DATA fresh(context_ptr);
+
+  // Diagnostic: the guest changed fields the decoder is about to overwrite.
+  if (fresh.input_buffer_read_offset != initial_data.input_buffer_read_offset ||
+      fresh.current_buffer != initial_data.current_buffer ||
+      fresh.input_buffer_0_ptr != initial_data.input_buffer_0_ptr ||
+      fresh.input_buffer_1_ptr != initial_data.input_buffer_1_ptr ||
+      fresh.input_buffer_0_valid != initial_data.input_buffer_0_valid ||
+      fresh.input_buffer_1_valid != initial_data.input_buffer_1_valid) {
+    static std::atomic<uint32_t> conflicts{0};
+    const uint32_t n = conflicts.fetch_add(1, std::memory_order_relaxed);
+    if (n < 50 || (n % 1000) == 0) {
+      XELOGW(
+          "XMA MERGE CONFLICT #{}: context {} offset {}->{} (decoder {}) "
+          "buffer {}->{} (decoder {}) ptr0 {:08X}->{:08X} ptr1 {:08X}->{:08X} "
+          "valid {}{}->{}{} (decoder {}{})",
+          n, id(), uint32_t(initial_data.input_buffer_read_offset),
+          uint32_t(fresh.input_buffer_read_offset),
+          uint32_t(data.input_buffer_read_offset),
+          uint32_t(initial_data.current_buffer), uint32_t(fresh.current_buffer),
+          uint32_t(data.current_buffer),
+          uint32_t(initial_data.input_buffer_0_ptr),
+          uint32_t(fresh.input_buffer_0_ptr),
+          uint32_t(initial_data.input_buffer_1_ptr),
+          uint32_t(fresh.input_buffer_1_ptr),
+          uint32_t(initial_data.input_buffer_0_valid),
+          uint32_t(initial_data.input_buffer_1_valid),
+          uint32_t(fresh.input_buffer_0_valid),
+          uint32_t(fresh.input_buffer_1_valid),
+          uint32_t(data.input_buffer_0_valid),
+          uint32_t(data.input_buffer_1_valid));
+    }
+  }
 
   // DWORD 0: decoder owns loop_count, output_buffer_write_offset.
   // Only clear valid flags the decoder actually consumed (was 1, now 0).

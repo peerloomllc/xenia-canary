@@ -278,6 +278,11 @@ class VirtualHeap : public BaseHeap {
 // The physical heap and the behavior of sharing pages with virtual pages is
 // implemented by having a 'parent' heap that is used to perform allocation in
 // the guest virtual address space 1:1 with the physical address space.
+// Diagnostic: called with the physical range of every physical heap
+// allocation, decommit and release.
+extern void (*physical_range_hook)(const char* op, uint32_t physical_address,
+                                   uint32_t size);
+
 class PhysicalHeap : public BaseHeap {
  public:
   PhysicalHeap();

@@ -129,6 +129,33 @@ class XmaContextNew : public XmaContext {
                           const XMA_CONTEXT_DATA& initial_data,
                           uint8_t* context_ptr);
 
+  // Diagnostic: the last decode steps of this context, logged with the
+  // input buffers when ffmpeg reports a malformed frame.
+  struct DecodeStep {
+    uint32_t buffer_ptr;
+    uint32_t packet_count;
+    uint32_t offset_in;
+    uint32_t offset_after_loop;
+    uint32_t offset_out;
+    int32_t packet_index;
+    uint32_t first_frame_offset;
+    uint32_t frame_size;
+    uint32_t padding_start;
+    uint8_t buffer_in;
+    uint8_t buffer_out;
+    uint8_t valid_in;
+    uint8_t valid_out;
+    uint8_t skip_count;
+    uint8_t frame;
+    uint8_t frame_count;
+    uint8_t loop_count;
+    char result;
+  };
+  void DumpDecodeHistory(XMA_CONTEXT_DATA* data);
+
+  std::array<DecodeStep, 16> decode_history_{};
+  uint32_t decode_history_next_ = 0;
+
   std::array<uint8_t, kBytesPerPacketData * 2> input_buffer_;
   // first byte contains bit offset information
   std::array<uint8_t, 1 + 4096> xma_frame_;

@@ -1845,6 +1845,9 @@ void PhysicalHeap::Initialize(Memory* memory, uint8_t* membase,
   system_page_flags_.resize((system_page_count_ + 63) / 64);
 }
 
+void (*physical_range_hook)(const char* op, uint32_t physical_address,
+                            uint32_t size) = nullptr;
+
 bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment,
                          uint32_t allocation_type, uint32_t protect,
                          bool top_down, uint32_t* out_address) {
@@ -1897,6 +1900,9 @@ bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment,
     parent_heap_->Release(parent_address);
     return false;
   }
+  if (physical_range_hook) {
+    physical_range_hook("alloc", parent_address, size);
+  }
   *out_address = address;
   return true;
 }
@@ -1948,6 +1954,9 @@ bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size,
     return false;
   }
 
+  if (physical_range_hook) {
+    physical_range_hook("alloc fixed", parent_base_address, size);
+  }
   return true;
 }
 
@@ -2017,6 +2026,9 @@ bool PhysicalHeap::AllocRange(uint32_t low_address, uint32_t high_address,
     parent_heap_->Release(parent_address);
     return false;
   }
+  if (physical_range_hook) {
+    physical_range_hook("alloc range", GetPhysicalAddress(address), size);
+  }
   *out_address = address;
   return true;
 }
@@ -2035,6 +2047,10 @@ bool PhysicalHeap::Decommit(uint32_t address, uint32_t size) {
   if (!parent_heap_->Decommit(parent_address, size)) {
     XELOGE("PhysicalHeap::Decommit failed due to parent heap failure");
     return false;
+  }
+
+  if (physical_range_hook) {
+    physical_range_hook("decommit", parent_address, size);
   }
 
   // Not caring about the contents anymore.
@@ -2063,6 +2079,9 @@ bool PhysicalHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
   // thus callback handlers will keep considering this range valid forever.
   uint32_t region_size;
   if (QuerySize(base_address, &region_size)) {
+    if (physical_range_hook) {
+      physical_range_hook("release", parent_base_address, region_size);
+    }
     TriggerCallbacks(std::move(global_lock), base_address, region_size, true,
                      true, true, true);
   }
