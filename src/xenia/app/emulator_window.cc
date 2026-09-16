@@ -9295,6 +9295,7 @@ void EmulatorWindow::SetPadHoldsUi(bool holds) {
     return;
   }
   pad_ui_holds_pad_ = holds;
+  XELOGI("Gamepad UI: game input {}", holds ? "held" : "released");
   if (emulator_ && emulator_->input_system()) {
     emulator_->input_system()->set_ui_holds_pad(holds);
   }
@@ -9304,6 +9305,15 @@ void EmulatorWindow::OpenMenuBarFromPad() {
   auto* menu = dynamic_cast<ui::GTKMenuItem*>(main_menu_for_pad_);
   GtkWidget* menubar = menu ? menu->handle() : nullptr;
   if (!menubar || !GTK_IS_MENU_SHELL(menubar)) {
+    return;
+  }
+  // Fullscreen takes the menu bar out of the window. A menu opened there is
+  // invisible but still takes the keyboard, and the pad stays held for it,
+  // so the game gets no input at all. Leave fullscreen so the menus show.
+  if (window_->IsFullscreen()) {
+    SetFullscreen(false);
+  }
+  if (!gtk_widget_get_visible(menubar)) {
     return;
   }
   gtk_widget_grab_focus(menubar);
@@ -9403,6 +9413,9 @@ void EmulatorWindow::PollGamepadUi() {
     if (!menubar || !GTK_IS_MENU_SHELL(menubar) ||
         !gtk_menu_shell_get_selected_item(GTK_MENU_SHELL(menubar))) {
       pad_ui_menu_open_ = false;
+      // Hand the pad back to the game too, or it stays held with no menu up.
+      auto* gtk_window = dynamic_cast<ui::GTKWindow*>(window_.get());
+      SetPadHoldsUi(gtk_window && gtk_window->idle_widget_shown());
     }
   }
 
