@@ -633,6 +633,29 @@ void XmaContextNew::Decode(XMA_CONTEXT_DATA* data) {
     packet_info.current_frame_size_ = (uint32_t)frame_size;
   }
 
+  // A frame is at least as long as its own 15-bit size field, so a nonzero
+  // smaller size means the read offset is not on a frame boundary (0 is
+  // handled below). Copying it would underflow the bit count in
+  // BitStream::Copy and fault in memcpy. Drop the rest of this packet and
+  // resume at the next one.
+  if (packet_info.current_frame_size_ != 0 &&
+      packet_info.current_frame_size_ < kBitsPerFrameHeader) {
+    XELOGW(
+        "XmaContext {}: Invalid frame size {} at offset {} in packet {}/{}, "
+        "skipping to the next packet",
+        id(), packet_info.current_frame_size_, relative_offset, packet_index,
+        current_input_packet_count);
+    const uint32_t next_packet_index_skip = packet_index + 1;
+    uint32_t next_input_offset = GetNextPacketReadOffset(
+        data, next_packet_index_skip, current_input_packet_count);
+    if (next_packet_index_skip >= current_input_packet_count ||
+        next_input_offset == kBitsPerPacketHeader) {
+      SwapInputBuffer(data);
+    }
+    data->input_buffer_read_offset = next_input_offset;
+    return;
+  }
+
   BitStream stream =
       BitStream(current_input_buffer, (packet_index + 1) * kBitsPerPacket);
   stream.SetOffset(data->input_buffer_read_offset);
