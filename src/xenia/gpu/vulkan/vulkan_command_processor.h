@@ -36,6 +36,7 @@
 #include "xenia/gpu/vulkan/vulkan_shared_memory.h"
 #include "xenia/gpu/vulkan/vulkan_texture_cache.h"
 #include "xenia/gpu/vulkan/vulkan_zpd_query_pool.h"
+#include "xenia/gpu/fmv_replacement.h"
 #include "xenia/gpu/xenos.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/ui/vulkan/linked_type_descriptor_set_allocator.h"
@@ -796,6 +797,23 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // host-visible.
   VkDeviceMemory gamma_ramp_upload_buffer_memory_ = VK_NULL_HANDLE;
   VkBuffer gamma_ramp_upload_buffer_ = VK_NULL_HANDLE;
+
+  // FMV replacement (fmv_replacement.h): the replacement frame, uploaded in
+  // place of the swap texture.
+  VkImageView UploadFmvFrame(const FmvReplacement::Frame& frame);
+  void DestroyFmvResources();
+  VkImage fmv_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory fmv_image_memory_ = VK_NULL_HANDLE;
+  VkImageView fmv_image_view_ = VK_NULL_HANDLE;
+  VkBuffer fmv_upload_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory fmv_upload_memory_ = VK_NULL_HANDLE;
+  uint32_t fmv_upload_memory_type_ = UINT32_MAX;
+  VkDeviceSize fmv_upload_memory_size_ = 0;
+  void* fmv_upload_mapping_ = nullptr;
+  uint32_t fmv_width_ = 0;
+  uint32_t fmv_height_ = 0;
+  uint64_t fmv_frame_id_ = 0;
+  bool fmv_image_written_ = false;
   VkDeviceSize gamma_ramp_upload_memory_size_;
   uint32_t gamma_ramp_upload_memory_type_;
   // Mapping of either gamma_ramp_buffer_memory_ (if it's host-visible) or

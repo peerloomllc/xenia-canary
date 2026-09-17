@@ -1398,8 +1398,129 @@ bool VulkanCommandProcessor::SetupContext() {
   return true;
 }
 
+void VulkanCommandProcessor::DestroyFmvResources() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device,
+                                         fmv_image_view_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device,
+                                         fmv_image_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                         fmv_image_memory_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                         fmv_upload_buffer_);
+  if (fmv_upload_mapping_) {
+    dfn.vkUnmapMemory(device, fmv_upload_memory_);
+    fmv_upload_mapping_ = nullptr;
+  }
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                         fmv_upload_memory_);
+  fmv_width_ = 0;
+  fmv_height_ = 0;
+  fmv_frame_id_ = 0;
+  fmv_image_written_ = false;
+}
+
+VkImageView VulkanCommandProcessor::UploadFmvFrame(
+    const FmvReplacement::Frame& frame) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (frame.width != fmv_width_ || frame.height != fmv_height_ ||
+      fmv_image_view_ == VK_NULL_HANDLE) {
+    if (fmv_image_ != VK_NULL_HANDLE || fmv_upload_buffer_ != VK_NULL_HANDLE) {
+      AwaitAllQueueOperationsCompletion();
+      DestroyFmvResources();
+    }
+    VkImageCreateInfo image_create_info = {};
+    image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    image_create_info.imageType = VK_IMAGE_TYPE_2D;
+    image_create_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+    image_create_info.extent = {frame.width, frame.height, 1};
+    image_create_info.mipLevels = 1;
+    image_create_info.arrayLayers = 1;
+    image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_create_info.usage =
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+            vulkan_device, image_create_info,
+            ui::vulkan::util::MemoryPurpose::kDeviceLocal, fmv_image_,
+            fmv_image_memory_)) {
+      XELOGE("FMV replacement: failed to create the {}x{} image", frame.width,
+             frame.height);
+      DestroyFmvResources();
+      return VK_NULL_HANDLE;
+    }
+    VkImageViewCreateInfo view_create_info = {};
+    view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_create_info.image = fmv_image_;
+    view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_create_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+    view_create_info.subresourceRange =
+        ui::vulkan::util::InitializeSubresourceRange();
+    if (dfn.vkCreateImageView(device, &view_create_info, nullptr,
+                              &fmv_image_view_) != VK_SUCCESS ||
+        !ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device, VkDeviceSize(frame.width) * frame.height * 4,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            ui::vulkan::util::MemoryPurpose::kUpload, fmv_upload_buffer_,
+            fmv_upload_memory_, &fmv_upload_memory_type_,
+            &fmv_upload_memory_size_) ||
+        dfn.vkMapMemory(device, fmv_upload_memory_, 0, VK_WHOLE_SIZE, 0,
+                        &fmv_upload_mapping_) != VK_SUCCESS) {
+      XELOGE("FMV replacement: failed to create the upload resources");
+      DestroyFmvResources();
+      return VK_NULL_HANDLE;
+    }
+    fmv_width_ = frame.width;
+    fmv_height_ = frame.height;
+  }
+  if (frame.id != fmv_frame_id_) {
+    const VkDeviceSize size = VkDeviceSize(frame.width) * frame.height * 4;
+    std::memcpy(fmv_upload_mapping_, frame.rgba.data(), size_t(size));
+    ui::vulkan::util::FlushMappedMemoryRange(
+        vulkan_device, fmv_upload_memory_, fmv_upload_memory_type_, 0,
+        fmv_upload_memory_size_, size);
+    const VkPipelineStageFlags shader_stages =
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    PushImageMemoryBarrier(
+        fmv_image_, ui::vulkan::util::InitializeSubresourceRange(),
+        fmv_image_written_ ? shader_stages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        fmv_image_written_ ? VkAccessFlags(VK_ACCESS_SHADER_READ_BIT) : 0,
+        VK_ACCESS_TRANSFER_WRITE_BIT,
+        fmv_image_written_ ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                           : VK_IMAGE_LAYOUT_UNDEFINED,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    SubmitBarriers(true);
+    VkBufferImageCopy copy = {};
+    copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copy.imageSubresource.layerCount = 1;
+    copy.imageExtent = {frame.width, frame.height, 1};
+    deferred_command_buffer_.CmdVkCopyBufferToImage(
+        fmv_upload_buffer_, fmv_image_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1, &copy);
+    PushImageMemoryBarrier(
+        fmv_image_, ui::vulkan::util::InitializeSubresourceRange(),
+        VK_PIPELINE_STAGE_TRANSFER_BIT, shader_stages,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    fmv_image_written_ = true;
+    fmv_frame_id_ = frame.id;
+  }
+  return fmv_image_view_;
+}
+
 void VulkanCommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+
+  DestroyFmvResources();
 
   ShutdownZPDQueryResources();
   zpd_host_query_pool_.reset();
@@ -1723,6 +1844,15 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
           swaps, frontbuffer_ptr, swaps_no_texture);
     }
     return;
+  }
+
+  if (std::shared_ptr<const FmvReplacement::Frame> fmv_frame =
+          FmvReplacement::Get().GetFrame(frontbuffer_width_scaled,
+                                         frontbuffer_height_scaled)) {
+    VkImageView fmv_view = UploadFmvFrame(*fmv_frame);
+    if (fmv_view != VK_NULL_HANDLE) {
+      swap_texture_view = fmv_view;
+    }
   }
 
   auto aspect = graphics_system_->GetScaledAspectRatio();

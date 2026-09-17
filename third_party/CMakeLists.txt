@@ -807,6 +807,23 @@ add_library(libavcodec STATIC
   FFmpeg/libavcodec/mpegaudiodec_fixed.c
   FFmpeg/libavcodec/mpegaudiodec_float.c
   FFmpeg/libavcodec/wmaprodec.c
+  FFmpeg/libavcodec/vp9.c
+  FFmpeg/libavcodec/vp9data.c
+  FFmpeg/libavcodec/vp9dsp.c
+  FFmpeg/libavcodec/vp9lpf.c
+  FFmpeg/libavcodec/vp9recon.c
+  FFmpeg/libavcodec/vp9block.c
+  FFmpeg/libavcodec/vp9prob.c
+  FFmpeg/libavcodec/vp9mvs.c
+  FFmpeg/libavcodec/vpx_rac.c
+  FFmpeg/libavcodec/vp9dsp_8bpp.c
+  FFmpeg/libavcodec/vp9dsp_10bpp.c
+  FFmpeg/libavcodec/vp9dsp_12bpp.c
+  FFmpeg/libavcodec/videodsp.c
+  FFmpeg/libavcodec/vp9_parser.c
+  FFmpeg/libavcodec/cbs.c
+  FFmpeg/libavcodec/cbs_vp9.c
+  FFmpeg/libavcodec/bsf/vp9_superframe_split.c
   FFmpeg/libavcodec/wma.c
   FFmpeg/libavcodec/wma_common.c
   FFmpeg/libavcodec/wmadec.c
@@ -887,6 +904,7 @@ add_library(libavformat STATIC
   FFmpeg/libavformat/demux_utils.c
   FFmpeg/libavformat/urldecode.c
   FFmpeg/libavformat/asf_tags.c
+  FFmpeg/libavformat/ivfdec.c
   FFmpeg/libavformat/to_upper4.c
 )
 if(WIN32)

@@ -51,6 +51,7 @@
 #include "xenia/cpu/stack_walker.h"
 #include "xenia/cpu/thread_state.h"
 #include "xenia/gpu/command_processor.h"
+#include "xenia/gpu/fmv_replacement.h"
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/gpu/render_target_cache.h"
 #include "xenia/hid/input_driver.h"
@@ -73,6 +74,7 @@
 #include "xenia/ui/windowed_app_context.h"
 #include "xenia/vfs/device.h"
 #include "xenia/vfs/devices/disc_image_device.h"
+#include "xenia/vfs/devices/disc_image_file.h"
 #include "xenia/vfs/devices/disc_zarchive_device.h"
 #include "xenia/vfs/devices/host_path_device.h"
 #include "xenia/vfs/devices/null_device.h"
@@ -294,6 +296,11 @@ X_STATUS Emulator::Setup(
 
   display_window_ = display_window;
   imgui_drawer_ = imgui_drawer;
+
+  vfs::SetDiscReadObserver([](const std::string& name, uint64_t offset,
+                              uint64_t length) {
+    gpu::FmvReplacement::Get().OnDiscRead(name, offset, length);
+  });
 
   // Initialize clock.
   // 360 uses a 50MHz clock.
@@ -2283,6 +2290,7 @@ bool Emulator::SwapDisc(const std::filesystem::path& path,
   // swapping to disc 2 carried disc 1's id and was refused by a session that
   // booted disc 2 directly.
   media_id_ = info.media_id;
+  gpu::FmvReplacement::Get().SetTitle(title_id_.value_or(0), media_id_);
 
   if (smc) {
     smc->SetTrayState(X_DVD_TRAY_STATE::CLOSED);
@@ -2687,6 +2695,7 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
     XELOGI("Title {:08X}: disc {} of {}, media id {:08X}", title_id_.value(),
            disc_number_, disc_count_, media_id_);
   }
+  gpu::FmvReplacement::Get().SetTitle(title_id_.value_or(0), media_id_);
 
   // Try and load the resource database (xex only).
   if (module->title_id()) {
