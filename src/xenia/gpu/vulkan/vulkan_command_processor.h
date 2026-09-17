@@ -800,11 +800,18 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   // FMV replacement (fmv_replacement.h): the replacement frame, uploaded in
   // place of the swap texture.
-  VkImageView UploadFmvFrame(const FmvReplacement::Frame& frame);
+  VkImageView UploadFmvFrame(const FmvReplacement::Frame& frame,
+                             uint32_t dst_width, uint32_t dst_height);
   void DestroyFmvResources();
   VkImage fmv_image_ = VK_NULL_HANDLE;
   VkDeviceMemory fmv_image_memory_ = VK_NULL_HANDLE;
-  VkImageView fmv_image_view_ = VK_NULL_HANDLE;
+  VkImage fmv_scaled_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory fmv_scaled_image_memory_ = VK_NULL_HANDLE;
+  VkImageView fmv_scaled_image_view_ = VK_NULL_HANDLE;
+  uint32_t fmv_scaled_width_ = 0;
+  uint32_t fmv_scaled_height_ = 0;
+  bool fmv_scaled_written_ = false;
+  bool fmv_linear_blit_ = true;
   VkBuffer fmv_upload_buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory fmv_upload_memory_ = VK_NULL_HANDLE;
   uint32_t fmv_upload_memory_type_ = UINT32_MAX;

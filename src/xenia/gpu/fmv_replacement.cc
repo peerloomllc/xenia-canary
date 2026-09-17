@@ -55,28 +55,25 @@ std::string ToLower(std::string_view s) {
   return out;
 }
 
-// Limited-range YUV 4:2:0 to RGBA, sampling the nearest source pixel when the
-// requested size differs.
-void ConvertFrame(const AVFrame* src, uint32_t width, uint32_t height,
-                  std::vector<uint8_t>& rgba) {
+// Limited-range YUV 4:2:0 to RGBA at the video's own size; the GPU scales it
+// to the front buffer.
+void ConvertFrame(const AVFrame* src, std::vector<uint8_t>& rgba) {
+  const uint32_t width = uint32_t(src->width), height = uint32_t(src->height);
   rgba.resize(size_t(width) * height * 4);
   const bool bt709 = src->colorspace == AVCOL_SPC_BT709;
   const int32_t cr_r = bt709 ? 459 : 409;
   const int32_t cb_g = bt709 ? 55 : 100;
   const int32_t cr_g = bt709 ? 136 : 208;
   const int32_t cb_b = bt709 ? 541 : 516;
-  const uint32_t sw = uint32_t(src->width), sh = uint32_t(src->height);
   for (uint32_t y = 0; y < height; ++y) {
-    const uint32_t sy = height == sh ? y : uint32_t(uint64_t(y) * sh / height);
-    const uint8_t* yrow = src->data[0] + sy * src->linesize[0];
-    const uint8_t* urow = src->data[1] + (sy >> 1) * src->linesize[1];
-    const uint8_t* vrow = src->data[2] + (sy >> 1) * src->linesize[2];
+    const uint8_t* yrow = src->data[0] + y * src->linesize[0];
+    const uint8_t* urow = src->data[1] + (y >> 1) * src->linesize[1];
+    const uint8_t* vrow = src->data[2] + (y >> 1) * src->linesize[2];
     uint8_t* out = rgba.data() + size_t(y) * width * 4;
     for (uint32_t x = 0; x < width; ++x) {
-      const uint32_t sx = width == sw ? x : uint32_t(uint64_t(x) * sw / width);
-      const int32_t c = (int32_t(yrow[sx]) - 16) * 298;
-      const int32_t d = int32_t(urow[sx >> 1]) - 128;
-      const int32_t e = int32_t(vrow[sx >> 1]) - 128;
+      const int32_t c = (int32_t(yrow[x]) - 16) * 298;
+      const int32_t d = int32_t(urow[x >> 1]) - 128;
+      const int32_t e = int32_t(vrow[x >> 1]) - 128;
       out[0] = uint8_t(std::clamp((c + cr_r * e + 128) >> 8, 0, 255));
       out[1] =
           uint8_t(std::clamp((c - cb_g * d - cr_g * e + 128) >> 8, 0, 255));
@@ -213,8 +210,7 @@ void FmvReplacement::OnDiscRead(std::string_view file_name, uint64_t offset,
   }
 }
 
-std::shared_ptr<const FmvReplacement::Frame> FmvReplacement::GetFrame(
-    uint32_t width, uint32_t height) {
+std::shared_ptr<const FmvReplacement::Frame> FmvReplacement::GetFrame() {
   if (!have_movies_) {
     return nullptr;
   }
@@ -225,8 +221,6 @@ std::shared_ptr<const FmvReplacement::Frame> FmvReplacement::GetFrame(
     if (!playing_) {
       return nullptr;
     }
-    want_width_ = width;
-    want_height_ = height;
     const uint32_t now = Clock::QueryGuestUptimeMillis();
     const uint32_t elapsed = uint32_t(std::max<int64_t>(
         int64_t(now - start_guest_ms_) - cvars::fmv_replacement_delay_ms, 0));
@@ -246,7 +240,7 @@ std::shared_ptr<const FmvReplacement::Frame> FmvReplacement::GetFrame(
       ++generation_;
       frame_.reset();
       old = std::move(decoder_);
-    } else if (frame_ && frame_->width == width && frame_->height == height) {
+    } else {
       result = frame_;
     }
   }
@@ -350,7 +344,6 @@ void FmvReplacement::DecodeThread(std::string path, uint64_t generation) {
           int64_t(Clock::QueryGuestUptimeMillis() - start_guest_ms_) -
           cvars::fmv_replacement_delay_ms;
       const uint32_t target_ms = uint32_t(std::max<int64_t>(raw_ms, 0));
-      const uint32_t want_width = want_width_, want_height = want_height_;
       lock.unlock();
       bool progressed = false;
       if (!have_next && !eof) {
@@ -374,13 +367,24 @@ void FmvReplacement::DecodeThread(std::string path, uint64_t generation) {
       // Only convert once caught up, so a late start skips frames cheaply.
       if (dirty && have_current && !have_next && !eof) {
         // Still behind: decode more before converting.
-      } else if (dirty && have_current && want_width && want_height &&
-                 current->format == AV_PIX_FMT_YUV420P) {
+      } else if (dirty && have_current &&
+                 current->format != AV_PIX_FMT_YUV420P) {
+        // Anything else (an RGB VP9 profile 1 file, say) would silently show
+        // nothing; say so and stop.
+        XELOGE(
+            "FMV replacement: {} is {}, not yuv420p - re-encode it with "
+            "-pix_fmt yuv420p",
+            path, av_get_pix_fmt_name(AVPixelFormat(current->format)));
+        dirty = false;
+        lock.lock();
+        decoder_finished_ = true;
+        break;
+      } else if (dirty && have_current) {
         converted = std::make_shared<Frame>();
         converted->id = ++frame_id;
-        converted->width = want_width;
-        converted->height = want_height;
-        ConvertFrame(current, want_width, want_height, converted->rgba);
+        converted->width = uint32_t(current->width);
+        converted->height = uint32_t(current->height);
+        ConvertFrame(current, converted->rgba);
         dirty = false;
       }
       lock.lock();

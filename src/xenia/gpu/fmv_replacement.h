@@ -51,9 +51,9 @@ class FmvReplacement {
   void OnDiscRead(std::string_view file_name, uint64_t offset,
                   uint64_t length);
 
-  // From the swap: the frame to show at the given front buffer size, or null
-  // when no replacement is playing.
-  std::shared_ptr<const Frame> GetFrame(uint32_t width, uint32_t height);
+  // From the swap: the frame to show at the video's own size (the caller
+  // scales it), or null when no replacement is playing.
+  std::shared_ptr<const Frame> GetFrame();
 
  private:
   struct Movie {
@@ -82,8 +82,6 @@ class FmvReplacement {
   uint32_t last_read_guest_ms_ = 0;
   uint64_t duration_ms_ = 0;  // 0 until the decoder knows.
   bool decoder_finished_ = false;
-  uint32_t want_width_ = 0;
-  uint32_t want_height_ = 0;
   std::shared_ptr<const Frame> frame_;
   std::thread decoder_;
   std::condition_variable wake_;

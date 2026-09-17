@@ -1403,7 +1403,11 @@ void VulkanCommandProcessor::DestroyFmvResources() {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device,
-                                         fmv_image_view_);
+                                         fmv_scaled_image_view_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device,
+                                         fmv_scaled_image_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                         fmv_scaled_image_memory_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device,
                                          fmv_image_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
@@ -1418,18 +1422,33 @@ void VulkanCommandProcessor::DestroyFmvResources() {
                                          fmv_upload_memory_);
   fmv_width_ = 0;
   fmv_height_ = 0;
+  fmv_scaled_width_ = 0;
+  fmv_scaled_height_ = 0;
   fmv_frame_id_ = 0;
   fmv_image_written_ = false;
+  fmv_scaled_written_ = false;
 }
 
+// Uploads the replacement frame at the video's own size and scales it on the
+// GPU to the front buffer, so any video resolution works with any resolution
+// scale. Returns the view to sample instead of the guest's swap texture.
 VkImageView VulkanCommandProcessor::UploadFmvFrame(
-    const FmvReplacement::Frame& frame) {
+    const FmvReplacement::Frame& frame, uint32_t dst_width,
+    uint32_t dst_height) {
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
-  if (frame.width != fmv_width_ || frame.height != fmv_height_ ||
-      fmv_image_view_ == VK_NULL_HANDLE) {
-    if (fmv_image_ != VK_NULL_HANDLE || fmv_upload_buffer_ != VK_NULL_HANDLE) {
+  if (!frame.width || !frame.height || !dst_width || !dst_height) {
+    return VK_NULL_HANDLE;
+  }
+  const bool source_changed =
+      frame.width != fmv_width_ || frame.height != fmv_height_;
+  const bool destination_changed =
+      dst_width != fmv_scaled_width_ || dst_height != fmv_scaled_height_;
+  if (source_changed || destination_changed ||
+      fmv_scaled_image_view_ == VK_NULL_HANDLE) {
+    if (fmv_image_ != VK_NULL_HANDLE || fmv_upload_buffer_ != VK_NULL_HANDLE ||
+        fmv_scaled_image_ != VK_NULL_HANDLE) {
       AwaitAllQueueOperationsCompletion();
       DestroyFmvResources();
     }
@@ -1443,27 +1462,35 @@ VkImageView VulkanCommandProcessor::UploadFmvFrame(
     image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
     image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
     image_create_info.usage =
-        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
-            vulkan_device, image_create_info,
-            ui::vulkan::util::MemoryPurpose::kDeviceLocal, fmv_image_,
-            fmv_image_memory_)) {
-      XELOGE("FMV replacement: failed to create the {}x{} image", frame.width,
-             frame.height);
+    bool created = ui::vulkan::util::CreateDedicatedAllocationImage(
+        vulkan_device, image_create_info,
+        ui::vulkan::util::MemoryPurpose::kDeviceLocal, fmv_image_,
+        fmv_image_memory_);
+    image_create_info.extent = {dst_width, dst_height, 1};
+    image_create_info.usage =
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    created = created && ui::vulkan::util::CreateDedicatedAllocationImage(
+                             vulkan_device, image_create_info,
+                             ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+                             fmv_scaled_image_, fmv_scaled_image_memory_);
+    if (!created) {
+      XELOGE("FMV replacement: failed to create the {}x{} -> {}x{} images",
+             frame.width, frame.height, dst_width, dst_height);
       DestroyFmvResources();
       return VK_NULL_HANDLE;
     }
     VkImageViewCreateInfo view_create_info = {};
     view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    view_create_info.image = fmv_image_;
+    view_create_info.image = fmv_scaled_image_;
     view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
     view_create_info.format = VK_FORMAT_R8G8B8A8_UNORM;
     view_create_info.subresourceRange =
         ui::vulkan::util::InitializeSubresourceRange();
     if (dfn.vkCreateImageView(device, &view_create_info, nullptr,
-                              &fmv_image_view_) != VK_SUCCESS ||
+                              &fmv_scaled_image_view_) != VK_SUCCESS ||
         !ui::vulkan::util::CreateDedicatedAllocationBuffer(
             vulkan_device, VkDeviceSize(frame.width) * frame.height * 4,
             VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -1476,45 +1503,97 @@ VkImageView VulkanCommandProcessor::UploadFmvFrame(
       DestroyFmvResources();
       return VK_NULL_HANDLE;
     }
+    // Smooth scaling needs the format to support a linear blit filter.
+    VkFormatProperties format_properties;
+    vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
+        vulkan_device->physical_device(), VK_FORMAT_R8G8B8A8_UNORM,
+        &format_properties);
+    fmv_linear_blit_ =
+        (format_properties.optimalTilingFeatures &
+         VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
+    if (!fmv_linear_blit_) {
+      XELOGW("FMV replacement: no linear blit filter, scaling will be blocky");
+    }
     fmv_width_ = frame.width;
     fmv_height_ = frame.height;
+    fmv_scaled_width_ = dst_width;
+    fmv_scaled_height_ = dst_height;
+    XELOGI("FMV replacement: {}x{} video into a {}x{} front buffer",
+           frame.width, frame.height, dst_width, dst_height);
   }
-  if (frame.id != fmv_frame_id_) {
-    const VkDeviceSize size = VkDeviceSize(frame.width) * frame.height * 4;
-    std::memcpy(fmv_upload_mapping_, frame.rgba.data(), size_t(size));
-    ui::vulkan::util::FlushMappedMemoryRange(
-        vulkan_device, fmv_upload_memory_, fmv_upload_memory_type_, 0,
-        fmv_upload_memory_size_, size);
-    const VkPipelineStageFlags shader_stages =
-        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-    PushImageMemoryBarrier(
-        fmv_image_, ui::vulkan::util::InitializeSubresourceRange(),
-        fmv_image_written_ ? shader_stages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
-        fmv_image_written_ ? VkAccessFlags(VK_ACCESS_SHADER_READ_BIT) : 0,
-        VK_ACCESS_TRANSFER_WRITE_BIT,
-        fmv_image_written_ ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-                           : VK_IMAGE_LAYOUT_UNDEFINED,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    SubmitBarriers(true);
-    VkBufferImageCopy copy = {};
-    copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    copy.imageSubresource.layerCount = 1;
-    copy.imageExtent = {frame.width, frame.height, 1};
-    deferred_command_buffer_.CmdVkCopyBufferToImage(
-        fmv_upload_buffer_, fmv_image_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        1, &copy);
-    PushImageMemoryBarrier(
-        fmv_image_, ui::vulkan::util::InitializeSubresourceRange(),
-        VK_PIPELINE_STAGE_TRANSFER_BIT, shader_stages,
-        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    fmv_image_written_ = true;
-    fmv_frame_id_ = frame.id;
+  if (frame.id == fmv_frame_id_ && fmv_scaled_written_) {
+    return fmv_scaled_image_view_;
   }
-  return fmv_image_view_;
+
+  const VkDeviceSize size = VkDeviceSize(frame.width) * frame.height * 4;
+  std::memcpy(fmv_upload_mapping_, frame.rgba.data(), size_t(size));
+  ui::vulkan::util::FlushMappedMemoryRange(
+      vulkan_device, fmv_upload_memory_, fmv_upload_memory_type_, 0,
+      fmv_upload_memory_size_, size);
+  const VkPipelineStageFlags shader_stages =
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+  PushImageMemoryBarrier(
+      fmv_image_, ui::vulkan::util::InitializeSubresourceRange(),
+      fmv_image_written_ ? VK_PIPELINE_STAGE_TRANSFER_BIT
+                         : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT,
+      fmv_image_written_ ? VkAccessFlags(VK_ACCESS_TRANSFER_READ_BIT) : 0,
+      VK_ACCESS_TRANSFER_WRITE_BIT,
+      fmv_image_written_ ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                         : VK_IMAGE_LAYOUT_UNDEFINED,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+  PushImageMemoryBarrier(
+      fmv_scaled_image_, ui::vulkan::util::InitializeSubresourceRange(),
+      fmv_scaled_written_ ? shader_stages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT,
+      fmv_scaled_written_ ? VkAccessFlags(VK_ACCESS_SHADER_READ_BIT) : 0,
+      VK_ACCESS_TRANSFER_WRITE_BIT,
+      fmv_scaled_written_ ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                          : VK_IMAGE_LAYOUT_UNDEFINED,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+  SubmitBarriers(true);
+
+  VkBufferImageCopy copy = {};
+  copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  copy.imageSubresource.layerCount = 1;
+  copy.imageExtent = {frame.width, frame.height, 1};
+  deferred_command_buffer_.CmdVkCopyBufferToImage(
+      fmv_upload_buffer_, fmv_image_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+      &copy);
+  fmv_image_written_ = true;
+
+  PushImageMemoryBarrier(fmv_image_,
+                         ui::vulkan::util::InitializeSubresourceRange(),
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_ACCESS_TRANSFER_WRITE_BIT,
+                         VK_ACCESS_TRANSFER_READ_BIT,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+  SubmitBarriers(true);
+
+  VkImageBlit blit = {};
+  blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  blit.srcSubresource.layerCount = 1;
+  blit.srcOffsets[1] = {int32_t(frame.width), int32_t(frame.height), 1};
+  blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  blit.dstSubresource.layerCount = 1;
+  blit.dstOffsets[1] = {int32_t(dst_width), int32_t(dst_height), 1};
+  deferred_command_buffer_.CmdVkBlitImage(
+      fmv_image_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, fmv_scaled_image_,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+      fmv_linear_blit_ ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+
+  PushImageMemoryBarrier(
+      fmv_scaled_image_, ui::vulkan::util::InitializeSubresourceRange(),
+      VK_PIPELINE_STAGE_TRANSFER_BIT, shader_stages,
+      VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  fmv_scaled_written_ = true;
+  fmv_frame_id_ = frame.id;
+  return fmv_scaled_image_view_;
 }
 
 void VulkanCommandProcessor::ShutdownContext() {
@@ -1847,9 +1926,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
   }
 
   if (std::shared_ptr<const FmvReplacement::Frame> fmv_frame =
-          FmvReplacement::Get().GetFrame(frontbuffer_width_scaled,
-                                         frontbuffer_height_scaled)) {
-    VkImageView fmv_view = UploadFmvFrame(*fmv_frame);
+          FmvReplacement::Get().GetFrame()) {
+    VkImageView fmv_view = UploadFmvFrame(*fmv_frame, frontbuffer_width_scaled,
+                                          frontbuffer_height_scaled);
     if (fmv_view != VK_NULL_HANDLE) {
       swap_texture_view = fmv_view;
     }
