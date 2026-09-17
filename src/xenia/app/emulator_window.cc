@@ -60,6 +60,7 @@
 #include "xenia/cpu/processor.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/command_processor.h"
+#include "xenia/gpu/fmv_replacement.h"
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/hid/input_system.h"
 #include "xenia/kernel/user_module.h"
@@ -93,6 +94,8 @@ DECLARE_string(readback_resolve);
 DECLARE_bool(readback_memexport);
 
 DECLARE_path(content_root);
+
+DECLARE_path(fmv_replacement_dir);
 DEFINE_bool(show_fps, false,
             "Show the frame rate (guest swaps per second) in the top-left "
             "overlay. Emulation > Show FPS toggles it.",
@@ -2673,6 +2676,42 @@ void EmulatorWindow::ToggleGameLibraryDialog() {
       game_library_dialog_.reset();
     }
   }
+}
+
+void EmulatorWindow::PickFmvReplacementDir() {
+  auto picker = xe::ui::FilePicker::Create();
+  picker->set_mode(ui::FilePicker::Mode::kOpen);
+  picker->set_type(ui::FilePicker::Type::kDirectory);
+  picker->set_multi_selection(false);
+  picker->set_title("Select the upscaled cutscenes folder");
+  if (!cvars::fmv_replacement_dir.empty()) {
+    picker->set_default_path(cvars::fmv_replacement_dir);
+  }
+  if (!picker->Show(window_.get())) {
+    return;
+  }
+  auto selected = picker->selected_files();
+  if (!selected.empty() && !selected[0].empty()) {
+    SetFmvReplacementDir(selected[0]);
+  }
+}
+
+void EmulatorWindow::SetFmvReplacementDir(const std::filesystem::path& dir) {
+  // fmv_replacement_dir is defined in the GPU module; reach it through the
+  // registry, the same way the content folder does.
+  auto it = cvar::ConfigVars
+                ? cvar::ConfigVars->find("fmv_replacement_dir")
+                : std::map<std::string, cvar::IConfigVar*>::iterator();
+  if (!cvar::ConfigVars || it == cvar::ConfigVars->end()) {
+    XELOGE("Upscaled cutscenes: no fmv_replacement_dir config variable");
+    return;
+  }
+  dynamic_cast<cvar::ConfigVar<std::filesystem::path>*>(it->second)
+      ->OverrideConfigValue(dir);
+  config::SaveConfig();
+  XELOGI("Upscaled cutscenes folder: {}",
+         dir.empty() ? "(off)" : dir.string());
+  gpu::FmvReplacement::Get().RescanFolder();
 }
 
 void EmulatorWindow::PickGamesDir() {
@@ -7947,6 +7986,9 @@ void EmulatorWindow::ToggleSettingsWindow() {
          [this]() { SetContentRoot(""); }},
         {"Games", "games_dir", "Use default", [this]() { PickGamesDir(); },
          [this]() { SetGamesDir(""); }},
+        {"Upscaled cutscenes (replacement videos)", "fmv_replacement_dir",
+         "Turn off", [this]() { PickFmvReplacementDir(); },
+         [this]() { SetFmvReplacementDir(""); }},
     };
     for (auto& f : folders) {
       GtkWidget* heading = HeadingLabel(f.heading);

@@ -47,6 +47,9 @@ class FmvReplacement {
   // The running title and disc; rescans the replacement folder.
   void SetTitle(uint32_t title_id, uint32_t media_id);
 
+  // After the replacement folder setting changes.
+  void RescanFolder();
+
   // From the disc file system, on the reading thread.
   void OnDiscRead(std::string_view file_name, uint64_t offset,
                   uint64_t length);

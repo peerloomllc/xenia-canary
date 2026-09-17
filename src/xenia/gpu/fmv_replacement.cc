@@ -122,6 +122,22 @@ void FmvReplacement::SetTitle(uint32_t title_id, uint32_t media_id) {
   }
 }
 
+void FmvReplacement::RescanFolder() {
+  std::thread old;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    playing_ = nullptr;
+    ++generation_;
+    frame_.reset();
+    old = std::move(decoder_);
+    Rescan();
+  }
+  wake_.notify_all();
+  if (old.joinable()) {
+    old.join();
+  }
+}
+
 void FmvReplacement::Rescan() {
   movies_.clear();
   have_movies_ = false;
