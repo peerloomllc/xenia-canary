@@ -301,8 +301,13 @@ void FmvReplacement::DecodeThread(std::string path, uint64_t generation) {
     } else {
       const AVStream* stream = format->streams[stream_index];
       time_base = av_q2d(stream->time_base);
+      // IVF written by concatenation carries a frame count where the
+      // container duration is expected, so prefer frames over the rate.
       uint64_t duration_ms = 0;
-      if (stream->duration > 0) {
+      const double fps = av_q2d(stream->avg_frame_rate);
+      if (stream->nb_frames > 0 && fps > 0.0) {
+        duration_ms = uint64_t(stream->nb_frames / fps * 1000.0);
+      } else if (stream->duration > 0) {
         duration_ms = uint64_t(stream->duration * time_base * 1000.0);
       } else if (format->duration > 0) {
         duration_ms = uint64_t(format->duration / 1000);
