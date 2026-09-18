@@ -128,9 +128,12 @@ class VulkanTextureCache final : public TextureCache {
   // Returns the 2D view of the front buffer texture (for fragment shader
   // reading - the barrier will be pushed in the command processor if needed),
   // or VK_NULL_HANDLE in case of failure. May call LoadTextureData.
+  // image_out, when given, receives the image behind the view, for reading a
+  // thumbnail of what the guest itself is showing (fmv_replacement.h).
   VkImageView RequestSwapTexture(uint32_t& width_scaled_out,
                                  uint32_t& height_scaled_out,
-                                 xenos::TextureFormat& format_out);
+                                 xenos::TextureFormat& format_out,
+                                 VkImage* image_out = nullptr);
 
   // Scaled resolve buffer management (for use by VulkanRenderTargetCache)
   // Simple non-overlapping buffer (fallback when sparse binding unavailable)

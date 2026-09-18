@@ -678,6 +678,8 @@ class EmulatorWindow {
   // the title (none if empty), then closes this window. Linux only.
   bool RelaunchProcess(const std::filesystem::path& path);
   std::filesystem::path last_launched_path_;
+  void PickFmvReplacementDir();  // folder picker; call from the UI loop
+  void SetFmvReplacementDir(const std::filesystem::path& dir);
   void PickGamesDir();  // folder picker; call from the UI loop
   void SetGamesDir(const std::filesystem::path& dir);
   void ScanGamesDir();
