@@ -10,7 +10,9 @@
 #ifndef XENIA_GPU_FMV_REPLACEMENT_H_
 #define XENIA_GPU_FMV_REPLACEMENT_H_
 
+#include <array>
 #include <atomic>
+#include <deque>
 #include <condition_variable>
 #include <cstdint>
 #include <map>
@@ -35,6 +37,12 @@ namespace gpu {
 // stops reading the movie early (a skip).
 class FmvReplacement {
  public:
+  // A frame boiled down to luma, for telling whether the guest is showing
+  // this movie and where in it.
+  static constexpr uint32_t kThumbWidth = 32;
+  static constexpr uint32_t kThumbHeight = 18;
+  using Thumb = std::array<uint8_t, kThumbWidth * kThumbHeight>;
+
   struct Frame {
     uint64_t id = 0;
     uint32_t width = 0;
@@ -53,6 +61,17 @@ class FmvReplacement {
   // From the disc file system, on the reading thread.
   void OnDiscRead(std::string_view file_name, uint64_t offset,
                   uint64_t length);
+
+  // True while a movie has been read but not finished: the swap should
+  // capture a thumbnail of the guest's own picture.
+  bool WantsGuestThumbnail();
+
+  // A kThumbWidth x kThumbHeight RGBA8 thumbnail of the guest's own frame.
+  void OnGuestThumbnail(const uint8_t* rgba);
+
+  // The swap cannot capture thumbnails on this host, so fall back to judging
+  // by the guest's draw count.
+  void SetGuestThumbnailUnavailable();
 
   // From the swap, with the number of draws the guest made for this frame:
   // the frame to show at the video's own size (the caller scales it), or null
@@ -90,6 +109,13 @@ class FmvReplacement {
   bool started_ = false;
   uint32_t last_swap_guest_ms_ = 0;
   float swap_interval_ms_ = 0.0f;
+  bool thumbnails_ok_ = true;
+  // The movie's opening, decoded when it is read, so its first frame on
+  // screen can be recognised; then the frames around the one being shown.
+  std::vector<std::pair<int32_t, Thumb>> start_thumbs_;
+  std::deque<std::pair<int32_t, Thumb>> recent_thumbs_;
+  bool matched_recently_ = false;
+  uint64_t thumbnails_seen_ = 0;
   uint64_t duration_ms_ = 0;  // 0 until the decoder knows.
   bool decoder_finished_ = false;
   std::shared_ptr<const Frame> frame_;

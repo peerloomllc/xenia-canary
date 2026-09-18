@@ -971,7 +971,7 @@ uint64_t VulkanTextureCache::GetSubmissionToAwaitOnSamplerOverflow(
 
 VkImageView VulkanTextureCache::RequestSwapTexture(
     uint32_t& width_scaled_out, uint32_t& height_scaled_out,
-    xenos::TextureFormat& format_out) {
+    xenos::TextureFormat& format_out, VkImage* image_out) {
   const auto& regs = register_file();
   xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(0);
   TextureKey key;
@@ -990,6 +990,9 @@ VkImageView VulkanTextureCache::RequestSwapTexture(
       false);
   if (texture_view == VK_NULL_HANDLE) {
     return VK_NULL_HANDLE;
+  }
+  if (image_out) {
+    *image_out = texture->image();
   }
   if (!LoadTextureData(*texture)) {
     XELOGE("Failed to load texture data for swap texture");

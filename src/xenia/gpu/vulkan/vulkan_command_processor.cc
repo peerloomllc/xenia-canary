@@ -1398,10 +1398,147 @@ bool VulkanCommandProcessor::SetupContext() {
   return true;
 }
 
+// Blits the guest's own frame down to a tiny host-visible image and hands the
+// previous one to the replacement, which uses it to tell whether the guest is
+// really showing the movie, and where in it (fmv_replacement.h).
+void VulkanCommandProcessor::CaptureFmvThumbnail(VkImage guest_image,
+                                                 uint32_t guest_width,
+                                                 uint32_t guest_height) {
+  if (fmv_thumb_unusable_ || guest_image == VK_NULL_HANDLE || !guest_width ||
+      !guest_height) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  constexpr uint32_t kWidth = FmvReplacement::kThumbWidth;
+  constexpr uint32_t kHeight = FmvReplacement::kThumbHeight;
+
+  if (fmv_thumb_image_ == VK_NULL_HANDLE) {
+    VkFormatProperties format_properties;
+    vulkan_device->vulkan_instance()
+        ->functions()
+        .vkGetPhysicalDeviceFormatProperties(vulkan_device->physical_device(),
+                                             VK_FORMAT_R8G8B8A8_UNORM,
+                                             &format_properties);
+    if (!(format_properties.linearTilingFeatures &
+          VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
+      fmv_thumb_unusable_ = true;
+      FmvReplacement::Get().SetGuestThumbnailUnavailable();
+      return;
+    }
+    VkImageCreateInfo image_create_info = {};
+    image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    image_create_info.imageType = VK_IMAGE_TYPE_2D;
+    image_create_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+    image_create_info.extent = {kWidth, kHeight, 1};
+    image_create_info.mipLevels = 1;
+    image_create_info.arrayLayers = 1;
+    image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_create_info.tiling = VK_IMAGE_TILING_LINEAR;
+    image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+            vulkan_device, image_create_info,
+            ui::vulkan::util::MemoryPurpose::kReadback, fmv_thumb_image_,
+            fmv_thumb_memory_, &fmv_thumb_memory_type_,
+            &fmv_thumb_memory_size_) ||
+        dfn.vkMapMemory(device, fmv_thumb_memory_, 0, VK_WHOLE_SIZE, 0,
+                        &fmv_thumb_mapping_) != VK_SUCCESS) {
+      XELOGW("FMV replacement: cannot create the thumbnail image");
+      fmv_thumb_unusable_ = true;
+      FmvReplacement::Get().SetGuestThumbnailUnavailable();
+      return;
+    }
+    VkImageSubresource subresource = {};
+    subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    VkSubresourceLayout layout;
+    dfn.vkGetImageSubresourceLayout(device, fmv_thumb_image_, &subresource,
+                                    &layout);
+    fmv_thumb_row_pitch_ = layout.rowPitch;
+    // Host access to a linear image wants GENERAL, and it stays there.
+    PushImageMemoryBarrier(fmv_thumb_image_,
+                           ui::vulkan::util::InitializeSubresourceRange(),
+                           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                           VK_ACCESS_TRANSFER_WRITE_BIT,
+                           VK_IMAGE_LAYOUT_UNDEFINED,
+                           VK_IMAGE_LAYOUT_GENERAL);
+  }
+
+  // Hand over the frame captured earlier, once the GPU has finished with it.
+  if (fmv_thumb_pending_ &&
+      GetCompletedSubmission() >= fmv_thumb_submission_) {
+    fmv_thumb_pending_ = false;
+    VkMappedMemoryRange range = {};
+    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    range.memory = fmv_thumb_memory_;
+    range.size = VK_WHOLE_SIZE;
+    dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
+    std::vector<uint8_t> rgba(size_t(kWidth) * kHeight * 4);
+    const uint8_t* mapped = reinterpret_cast<const uint8_t*>(fmv_thumb_mapping_);
+    for (uint32_t y = 0; y < kHeight; ++y) {
+      std::memcpy(rgba.data() + size_t(y) * kWidth * 4,
+                  mapped + y * fmv_thumb_row_pitch_, size_t(kWidth) * 4);
+    }
+    FmvReplacement::Get().OnGuestThumbnail(rgba.data());
+  }
+  if (fmv_thumb_pending_) {
+    return;
+  }
+
+  PushImageMemoryBarrier(
+      guest_image, ui::vulkan::util::InitializeSubresourceRange(),
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT,
+      VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+  SubmitBarriers(true);
+  VkImageBlit blit = {};
+  blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  blit.srcSubresource.layerCount = 1;
+  blit.srcOffsets[1] = {int32_t(guest_width), int32_t(guest_height), 1};
+  blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  blit.dstSubresource.layerCount = 1;
+  blit.dstOffsets[1] = {int32_t(kWidth), int32_t(kHeight), 1};
+  deferred_command_buffer_.CmdVkBlitImage(
+      guest_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, fmv_thumb_image_,
+      VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
+      fmv_linear_blit_ ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+  PushImageMemoryBarrier(
+      guest_image, ui::vulkan::util::InitializeSubresourceRange(),
+      VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  PushImageMemoryBarrier(fmv_thumb_image_,
+                         ui::vulkan::util::InitializeSubresourceRange(),
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT,
+                         VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT,
+                         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+  SubmitBarriers(true);
+  fmv_thumb_pending_ = true;
+  fmv_thumb_submission_ = GetCurrentSubmission();
+}
+
 void VulkanCommandProcessor::DestroyFmvResources() {
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
+  if (fmv_thumb_mapping_) {
+    dfn.vkUnmapMemory(device, fmv_thumb_memory_);
+    fmv_thumb_mapping_ = nullptr;
+  }
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device,
+                                         fmv_thumb_image_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                         fmv_thumb_memory_);
+  fmv_thumb_pending_ = false;
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device,
                                          fmv_scaled_image_view_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device,
@@ -1914,8 +2051,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
   // resolution-scaled if it's a resolve destination, or not otherwise.
   uint32_t frontbuffer_width_scaled, frontbuffer_height_scaled;
   xenos::TextureFormat frontbuffer_format;
+  VkImage swap_texture_image = VK_NULL_HANDLE;
   VkImageView swap_texture_view = texture_cache_->RequestSwapTexture(
-      frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format);
+      frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format,
+      &swap_texture_image);
   if (swap_texture_view == VK_NULL_HANDLE) {
     if ((++swaps_no_texture % 60) == 1) {
       XELOGW(
@@ -1923,6 +2062,11 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
           swaps, frontbuffer_ptr, swaps_no_texture);
     }
     return;
+  }
+
+  if (FmvReplacement::Get().WantsGuestThumbnail()) {
+    CaptureFmvThumbnail(swap_texture_image, frontbuffer_width_scaled,
+                        frontbuffer_height_scaled);
   }
 
   // How much the guest drew for this frame tells a movie (a handful of draws)

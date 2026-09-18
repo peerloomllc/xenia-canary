@@ -25,12 +25,10 @@ extern "C" {
 #include "third_party/FFmpeg/libavutil/pixdesc.h"
 }  // extern "C"
 
-DEFINE_bool(fmv_replacement_enabled, true,
-            "Play the replacement videos from the folder below in place of "
-            "the game's own cutscenes.",
-            "GPU");
-
-DEFINE_int32(fmv_replacement_delay_ms, 0,
+// Renamed from fmv_replacement_delay_ms, which older configs carry with a
+// value meant for the old read-based timing; the picture match needs no
+// allowance at all.
+DEFINE_int32(fmv_replacement_offset_ms, 0,
              "Shifts the replacement against the game's own playback, in "
              "milliseconds. Positive plays it later.",
              "GPU");
@@ -45,6 +43,18 @@ DEFINE_int32(fmv_replacement_min_frame_ms, 25,
              "A movie is also presented at its own rate (about 33 ms a frame "
              "for 30 fps) rather than the game's, so frames closer together "
              "than this are a scene, not a movie.",
+             "GPU");
+
+DEFINE_int32(fmv_replacement_min_contrast, 8,
+             "A picture flatter than this (mean difference from its own "
+             "average) is a fade or a black screen and cannot be matched "
+             "against anything.",
+             "GPU");
+
+DEFINE_int32(fmv_replacement_match_threshold, 14,
+             "How closely the guest's own picture must match a frame of the "
+             "replacement (mean difference per pixel, 0-255) for it to count "
+             "as that movie playing.",
              "GPU");
 
 DEFINE_int32(fmv_replacement_arm_seconds, 60,
@@ -102,6 +112,81 @@ void ConvertFrame(const AVFrame* src, std::vector<uint8_t>& rgba) {
       out += 4;
     }
   }
+}
+
+// The movie's first seconds are decoded when it is read, so that the moment
+// the guest puts it on screen can be recognised.
+constexpr int32_t kPrefetchMs = 3000;
+// How many played frames to keep for checking the guest is still on the movie.
+constexpr size_t kRecentThumbs = 24;
+
+FmvReplacement::Thumb ThumbFromYuv(const AVFrame* frame) {
+  FmvReplacement::Thumb thumb{};
+  const uint32_t w = uint32_t(frame->width), h = uint32_t(frame->height);
+  for (uint32_t ty = 0; ty < FmvReplacement::kThumbHeight; ++ty) {
+    const uint32_t y0 = ty * h / FmvReplacement::kThumbHeight;
+    const uint32_t y1 = std::max((ty + 1) * h / FmvReplacement::kThumbHeight,
+                                 y0 + 1);
+    for (uint32_t tx = 0; tx < FmvReplacement::kThumbWidth; ++tx) {
+      const uint32_t x0 = tx * w / FmvReplacement::kThumbWidth;
+      const uint32_t x1 = std::max((tx + 1) * w / FmvReplacement::kThumbWidth,
+                                   x0 + 1);
+      uint32_t sum = 0, count = 0;
+      for (uint32_t y = y0; y < y1; y += 2) {
+        const uint8_t* row = frame->data[0] + y * frame->linesize[0];
+        for (uint32_t x = x0; x < x1; x += 2) {
+          sum += row[x];
+          ++count;
+        }
+      }
+      thumb[ty * FmvReplacement::kThumbWidth + tx] =
+          uint8_t(count ? sum / count : 0);
+    }
+  }
+  return thumb;
+}
+
+FmvReplacement::Thumb ThumbFromRgba(const uint8_t* rgba) {
+  FmvReplacement::Thumb thumb{};
+  for (size_t i = 0; i < thumb.size(); ++i) {
+    const uint8_t* p = rgba + i * 4;
+    // The guest's picture is limited-range video too; compare luma only.
+    thumb[i] = uint8_t((77 * p[0] + 150 * p[1] + 29 * p[2]) >> 8);
+  }
+  return thumb;
+}
+
+// Spread of a thumbnail's luma. A flat picture (a black screen, a fade)
+// matches anything once brightness is taken out, so it is not evidence.
+uint32_t ThumbContrast(const FmvReplacement::Thumb& thumb) {
+  int32_t sum = 0;
+  for (uint8_t v : thumb) {
+    sum += v;
+  }
+  const int32_t mean = sum / int32_t(thumb.size());
+  uint32_t spread = 0;
+  for (uint8_t v : thumb) {
+    spread += uint32_t(std::abs(int32_t(v) - mean));
+  }
+  return spread / uint32_t(thumb.size());
+}
+
+// Mean absolute difference, ignoring an overall brightness shift (the guest
+// has not applied its gamma ramp yet at this point, the replacement has not
+// been through the same path either).
+uint32_t ThumbDifference(const FmvReplacement::Thumb& a,
+                         const FmvReplacement::Thumb& b) {
+  int32_t sum_a = 0, sum_b = 0;
+  for (size_t i = 0; i < a.size(); ++i) {
+    sum_a += a[i];
+    sum_b += b[i];
+  }
+  const int32_t bias = (sum_a - sum_b) / int32_t(a.size());
+  uint32_t total = 0;
+  for (size_t i = 0; i < a.size(); ++i) {
+    total += uint32_t(std::abs(int32_t(a[i]) - int32_t(b[i]) - bias));
+  }
+  return total / uint32_t(a.size());
 }
 
 }  // namespace
@@ -199,7 +284,7 @@ void FmvReplacement::Rescan() {
 void FmvReplacement::OnDiscRead(std::string_view file_name, uint64_t offset,
                                 uint64_t length) {
   (void)length;
-  if (!have_movies_ || !cvars::fmv_replacement_enabled) {
+  if (!have_movies_) {
     return;
   }
   const std::string name = ToLower(file_name);
@@ -240,6 +325,9 @@ void FmvReplacement::OnDiscRead(std::string_view file_name, uint64_t offset,
     duration_ms_ = 0;
     decoder_finished_ = false;
     frame_.reset();
+    start_thumbs_.clear();
+    recent_thumbs_.clear();
+    matched_recently_ = false;
     XELOGI("FMV replacement: {} at {:X} read at uptime {}, ready to play {}",
            name, offset, now, found->path);
     decoder_ = std::thread(&FmvReplacement::DecodeThread, this, found->path,
@@ -251,9 +339,99 @@ void FmvReplacement::OnDiscRead(std::string_view file_name, uint64_t offset,
   }
 }
 
+bool FmvReplacement::WantsGuestThumbnail() {
+  if (!have_movies_ || !thumbnails_ok_) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  return playing_ != nullptr;
+}
+
+void FmvReplacement::SetGuestThumbnailUnavailable() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (thumbnails_ok_) {
+    thumbnails_ok_ = false;
+    XELOGW(
+        "FMV replacement: cannot read the guest's picture, falling back to "
+        "the draw count");
+  }
+}
+
+void FmvReplacement::OnGuestThumbnail(const uint8_t* rgba) {
+  const Thumb guest = ThumbFromRgba(rgba);
+  const uint32_t guest_contrast = ThumbContrast(guest);
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!playing_) {
+    return;
+  }
+  ++thumbnails_seen_;
+  const bool too_flat =
+      guest_contrast <
+      uint32_t(std::max(cvars::fmv_replacement_min_contrast, 0));
+  if (too_flat && !started_) {
+    // A fade or a black screen matches anything, so it cannot start a movie.
+    return;
+  }
+  if (too_flat) {
+    // Mid-movie it is a fade in the movie itself: no evidence either way, so
+    // carry on rather than counting it as the guest leaving.
+    matched_recently_ = true;
+    last_video_guest_ms_ = Clock::QueryGuestUptimeMillis();
+    return;
+  }
+  const uint32_t threshold =
+      uint32_t(std::max(cvars::fmv_replacement_match_threshold, 0));
+  const uint32_t now = Clock::QueryGuestUptimeMillis();
+  if (!started_) {
+    // Which frame of the movie's opening is on screen, if any?
+    uint32_t best = UINT32_MAX;
+    int32_t best_pts = 0;
+    uint32_t best_contrast = 0;
+    for (const auto& [pts, thumb] : start_thumbs_) {
+      const uint32_t difference = ThumbDifference(guest, thumb);
+      if (difference < best) {
+        best = difference;
+        best_pts = pts;
+        best_contrast = ThumbContrast(thumb);
+      }
+    }
+    if (best <= threshold && best_contrast >= guest_contrast / 2) {
+      started_ = true;
+      matched_recently_ = true;
+      // Line the clock up with the frame the guest is actually showing.
+      start_guest_ms_ = uint32_t(int64_t(now) - best_pts);
+      last_video_guest_ms_ = now;
+      XELOGI(
+          "FMV replacement: {} on screen at uptime {} ({} ms after the read), "
+          "the guest is at {} ms, match {}",
+          playing_->path, now, now - arm_guest_ms_, best_pts, best);
+    }
+    return;
+  }
+  uint32_t best = UINT32_MAX;
+  int32_t best_pts = 0;
+  for (const auto& [pts, thumb] : recent_thumbs_) {
+    const uint32_t difference = ThumbDifference(guest, thumb);
+    if (difference < best) {
+      best = difference;
+      best_pts = pts;
+    }
+  }
+  if (thumbnails_seen_ % 300 == 1) {
+    XELOGD(
+        "FMV replacement: playing, best match {} at {} ms of {} frames kept, "
+        "guest contrast {}",
+        best, best_pts, recent_thumbs_.size(), guest_contrast);
+  }
+  if (best <= threshold) {
+    matched_recently_ = true;
+    last_video_guest_ms_ = now;
+  }
+}
+
 std::shared_ptr<const FmvReplacement::Frame> FmvReplacement::GetFrame(
     uint32_t guest_draws) {
-  if (!have_movies_ || !cvars::fmv_replacement_enabled) {
+  if (!have_movies_) {
     return nullptr;
   }
   std::thread old;
@@ -274,19 +452,23 @@ std::shared_ptr<const FmvReplacement::Frame> FmvReplacement::GetFrame(
                               : interval;
     }
     last_swap_guest_ms_ = now;
-    const bool guest_playing_movie =
+    const bool draws_like_movie =
         guest_draws <= uint32_t(std::max(cvars::fmv_replacement_max_draws, 0)) &&
         swap_interval_ms_ >= float(cvars::fmv_replacement_min_frame_ms);
+    // The guest's own picture matching a frame of this movie is what says it
+    // is playing; the draw count is only for hosts where it cannot be read.
+    const bool guest_playing_movie =
+        thumbnails_ok_ ? matched_recently_ : draws_like_movie;
     const char* ended = nullptr;
     if (!started_) {
       // The movie has been read but the game has not reached it yet: it is
       // still drawing a scene. Wait, but not for ever.
-      if (guest_playing_movie) {
+      if (guest_playing_movie && !thumbnails_ok_) {
         started_ = true;
         start_guest_ms_ = now;
         last_video_guest_ms_ = now;
         XELOGI("FMV replacement: {} on screen at uptime {}, {} ms after the "
-               "read",
+               "read (by draw count)",
                playing_->path, now, now - arm_guest_ms_);
       } else if (now - arm_guest_ms_ >
                  uint32_t(std::max(cvars::fmv_replacement_arm_seconds, 1)) *
@@ -297,8 +479,9 @@ std::shared_ptr<const FmvReplacement::Frame> FmvReplacement::GetFrame(
       if (guest_playing_movie) {
         last_video_guest_ms_ = now;
       }
+      matched_recently_ = false;
       const uint32_t elapsed = uint32_t(std::max<int64_t>(
-          int64_t(now - start_guest_ms_) - cvars::fmv_replacement_delay_ms, 0));
+          int64_t(now - start_guest_ms_) - cvars::fmv_replacement_offset_ms, 0));
       if (now - last_video_guest_ms_ > kVideoGapMs) {
         ended = "the guest stopped playing it";
       } else if (decoder_finished_ &&
@@ -307,8 +490,11 @@ std::shared_ptr<const FmvReplacement::Frame> FmvReplacement::GetFrame(
       }
     }
     if (ended) {
-      XELOGI("FMV replacement: {} stopped ({}) at uptime {}", playing_->path,
-             ended, now);
+      XELOGI(
+          "FMV replacement: {} stopped ({}) at uptime {}, {} ms since a match, "
+          "{} guest thumbnails seen",
+          playing_->path, ended, now, now - last_video_guest_ms_,
+          thumbnails_seen_);
       playing_ = nullptr;
       started_ = false;
       ++generation_;
@@ -333,6 +519,9 @@ void FmvReplacement::DecodeThread(std::string path, uint64_t generation) {
   AVFrame* current = av_frame_alloc();
   AVFrame* next = av_frame_alloc();
   bool have_current = false, have_next = false, eof = false, dirty = false;
+  Thumb current_thumb{};
+  int32_t current_thumb_ms = 0;
+  bool have_thumb = false;
   int stream_index = -1;
   double time_base = 0.0;
   uint64_t frame_id = 0;
@@ -411,6 +600,31 @@ void FmvReplacement::DecodeThread(std::string path, uint64_t generation) {
     }
   };
 
+  // Decode the movie's opening now, while the guest is still showing whatever
+  // comes before it, so the frame it starts with can be recognised.
+  if (codec) {
+    std::vector<std::pair<int32_t, Thumb>> opening;
+    while (decode_next()) {
+      const int64_t pts = next->best_effort_timestamp;
+      const int32_t pts_ms =
+          pts == AV_NOPTS_VALUE ? 0 : int32_t(pts * time_base * 1000.0);
+      if (next->format == AV_PIX_FMT_YUV420P) {
+        opening.emplace_back(pts_ms, ThumbFromYuv(next));
+      }
+      if (pts_ms >= kPrefetchMs) {
+        break;
+      }
+    }
+    av_seek_frame(format, stream_index, 0, AVSEEK_FLAG_BACKWARD);
+    avcodec_flush_buffers(codec);
+    have_next = false;
+    eof = false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (generation_ == generation) {
+      start_thumbs_ = std::move(opening);
+    }
+  }
+
   if (codec) {
     std::unique_lock<std::mutex> lock(mutex_);
     while (generation_ == generation) {
@@ -418,7 +632,7 @@ void FmvReplacement::DecodeThread(std::string path, uint64_t generation) {
       // is read seconds before it plays.
       const int64_t raw_ms =
           started_ ? int64_t(Clock::QueryGuestUptimeMillis() - start_guest_ms_) -
-                         cvars::fmv_replacement_delay_ms
+                         cvars::fmv_replacement_offset_ms
                    : 0;
       const uint32_t target_ms = uint32_t(std::max<int64_t>(raw_ms, 0));
       lock.unlock();
@@ -438,6 +652,11 @@ void FmvReplacement::DecodeThread(std::string path, uint64_t generation) {
           have_next = false;
           dirty = true;
           progressed = true;
+          if (current->format == AV_PIX_FMT_YUV420P) {
+            current_thumb = ThumbFromYuv(current);
+            current_thumb_ms = int32_t(pts_ms);
+            have_thumb = true;
+          }
         }
       }
       std::shared_ptr<Frame> converted;
@@ -467,6 +686,15 @@ void FmvReplacement::DecodeThread(std::string path, uint64_t generation) {
       lock.lock();
       if (generation_ != generation) {
         break;
+      }
+      if (have_thumb) {
+        // What is on screen now, for checking the guest is still on this
+        // movie (and has not skipped it).
+        recent_thumbs_.emplace_back(current_thumb_ms, current_thumb);
+        while (recent_thumbs_.size() > kRecentThumbs) {
+          recent_thumbs_.pop_front();
+        }
+        have_thumb = false;
       }
       if (converted) {
         frame_ = std::move(converted);

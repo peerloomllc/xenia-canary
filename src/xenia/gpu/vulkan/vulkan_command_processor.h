@@ -813,6 +813,18 @@ class VulkanCommandProcessor final : public CommandProcessor {
   bool fmv_scaled_written_ = false;
   bool fmv_linear_blit_ = true;
   uint64_t fmv_last_draw_count_ = 0;
+  // A thumbnail of the guest's own frame, read back for the picture match.
+  void CaptureFmvThumbnail(VkImage guest_image, uint32_t guest_width,
+                           uint32_t guest_height);
+  VkImage fmv_thumb_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory fmv_thumb_memory_ = VK_NULL_HANDLE;
+  uint32_t fmv_thumb_memory_type_ = UINT32_MAX;
+  VkDeviceSize fmv_thumb_memory_size_ = 0;
+  VkDeviceSize fmv_thumb_row_pitch_ = 0;
+  void* fmv_thumb_mapping_ = nullptr;
+  uint64_t fmv_thumb_submission_ = 0;
+  bool fmv_thumb_pending_ = false;
+  bool fmv_thumb_unusable_ = false;
   VkBuffer fmv_upload_buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory fmv_upload_memory_ = VK_NULL_HANDLE;
   uint32_t fmv_upload_memory_type_ = UINT32_MAX;
