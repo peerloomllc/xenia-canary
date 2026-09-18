@@ -96,6 +96,8 @@ DECLARE_bool(readback_memexport);
 DECLARE_path(content_root);
 
 DECLARE_path(fmv_replacement_dir);
+
+DECLARE_bool(fmv_replacement_enabled);
 DEFINE_bool(show_fps, false,
             "Show the frame rate (guest swaps per second) in the top-left "
             "overlay. Emulation > Show FPS toggles it.",
@@ -7184,6 +7186,10 @@ void EmulatorWindow::RefreshSettingsWindow() {
       }
     } else if (key == "games_dir") {
       text = cvars::games_dir.empty() ? "(none)" : cvars::games_dir;
+    } else if (key == "fmv_replacement_dir") {
+      text = cvars::fmv_replacement_dir.empty()
+                 ? "(none)"
+                 : cvars::fmv_replacement_dir.string();
     } else if (key.rfind("hotkey:", 0) == 0) {
       int a = std::stoi(key.substr(7));
       if (settings_capture_action_ == a) {
@@ -8014,6 +8020,10 @@ void EmulatorWindow::ToggleSettingsWindow() {
         RefreshSettingsWindow();
       });
       gtk_grid_attach(GTK_GRID(grid), clear, 1, row++, 1, 1);
+      if (std::string(f.key) == "fmv_replacement_dir") {
+        AddCheck(grid, row, "Use the upscaled cutscenes in this folder",
+                 "fmv_replacement_enabled", cvars::fmv_replacement_enabled);
+      }
     }
     // A save-state behaviour rather than a folder, but this is the tab where
     // save states are, and Emulation > Save State Slots... carries it too.

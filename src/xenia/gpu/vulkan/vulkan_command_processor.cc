@@ -1925,8 +1925,15 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
     return;
   }
 
+  // How much the guest drew for this frame tells a movie (a handful of draws)
+  // from a scene, which is what says the movie is actually on screen.
+  const uint64_t draw_count_now =
+      stats_draw_count_.load(std::memory_order_relaxed);
+  const uint64_t guest_draws = draw_count_now - fmv_last_draw_count_;
+  fmv_last_draw_count_ = draw_count_now;
   if (std::shared_ptr<const FmvReplacement::Frame> fmv_frame =
-          FmvReplacement::Get().GetFrame()) {
+          FmvReplacement::Get().GetFrame(
+              uint32_t(std::min<uint64_t>(guest_draws, UINT32_MAX)))) {
     VkImageView fmv_view = UploadFmvFrame(*fmv_frame, frontbuffer_width_scaled,
                                           frontbuffer_height_scaled);
     if (fmv_view != VK_NULL_HANDLE) {

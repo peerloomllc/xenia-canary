@@ -25,9 +25,31 @@ extern "C" {
 #include "third_party/FFmpeg/libavutil/pixdesc.h"
 }  // extern "C"
 
-DEFINE_int32(fmv_replacement_delay_ms, 1900,
-             "How long after a game starts reading a movie it shows the first "
-             "frame (its buffering), subtracted from the replacement's clock.",
+DEFINE_bool(fmv_replacement_enabled, true,
+            "Play the replacement videos from the folder below in place of "
+            "the game's own cutscenes.",
+            "GPU");
+
+DEFINE_int32(fmv_replacement_delay_ms, 0,
+             "Shifts the replacement against the game's own playback, in "
+             "milliseconds. Positive plays it later.",
+             "GPU");
+
+DEFINE_int32(fmv_replacement_max_draws, 250,
+             "A frame with at most this many guest draws is the game playing "
+             "a movie rather than a scene. Lost Odyssey draws about 84 in a "
+             "movie and 350-900 in an in-engine cutscene.",
+             "GPU");
+
+DEFINE_int32(fmv_replacement_min_frame_ms, 25,
+             "A movie is also presented at its own rate (about 33 ms a frame "
+             "for 30 fps) rather than the game's, so frames closer together "
+             "than this are a scene, not a movie.",
+             "GPU");
+
+DEFINE_int32(fmv_replacement_arm_seconds, 60,
+             "How long after a movie is read from the disc it may still start "
+             "playing; after this the replacement is dropped.",
              "GPU");
 
 DEFINE_path(fmv_replacement_dir, "",
@@ -41,11 +63,9 @@ namespace gpu {
 
 namespace {
 
-// The game reads a movie ahead of playback, so near the end reads stop while
-// the picture still runs; only a gap well before the end is a skip.
-constexpr uint32_t kReadAheadMs = 10000;
-constexpr uint32_t kSkipGapMs = 2500;
-// A read of the same movie's header this long after the start is a replay.
+// The movie is over (or was skipped) once the guest stops drawing like one.
+constexpr uint32_t kVideoGapMs = 300;
+// A read of the same movie's header this long after the last one is a replay.
 constexpr uint32_t kRestartMs = 3000;
 
 std::string ToLower(std::string_view s) {
@@ -179,7 +199,7 @@ void FmvReplacement::Rescan() {
 void FmvReplacement::OnDiscRead(std::string_view file_name, uint64_t offset,
                                 uint64_t length) {
   (void)length;
-  if (!have_movies_) {
+  if (!have_movies_ || !cvars::fmv_replacement_enabled) {
     return;
   }
   const std::string name = ToLower(file_name);
@@ -188,12 +208,15 @@ void FmvReplacement::OnDiscRead(std::string_view file_name, uint64_t offset,
     std::lock_guard<std::mutex> lock(mutex_);
     const uint32_t now = Clock::QueryGuestUptimeMillis();
     if (playing_ && playing_->archive == name && offset >= playing_->offset &&
-        (offset != playing_->offset || now - start_guest_ms_ < kRestartMs)) {
+        (offset != playing_->offset || now - arm_guest_ms_ < kRestartMs)) {
       // Beyond the next known movie of the same archive is not this one.
       const Movie* next = playing_ + 1;
       if (next == movies_.data() + movies_.size() || next->archive != name ||
           offset < next->offset) {
-        last_read_guest_ms_ = now;
+        if (!started_) {
+          // Still waiting for the guest to play it; keep the wait alive.
+          arm_guest_ms_ = now;
+        }
         return;
       }
     }
@@ -210,13 +233,15 @@ void FmvReplacement::OnDiscRead(std::string_view file_name, uint64_t offset,
     old = std::move(decoder_);
     playing_ = found;
     ++generation_;
+    arm_guest_ms_ = now;
     start_guest_ms_ = now;
-    last_read_guest_ms_ = now;
+    last_video_guest_ms_ = 0;
+    started_ = false;
     duration_ms_ = 0;
     decoder_finished_ = false;
     frame_.reset();
-    XELOGI("FMV replacement: {} at {:X} started at uptime {}, playing {}", name,
-           offset, now, found->path);
+    XELOGI("FMV replacement: {} at {:X} read at uptime {}, ready to play {}",
+           name, offset, now, found->path);
     decoder_ = std::thread(&FmvReplacement::DecodeThread, this, found->path,
                            generation_);
   }
@@ -226,8 +251,9 @@ void FmvReplacement::OnDiscRead(std::string_view file_name, uint64_t offset,
   }
 }
 
-std::shared_ptr<const FmvReplacement::Frame> FmvReplacement::GetFrame() {
-  if (!have_movies_) {
+std::shared_ptr<const FmvReplacement::Frame> FmvReplacement::GetFrame(
+    uint32_t guest_draws) {
+  if (!have_movies_ || !cvars::fmv_replacement_enabled) {
     return nullptr;
   }
   std::thread old;
@@ -238,25 +264,57 @@ std::shared_ptr<const FmvReplacement::Frame> FmvReplacement::GetFrame() {
       return nullptr;
     }
     const uint32_t now = Clock::QueryGuestUptimeMillis();
-    const uint32_t elapsed = uint32_t(std::max<int64_t>(
-        int64_t(now - start_guest_ms_) - cvars::fmv_replacement_delay_ms, 0));
-    bool ended = false;
-    if (decoder_finished_ &&
-        (!duration_ms_ || elapsed > duration_ms_ + 250 || !frame_)) {
-      ended = true;
-    } else if (duration_ms_ && elapsed + kReadAheadMs < duration_ms_ &&
-               now - last_read_guest_ms_ > kSkipGapMs) {
-      XELOGI("FMV replacement: reads stopped at {} ms of {}, skipped",
-             elapsed, duration_ms_);
-      ended = true;
+    // Smoothed time between swaps: a movie runs at its own frame rate, a game
+    // at its own. Together with the draw count this separates a movie from a
+    // menu that also draws very little.
+    if (last_swap_guest_ms_) {
+      const float interval = float(now - last_swap_guest_ms_);
+      swap_interval_ms_ = swap_interval_ms_
+                              ? swap_interval_ms_ * 0.75f + interval * 0.25f
+                              : interval;
+    }
+    last_swap_guest_ms_ = now;
+    const bool guest_playing_movie =
+        guest_draws <= uint32_t(std::max(cvars::fmv_replacement_max_draws, 0)) &&
+        swap_interval_ms_ >= float(cvars::fmv_replacement_min_frame_ms);
+    const char* ended = nullptr;
+    if (!started_) {
+      // The movie has been read but the game has not reached it yet: it is
+      // still drawing a scene. Wait, but not for ever.
+      if (guest_playing_movie) {
+        started_ = true;
+        start_guest_ms_ = now;
+        last_video_guest_ms_ = now;
+        XELOGI("FMV replacement: {} on screen at uptime {}, {} ms after the "
+               "read",
+               playing_->path, now, now - arm_guest_ms_);
+      } else if (now - arm_guest_ms_ >
+                 uint32_t(std::max(cvars::fmv_replacement_arm_seconds, 1)) *
+                     1000u) {
+        ended = "never played";
+      }
+    } else {
+      if (guest_playing_movie) {
+        last_video_guest_ms_ = now;
+      }
+      const uint32_t elapsed = uint32_t(std::max<int64_t>(
+          int64_t(now - start_guest_ms_) - cvars::fmv_replacement_delay_ms, 0));
+      if (now - last_video_guest_ms_ > kVideoGapMs) {
+        ended = "the guest stopped playing it";
+      } else if (decoder_finished_ &&
+                 (!duration_ms_ || elapsed > duration_ms_ + 250 || !frame_)) {
+        ended = "it ran out";
+      }
     }
     if (ended) {
-      XELOGI("FMV replacement: {} ended at {} ms", playing_->path, elapsed);
+      XELOGI("FMV replacement: {} stopped ({}) at uptime {}", playing_->path,
+             ended, now);
       playing_ = nullptr;
+      started_ = false;
       ++generation_;
       frame_.reset();
       old = std::move(decoder_);
-    } else {
+    } else if (started_) {
       result = frame_;
     }
   }
@@ -356,9 +414,12 @@ void FmvReplacement::DecodeThread(std::string path, uint64_t generation) {
   if (codec) {
     std::unique_lock<std::mutex> lock(mutex_);
     while (generation_ == generation) {
+      // Until the guest reaches the movie, hold at the first frame: the file
+      // is read seconds before it plays.
       const int64_t raw_ms =
-          int64_t(Clock::QueryGuestUptimeMillis() - start_guest_ms_) -
-          cvars::fmv_replacement_delay_ms;
+          started_ ? int64_t(Clock::QueryGuestUptimeMillis() - start_guest_ms_) -
+                         cvars::fmv_replacement_delay_ms
+                   : 0;
       const uint32_t target_ms = uint32_t(std::max<int64_t>(raw_ms, 0));
       lock.unlock();
       bool progressed = false;

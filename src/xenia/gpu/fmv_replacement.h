@@ -54,9 +54,12 @@ class FmvReplacement {
   void OnDiscRead(std::string_view file_name, uint64_t offset,
                   uint64_t length);
 
-  // From the swap: the frame to show at the video's own size (the caller
-  // scales it), or null when no replacement is playing.
-  std::shared_ptr<const Frame> GetFrame();
+  // From the swap, with the number of draws the guest made for this frame:
+  // the frame to show at the video's own size (the caller scales it), or null
+  // when no replacement should be on screen. A game reads a movie from the
+  // disc seconds before it plays it, often while an in-engine scene is on
+  // screen, so the draw count is what says the movie is actually playing.
+  std::shared_ptr<const Frame> GetFrame(uint32_t guest_draws);
 
  private:
   struct Movie {
@@ -81,8 +84,12 @@ class FmvReplacement {
   // The movie playing, guarded by mutex_.
   const Movie* playing_ = nullptr;
   uint64_t generation_ = 0;
-  uint32_t start_guest_ms_ = 0;
-  uint32_t last_read_guest_ms_ = 0;
+  uint32_t start_guest_ms_ = 0;   // When the guest's own movie started.
+  uint32_t arm_guest_ms_ = 0;     // When the movie was read from the disc.
+  uint32_t last_video_guest_ms_ = 0;
+  bool started_ = false;
+  uint32_t last_swap_guest_ms_ = 0;
+  float swap_interval_ms_ = 0.0f;
   uint64_t duration_ms_ = 0;  // 0 until the decoder knows.
   bool decoder_finished_ = false;
   std::shared_ptr<const Frame> frame_;

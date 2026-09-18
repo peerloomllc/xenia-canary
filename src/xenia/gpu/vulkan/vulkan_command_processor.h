@@ -812,6 +812,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
   uint32_t fmv_scaled_height_ = 0;
   bool fmv_scaled_written_ = false;
   bool fmv_linear_blit_ = true;
+  uint64_t fmv_last_draw_count_ = 0;
   VkBuffer fmv_upload_buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory fmv_upload_memory_ = VK_NULL_HANDLE;
   uint32_t fmv_upload_memory_type_ = UINT32_MAX;
