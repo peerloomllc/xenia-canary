@@ -425,9 +425,9 @@ void FmvReplacement::OnGuestThumbnail(const uint8_t* rgba) {
   }
   if (thumbnails_seen_ % 300 == 1) {
     XELOGD(
-        "FMV replacement: playing, best match {} at {} ms of {} frames kept, "
+        "FMV replacement: playing, best match {} at {} ms, we are at {} ms, "
         "guest contrast {}",
-        best, best_pts, recent_thumbs_.size(), guest_contrast);
+        best, best_pts, int32_t(now - start_guest_ms_), guest_contrast);
   }
   // A busy picture has more room to be wrong: what separates one frame from
   // the next grows with the contrast, so the same small timing difference
@@ -437,6 +437,20 @@ void FmvReplacement::OnGuestThumbnail(const uint8_t* rgba) {
   if (best <= threshold + guest_contrast / 3) {
     matched_recently_ = true;
     last_video_guest_ms_ = now;
+    // The game does not play its movie at the guest clock's rate: Blue
+    // Dragon's opening runs about 1.3% slow, a second behind us every minute,
+    // so the picture drifts out of step with the game's own sound and once
+    // the gap passes the frames we keep the check cannot place the guest at
+    // all. The frame it really is showing is the measurement, so steer the
+    // clock towards it a little at a time rather than letting the error pile
+    // up. A frame either way is left alone; the rest converges in under a
+    // second and follows a drift of any size.
+    const int32_t ours = int32_t(now - start_guest_ms_);
+    const int32_t error = best_pts - ours;
+    if (std::abs(error) > 33) {
+      const int32_t step = std::clamp(error / 8, -50, 50);
+      start_guest_ms_ = uint32_t(int64_t(start_guest_ms_) - step);
+    }
   }
 }
 
