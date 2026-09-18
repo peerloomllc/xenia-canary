@@ -114,6 +114,10 @@ class FmvReplacement {
   // screen can be recognised; then the frames around the one being shown.
   std::vector<std::pair<int32_t, Thumb>> start_thumbs_;
   std::deque<std::pair<int32_t, Thumb>> recent_thumbs_;
+  // Frames decoded but not shown yet. The game's own playback wanders either
+  // side of ours, and where consecutive frames differ wildly, its being a
+  // frame ahead of us looks like a different movie altogether.
+  std::deque<std::pair<int32_t, Thumb>> ahead_thumbs_;
   bool matched_recently_ = false;
   uint64_t thumbnails_seen_ = 0;
   uint64_t duration_ms_ = 0;  // 0 until the decoder knows.

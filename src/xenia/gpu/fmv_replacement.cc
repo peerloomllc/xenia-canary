@@ -119,6 +119,9 @@ void ConvertFrame(const AVFrame* src, std::vector<uint8_t>& rgba) {
 constexpr int32_t kPrefetchMs = 3000;
 // How many played frames to keep for checking the guest is still on the movie.
 constexpr size_t kRecentThumbs = 24;
+// How far past the frame being shown to decode, so that the same check can
+// also recognise a guest that is running slightly ahead of us.
+constexpr int32_t kThumbLeadMs = 250;
 
 FmvReplacement::Thumb ThumbFromYuv(const AVFrame* frame) {
   FmvReplacement::Thumb thumb{};
@@ -327,6 +330,7 @@ void FmvReplacement::OnDiscRead(std::string_view file_name, uint64_t offset,
     frame_.reset();
     start_thumbs_.clear();
     recent_thumbs_.clear();
+    ahead_thumbs_.clear();
     matched_recently_ = false;
     XELOGI("FMV replacement: {} at {:X} read at uptime {}, ready to play {}",
            name, offset, now, found->path);
@@ -410,11 +414,13 @@ void FmvReplacement::OnGuestThumbnail(const uint8_t* rgba) {
   }
   uint32_t best = UINT32_MAX;
   int32_t best_pts = 0;
-  for (const auto& [pts, thumb] : recent_thumbs_) {
-    const uint32_t difference = ThumbDifference(guest, thumb);
-    if (difference < best) {
-      best = difference;
-      best_pts = pts;
+  for (const auto* frames : {&recent_thumbs_, &ahead_thumbs_}) {
+    for (const auto& [pts, thumb] : *frames) {
+      const uint32_t difference = ThumbDifference(guest, thumb);
+      if (difference < best) {
+        best = difference;
+        best_pts = pts;
+      }
     }
   }
   if (thumbnails_seen_ % 300 == 1) {
@@ -423,7 +429,12 @@ void FmvReplacement::OnGuestThumbnail(const uint8_t* rgba) {
         "guest contrast {}",
         best, best_pts, recent_thumbs_.size(), guest_contrast);
   }
-  if (best <= threshold) {
+  // A busy picture has more room to be wrong: what separates one frame from
+  // the next grows with the contrast, so the same small timing difference
+  // between the game's playback and ours costs more there. Measured on Blue
+  // Dragon's opening, a frame that really is the right one scores a median of
+  // 5 below contrast 15 and 18 around contrast 50.
+  if (best <= threshold + guest_contrast / 3) {
     matched_recently_ = true;
     last_video_guest_ms_ = now;
   }
@@ -516,12 +527,29 @@ void FmvReplacement::DecodeThread(std::string path, uint64_t generation) {
   AVFormatContext* format = nullptr;
   AVCodecContext* codec = nullptr;
   AVPacket* packet = av_packet_alloc();
-  AVFrame* current = av_frame_alloc();
-  AVFrame* next = av_frame_alloc();
-  bool have_current = false, have_next = false, eof = false, dirty = false;
-  Thumb current_thumb{};
-  int32_t current_thumb_ms = 0;
-  bool have_thumb = false;
+  AVFrame* current = nullptr;
+  bool eof = false, dirty = false;
+  // Frames decoded but not shown yet, oldest first, each with its thumbnail.
+  struct Decoded {
+    AVFrame* frame;
+    int32_t pts_ms;
+    Thumb thumb;
+    bool has_thumb;
+  };
+  std::deque<Decoded> pending;
+  std::vector<AVFrame*> spares;
+  auto take_frame = [&]() -> AVFrame* {
+    if (spares.empty()) {
+      return av_frame_alloc();
+    }
+    AVFrame* frame = spares.back();
+    spares.pop_back();
+    return frame;
+  };
+  auto give_frame = [&](AVFrame* frame) {
+    av_frame_unref(frame);
+    spares.push_back(frame);
+  };
   int stream_index = -1;
   double time_base = 0.0;
   uint64_t frame_id = 0;
@@ -578,8 +606,8 @@ void FmvReplacement::DecodeThread(std::string path, uint64_t generation) {
     }
   }
 
-  // Decodes the next frame into `next`; false at the end of the stream.
-  auto decode_next = [&]() -> bool {
+  // Decodes the next frame; false at the end of the stream.
+  auto decode_into = [&](AVFrame* next) -> bool {
     while (true) {
       int ret = avcodec_receive_frame(codec, next);
       if (ret == 0) {
@@ -604,20 +632,21 @@ void FmvReplacement::DecodeThread(std::string path, uint64_t generation) {
   // comes before it, so the frame it starts with can be recognised.
   if (codec) {
     std::vector<std::pair<int32_t, Thumb>> opening;
-    while (decode_next()) {
-      const int64_t pts = next->best_effort_timestamp;
+    AVFrame* scratch = take_frame();
+    while (decode_into(scratch)) {
+      const int64_t pts = scratch->best_effort_timestamp;
       const int32_t pts_ms =
           pts == AV_NOPTS_VALUE ? 0 : int32_t(pts * time_base * 1000.0);
-      if (next->format == AV_PIX_FMT_YUV420P) {
-        opening.emplace_back(pts_ms, ThumbFromYuv(next));
+      if (scratch->format == AV_PIX_FMT_YUV420P) {
+        opening.emplace_back(pts_ms, ThumbFromYuv(scratch));
       }
       if (pts_ms >= kPrefetchMs) {
         break;
       }
     }
+    give_frame(scratch);
     av_seek_frame(format, stream_index, 0, AVSEEK_FLAG_BACKWARD);
     avcodec_flush_buffers(codec);
-    have_next = false;
     eof = false;
     std::lock_guard<std::mutex> lock(mutex_);
     if (generation_ == generation) {
@@ -637,33 +666,54 @@ void FmvReplacement::DecodeThread(std::string path, uint64_t generation) {
       const uint32_t target_ms = uint32_t(std::max<int64_t>(raw_ms, 0));
       lock.unlock();
       bool progressed = false;
-      if (!have_next && !eof) {
-        have_next = decode_next();
-        eof = !have_next;
+      // Decode past the frame being shown, so that the picture check can place
+      // a guest that is running a little ahead of us as well as behind.
+      while (!eof && pending.size() < 16 &&
+             (pending.empty() ||
+              pending.back().pts_ms <= int32_t(target_ms) + kThumbLeadMs)) {
+        AVFrame* frame = take_frame();
+        if (!decode_into(frame)) {
+          give_frame(frame);
+          eof = true;
+          break;
+        }
+        const int64_t pts = frame->best_effort_timestamp;
+        Decoded decoded{frame,
+                        pts == AV_NOPTS_VALUE
+                            ? 0
+                            : int32_t(pts * time_base * 1000.0),
+                        Thumb{}, false};
+        if (frame->format == AV_PIX_FMT_YUV420P) {
+          decoded.thumb = ThumbFromYuv(frame);
+          decoded.has_thumb = true;
+        }
+        pending.push_back(std::move(decoded));
         progressed = true;
       }
-      if (have_next) {
-        int64_t pts = next->best_effort_timestamp;
-        const double pts_ms =
-            pts == AV_NOPTS_VALUE ? 0.0 : pts * time_base * 1000.0;
-        if (pts_ms <= double(target_ms)) {
-          std::swap(current, next);
-          have_current = true;
-          have_next = false;
-          dirty = true;
-          progressed = true;
-          if (current->format == AV_PIX_FMT_YUV420P) {
-            current_thumb = ThumbFromYuv(current);
-            current_thumb_ms = int32_t(pts_ms);
-            have_thumb = true;
-          }
+      // Show the newest frame that is due; anything older is skipped.
+      bool shown_thumb = false;
+      Thumb shown{};
+      int32_t shown_ms = 0;
+      while (!pending.empty() &&
+             pending.front().pts_ms <= int32_t(target_ms)) {
+        if (current) {
+          give_frame(current);
         }
+        current = pending.front().frame;
+        dirty = true;
+        progressed = true;
+        if (pending.front().has_thumb) {
+          shown = pending.front().thumb;
+          shown_ms = pending.front().pts_ms;
+          shown_thumb = true;
+        }
+        pending.pop_front();
       }
       std::shared_ptr<Frame> converted;
       // Only convert once caught up, so a late start skips frames cheaply.
-      if (dirty && have_current && !have_next && !eof) {
+      if (dirty && current && pending.empty() && !eof) {
         // Still behind: decode more before converting.
-      } else if (dirty && have_current &&
+      } else if (dirty && current &&
                  current->format != AV_PIX_FMT_YUV420P) {
         // Anything else (an RGB VP9 profile 1 file, say) would silently show
         // nothing; say so and stop.
@@ -675,7 +725,7 @@ void FmvReplacement::DecodeThread(std::string path, uint64_t generation) {
         lock.lock();
         decoder_finished_ = true;
         break;
-      } else if (dirty && have_current) {
+      } else if (dirty && current) {
         converted = std::make_shared<Frame>();
         converted->id = ++frame_id;
         converted->width = uint32_t(current->width);
@@ -687,14 +737,19 @@ void FmvReplacement::DecodeThread(std::string path, uint64_t generation) {
       if (generation_ != generation) {
         break;
       }
-      if (have_thumb) {
+      if (shown_thumb) {
         // What is on screen now, for checking the guest is still on this
         // movie (and has not skipped it).
-        recent_thumbs_.emplace_back(current_thumb_ms, current_thumb);
+        recent_thumbs_.emplace_back(shown_ms, shown);
         while (recent_thumbs_.size() > kRecentThumbs) {
           recent_thumbs_.pop_front();
         }
-        have_thumb = false;
+      }
+      ahead_thumbs_.clear();
+      for (const Decoded& decoded : pending) {
+        if (decoded.has_thumb) {
+          ahead_thumbs_.emplace_back(decoded.pts_ms, decoded.thumb);
+        }
       }
       if (converted) {
         frame_ = std::move(converted);
@@ -707,7 +762,7 @@ void FmvReplacement::DecodeThread(std::string path, uint64_t generation) {
                  frame_id, shown_ms, target_ms);
         }
       }
-      if (eof && !have_next) {
+      if (eof && pending.empty()) {
         decoder_finished_ = true;
       }
       if (!progressed || (eof && !dirty)) {
@@ -716,8 +771,15 @@ void FmvReplacement::DecodeThread(std::string path, uint64_t generation) {
     }
   }
 
-  av_frame_free(&current);
-  av_frame_free(&next);
+  if (current) {
+    av_frame_free(&current);
+  }
+  for (Decoded& decoded : pending) {
+    av_frame_free(&decoded.frame);
+  }
+  for (AVFrame* frame : spares) {
+    av_frame_free(&frame);
+  }
   av_packet_free(&packet);
   if (codec) {
     avcodec_free_context(&codec);
