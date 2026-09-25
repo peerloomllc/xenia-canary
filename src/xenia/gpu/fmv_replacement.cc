@@ -39,6 +39,12 @@ DEFINE_int32(fmv_replacement_max_draws, 250,
              "movie and 350-900 in an in-engine cutscene.",
              "GPU");
 
+DEFINE_int32(fmv_replacement_scene_draws, 1000,
+             "A frame with more guest draws than this is a scene even when "
+             "its picture looks like the movie's: Blue Dragon's in-engine "
+             "scenes draw about 4900 a frame, its movies about 200.",
+             "GPU");
+
 DEFINE_int32(fmv_replacement_min_frame_ms, 25,
              "A movie is also presented at its own rate (about 33 ms a frame "
              "for 30 fps) rather than the game's, so frames closer together "
@@ -369,6 +375,14 @@ void FmvReplacement::OnGuestThumbnail(const uint8_t* rgba) {
     return;
   }
   ++thumbnails_seen_;
+  if (last_guest_draws_ >
+      uint32_t(std::max(cvars::fmv_replacement_scene_draws, 0))) {
+    // The game is drawing a scene, however much it looks like the movie:
+    // neither start nor keep the replacement, or it hides the scene and,
+    // with the clock steered to a picture that stands still, stays on
+    // screen for ever.
+    return;
+  }
   const bool too_flat =
       guest_contrast <
       uint32_t(std::max(cvars::fmv_replacement_min_contrast, 0));
@@ -477,6 +491,7 @@ std::shared_ptr<const FmvReplacement::Frame> FmvReplacement::GetFrame(
                               : interval;
     }
     last_swap_guest_ms_ = now;
+    last_guest_draws_ = guest_draws;
     const bool draws_like_movie =
         guest_draws <= uint32_t(std::max(cvars::fmv_replacement_max_draws, 0)) &&
         swap_interval_ms_ >= float(cvars::fmv_replacement_min_frame_ms);

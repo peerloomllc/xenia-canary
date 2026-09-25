@@ -109,6 +109,7 @@ class FmvReplacement {
   bool started_ = false;
   uint32_t last_swap_guest_ms_ = 0;
   float swap_interval_ms_ = 0.0f;
+  uint32_t last_guest_draws_ = 0;  // Draws in the frame last swapped.
   bool thumbnails_ok_ = true;
   // The movie's opening, decoded when it is read, so its first frame on
   // screen can be recognised; then the frames around the one being shown.
