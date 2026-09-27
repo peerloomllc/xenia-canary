@@ -417,6 +417,20 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
       }
     }
 
+    // The bin mask and select packets only decide whether later predicated
+    // packets run, a plain event only records its initiator and the screen
+    // extent event is answered with a constant, so they leave the draw state
+    // alone.
+    if (opcode != PM4_DRAW_INDX && opcode != PM4_DRAW_INDX_2 &&
+        opcode != PM4_EVENT_WRITE && opcode != PM4_EVENT_WRITE_EXT &&
+        opcode != PM4_SET_CONSTANT && opcode != PM4_SET_CONSTANT2 &&
+        opcode != PM4_NOP && opcode != PM4_SET_BIN_MASK_LO &&
+        opcode != PM4_SET_BIN_MASK_HI && opcode != PM4_SET_BIN_SELECT_LO &&
+        opcode != PM4_SET_BIN_SELECT_HI && opcode != PM4_SET_BIN_MASK &&
+        opcode != PM4_SET_BIN_SELECT) {
+      fast_draw_valid_ = false;
+    }
+
     bool result = false;
     switch (opcode) {
       case PM4_ME_INIT:

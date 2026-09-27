@@ -123,6 +123,7 @@ void SpirvShaderTranslator::Reset() {
   builder_.reset();
 
   uniform_float_constants_ = spv::NoResult;
+  push_constants_ = spv::NoResult;
 
   // Vertex shader inputs.
   input_vertex_index_ = spv::NoResult;
@@ -369,6 +370,23 @@ void SpirvShaderTranslator::StartTranslation() {
                           int(kConstantBufferSystem));
   if (features_.spirv_version >= spv::Spv_1_4) {
     main_interface_.push_back(uniform_system_constants_);
+  }
+
+  if (IsSpirvVertexShader()) {
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(type_int_);
+    spv::Id type_push_constants =
+        builder_->makeStructType(id_vector_temp_, "XePushConstants");
+    builder_->addMemberName(type_push_constants, 0, "vertex_base_index");
+    builder_->addMemberDecoration(type_push_constants, 0,
+                                  spv::DecorationOffset, 0);
+    builder_->addDecoration(type_push_constants, spv::DecorationBlock);
+    push_constants_ = builder_->createVariable(
+        spv::NoPrecision, spv::StorageClassPushConstant, type_push_constants,
+        "xe_push_constants");
+    if (features_.spirv_version >= spv::Spv_1_4) {
+      main_interface_.push_back(push_constants_);
+    }
   }
 
   bool memexport_used = IsMemoryExportUsed();
@@ -1955,14 +1973,13 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
           builder_->createUnaryOp(spv::OpBitcast, type_int_, vertex_index);
       // Add the base to the index.
       id_vector_temp_.clear();
-      id_vector_temp_.push_back(
-          builder_->makeIntConstant(kSystemConstantVertexBaseIndex));
+      id_vector_temp_.push_back(const_int_0_);
       vertex_index = builder_->createBinOp(
           spv::OpIAdd, type_int_, vertex_index,
-          builder_->createLoad(builder_->createAccessChain(
-                                   spv::StorageClassUniform,
-                                   uniform_system_constants_, id_vector_temp_),
-                               spv::NoPrecision));
+          builder_->createLoad(
+              builder_->createAccessChain(spv::StorageClassPushConstant,
+                                          push_constants_, id_vector_temp_),
+              spv::NoPrecision));
       // Write the index to r0.x as float.
       id_vector_temp_.clear();
       id_vector_temp_.push_back(const_int_0_);

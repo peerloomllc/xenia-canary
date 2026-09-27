@@ -94,11 +94,29 @@ class DeferredCommandBuffer {
 
   void CmdVkBindIndexBuffer(VkBuffer buffer, VkDeviceSize offset,
                             VkIndexType index_type) {
+    bound_index_buffer_ = buffer;
+    bound_index_buffer_offset_ = offset;
+    bound_index_type_ = index_type;
     auto& args = *reinterpret_cast<ArgsVkBindIndexBuffer*>(WriteCommand(
         Command::kVkBindIndexBuffer, sizeof(ArgsVkBindIndexBuffer)));
     args.buffer = buffer;
     args.offset = offset;
     args.index_type = index_type;
+  }
+
+  // Changes with every push constant write and every Reset, so a caller can
+  // tell whether push constants it wrote are still the last ones.
+  uint64_t push_constants_generation() const {
+    return push_constants_generation_;
+  }
+
+  // Whether the last index buffer binding recorded since the last Reset is
+  // this one.
+  bool IsIndexBufferBound(VkBuffer buffer, VkDeviceSize offset,
+                          VkIndexType index_type) const {
+    return bound_index_buffer_ == buffer &&
+           bound_index_buffer_offset_ == offset &&
+           bound_index_type_ == index_type;
   }
 
   void CmdVkBindPipeline(VkPipelineBindPoint pipeline_bind_point,
@@ -391,6 +409,7 @@ class DeferredCommandBuffer {
   void CmdVkPushConstants(VkPipelineLayout layout,
                           VkShaderStageFlags stage_flags, uint32_t offset,
                           uint32_t size, const void* values) {
+    ++push_constants_generation_;
     uint8_t* args_ptr = reinterpret_cast<uint8_t*>(WriteCommand(
         Command::kVkPushConstants, sizeof(ArgsVkPushConstants) + size));
     auto& args = *reinterpret_cast<ArgsVkPushConstants*>(args_ptr);
@@ -721,6 +740,10 @@ class DeferredCommandBuffer {
   const VulkanCommandProcessor& command_processor_;
 
   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
+  uint64_t push_constants_generation_ = 0;
+  VkBuffer bound_index_buffer_ = VK_NULL_HANDLE;
+  VkDeviceSize bound_index_buffer_offset_ = 0;
+  VkIndexType bound_index_type_ = VK_INDEX_TYPE_MAX_ENUM;
   std::vector<uintmax_t> command_stream_;
 };
 

@@ -57,6 +57,11 @@ namespace gpu {
 // because textures are streamed this way anyway.
 class TextureCache {
  public:
+  // A texture's memory was written since the bindings were last checked.
+  bool texture_became_outdated() const {
+    return texture_became_outdated_.load(std::memory_order_relaxed);
+  }
+
   // Hard limit, originating from the half-pixel offset filling hack in the
   // resolve shaders only filling up to 3 pixels, due to the bit counts used for
   // passing the scale to shaders, and because the full 490 MB EDRAM buffer is
