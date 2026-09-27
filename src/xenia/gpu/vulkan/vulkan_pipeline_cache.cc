@@ -9,9 +9,13 @@
 
 #include "xenia/gpu/vulkan/vulkan_pipeline_cache.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <set>
+#include <string>
+#include <vector>
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/assert.h"
@@ -58,6 +62,16 @@ DEFINE_int32(
     "automatically (75% of logical CPU cores), a positive number to specify "
     "the number of threads explicitly (up to the number of logical CPU cores), "
     "0 to disable multithreaded pipeline creation.",
+    "Vulkan");
+
+DEFINE_string(
+    vulkan_geometry_passthrough_pixel_shaders, "576D5839C5B79A77",
+    "Pixel shaders (ucode hashes in hex, comma-separated) whose triangle draws "
+    "go through a pass-through geometry shader. Works around the NVIDIA "
+    "driver drawing pixels outside the triangles of these draws: "
+    "576D5839C5B79A77 is Blue Dragon's summon shimmer (dark wedges and "
+    "flat dark screen halves flickering over the dragon spirits). Empty to "
+    "disable. Takes effect on the next launch.",
     "Vulkan");
 
 DECLARE_bool(spirv_disable_rounding_mode_rte);
@@ -653,10 +667,12 @@ bool VulkanPipelineCache::ConfigurePipeline(
   }
 
   VkShaderModule geometry_shader = VK_NULL_HANDLE;
-  if (description.geometry_shader != PipelineGeometryShader::kNone) {
+  PipelineGeometryShader host_geometry_shader =
+      GetHostGeometryShader(description);
+  if (host_geometry_shader != PipelineGeometryShader::kNone) {
     GeometryShaderKey geometry_shader_key;
     GetGeometryShaderKey(
-        description.geometry_shader,
+        host_geometry_shader,
         SpirvShaderTranslator::Modification(vertex_shader->modification()),
         SpirvShaderTranslator::Modification(
             pixel_shader ? pixel_shader->modification() : 0),
@@ -1518,6 +1534,58 @@ bool VulkanPipelineCache::ArePipelineRequirementsMet(
   return true;
 }
 
+VulkanPipelineCache::PipelineGeometryShader
+VulkanPipelineCache::GetHostGeometryShader(
+    const PipelineDescription& description) const {
+  if (description.geometry_shader != PipelineGeometryShader::kNone ||
+      description.tessellation_mode != PipelineTessellationMode::kNone ||
+      !description.pixel_shader_hash) {
+    return description.geometry_shader;
+  }
+  switch (description.primitive_topology) {
+    case PipelinePrimitiveTopology::kTriangleList:
+    case PipelinePrimitiveTopology::kTriangleStrip:
+    case PipelinePrimitiveTopology::kTriangleFan:
+      break;
+    default:
+      return description.geometry_shader;
+  }
+  // Parsed once: the list takes effect on the next launch.
+  static const std::vector<uint64_t> passthrough_pixel_shaders = [] {
+    std::vector<uint64_t> hashes;
+    const std::string& list = cvars::vulkan_geometry_passthrough_pixel_shaders;
+    size_t start = 0;
+    while (start < list.size()) {
+      size_t end = list.find(',', start);
+      if (end == std::string::npos) {
+        end = list.size();
+      }
+      std::string item = list.substr(start, end - start);
+      if (!item.empty()) {
+        char* parse_end;
+        uint64_t hash = std::strtoull(item.c_str(), &parse_end, 16);
+        if (*parse_end == '\0') {
+          hashes.push_back(hash);
+        } else {
+          XELOGW(
+              "vulkan_geometry_passthrough_pixel_shaders: ignoring \"{}\"",
+              item);
+        }
+      }
+      start = end + 1;
+    }
+    return hashes;
+  }();
+  if (!command_processor_.GetVulkanDevice()->properties().geometryShader ||
+      std::find(passthrough_pixel_shaders.cbegin(),
+                passthrough_pixel_shaders.cend(),
+                description.pixel_shader_hash) ==
+          passthrough_pixel_shaders.cend()) {
+    return description.geometry_shader;
+  }
+  return PipelineGeometryShader::kTrianglePassthrough;
+}
+
 bool VulkanPipelineCache::GetGeometryShaderKey(
     PipelineGeometryShader geometry_shader_type,
     SpirvShaderTranslator::Modification vertex_shader_modification,
@@ -1592,6 +1660,12 @@ VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
       input_primitive_vertex_count = 4;
       output_primitive_execution_mode = spv::ExecutionModeOutputTriangleStrip;
       output_max_vertices = 4;
+      break;
+    case PipelineGeometryShader::kTrianglePassthrough:
+      input_primitive_execution_mode = spv::ExecutionModeTriangles;
+      input_primitive_vertex_count = 3;
+      output_primitive_execution_mode = spv::ExecutionModeOutputTriangleStrip;
+      output_max_vertices = 3;
       break;
     default:
       assert_unhandled_case(key.type);
@@ -2470,7 +2544,9 @@ VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
       builder.createNoResultOp(spv::OpEndPrimitive);
     } break;
 
-    case PipelineGeometryShader::kQuadList: {
+    case PipelineGeometryShader::kQuadList:
+    case PipelineGeometryShader::kTrianglePassthrough: {
+      bool is_quad = key.type == PipelineGeometryShader::kQuadList;
       // Initialize the point coordinates output for safety if this shader type
       // is used with has_point_coordinates for some reason.
       spv::Id const_point_coordinates_zero = spv::NoResult;
@@ -2484,12 +2560,14 @@ VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
       }
 
       // Build the triangle strip from the original quad vertices in the
-      // 0, 1, 3, 2 order (like specified for GL_QUAD_STRIP).
+      // 0, 1, 3, 2 order (like specified for GL_QUAD_STRIP), or pass the
+      // triangle's vertices through in order.
       // TODO(Triang3l): Find the correct decomposition of quads into triangles
       // on the real hardware.
-      for (uint32_t i = 0; i < 4; ++i) {
+      uint32_t vertex_count = is_quad ? 4 : 3;
+      for (uint32_t i = 0; i < vertex_count; ++i) {
         spv::Id const_vertex_index =
-            builder.makeIntConstant(int32_t(i ^ (i >> 1)));
+            builder.makeIntConstant(int32_t(is_quad ? i ^ (i >> 1) : i));
         // Interpolators.
         id_vector_temp.clear();
         id_vector_temp.push_back(const_vertex_index);
@@ -3454,11 +3532,12 @@ void VulkanPipelineCache::InitializeShaderStorage(
 
       // Get geometry shader if needed.
       VkShaderModule geometry_shader = VK_NULL_HANDLE;
-      if (pipeline_description.geometry_shader !=
-          PipelineGeometryShader::kNone) {
+      PipelineGeometryShader host_geometry_shader =
+          GetHostGeometryShader(pipeline_description);
+      if (host_geometry_shader != PipelineGeometryShader::kNone) {
         GeometryShaderKey geometry_shader_key;
         GetGeometryShaderKey(
-            pipeline_description.geometry_shader,
+            host_geometry_shader,
             SpirvShaderTranslator::Modification(
                 vertex_translation->modification()),
             SpirvShaderTranslator::Modification(

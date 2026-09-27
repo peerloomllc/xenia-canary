@@ -154,6 +154,10 @@ class VulkanPipelineCache {
     kPointList,
     kRectangleList,
     kQuadList,
+    // Triangles passed through unchanged. Chosen when the pipeline is created
+    // (GetHostGeometryShader), never stored in PipelineDescription, whose
+    // geometry_shader field has only 2 bits.
+    kTrianglePassthrough,
   };
 
   enum class PipelinePrimitiveTopology : uint32_t {
@@ -315,7 +319,7 @@ class VulkanPipelineCache {
   union GeometryShaderKey {
     uint32_t key;
     struct {
-      PipelineGeometryShader type : 2;
+      PipelineGeometryShader type : 3;
       uint32_t interpolator_count : 5;
       uint32_t has_user_clip_planes : 1;
       uint32_t user_clip_plane_cull : 1;
@@ -363,6 +367,11 @@ class VulkanPipelineCache {
   // Whether the pipeline for the given description is supported by the device.
   bool ArePipelineRequirementsMet(const PipelineDescription& description) const;
 
+  // The geometry shader a pipeline is created with: the description's, or
+  // kTrianglePassthrough for triangle draws of the pixel shaders listed in
+  // --vulkan_geometry_passthrough_pixel_shaders.
+  PipelineGeometryShader GetHostGeometryShader(
+      const PipelineDescription& description) const;
   static bool GetGeometryShaderKey(
       PipelineGeometryShader geometry_shader_type,
       SpirvShaderTranslator::Modification vertex_shader_modification,
