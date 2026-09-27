@@ -1567,9 +1567,8 @@ VulkanPipelineCache::GetHostGeometryShader(
         if (*parse_end == '\0') {
           hashes.push_back(hash);
         } else {
-          XELOGW(
-              "vulkan_geometry_passthrough_pixel_shaders: ignoring \"{}\"",
-              item);
+          XELOGW("vulkan_geometry_passthrough_pixel_shaders: ignoring \"{}\"",
+                 item);
         }
       }
       start = end + 1;
@@ -1577,10 +1576,9 @@ VulkanPipelineCache::GetHostGeometryShader(
     return hashes;
   }();
   if (!command_processor_.GetVulkanDevice()->properties().geometryShader ||
-      std::find(passthrough_pixel_shaders.cbegin(),
-                passthrough_pixel_shaders.cend(),
-                description.pixel_shader_hash) ==
-          passthrough_pixel_shaders.cend()) {
+      std::find(
+          passthrough_pixel_shaders.cbegin(), passthrough_pixel_shaders.cend(),
+          description.pixel_shader_hash) == passthrough_pixel_shaders.cend()) {
     return description.geometry_shader;
   }
   return PipelineGeometryShader::kTrianglePassthrough;
