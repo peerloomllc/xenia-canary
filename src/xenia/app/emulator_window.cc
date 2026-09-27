@@ -107,6 +107,7 @@ DECLARE_uint64(framerate_limit);
 DECLARE_int32(draw_resolution_scale_x);
 DECLARE_int32(draw_resolution_scale_y);
 DECLARE_string(render_target_path_vulkan);
+DECLARE_path(target);
 DECLARE_bool(vulkan_sparse_shared_memory);
 DECLARE_bool(dirty_region_tracking);
 DECLARE_bool(promote_vector_context_values);
@@ -6209,6 +6210,29 @@ xe::X_STATUS EmulatorWindow::RunTitle(
       return X_STATUS_SUCCESS;
     }
     return X_STATUS_UNSUCCESSFUL;
+  }
+
+  // A title's own settings are read when it launches, after the graphics
+  // system was built from the main config, so the ones read while setting up
+  // (the render target path, for one) would not apply. A process started with
+  // the path reads them before that (xenia_main.cc), so start one when this
+  // title has settings of its own and this process was not started for it.
+  {
+    Emulator::DiscInfo disc_info;
+    std::error_code ec;
+    bool started_for_it =
+        !cvars::target.empty() &&
+        std::filesystem::equivalent(cvars::target, path_to_file, ec);
+    if (!started_for_it && Emulator::ReadDiscInfo(path_to_file, &disc_info) &&
+        disc_info.title_id &&
+        !config::GameConfigValues(fmt::format("{:08X}", disc_info.title_id))
+             .empty()) {
+      XELOGI("RunTitle: {:08X} has its own settings; restarting to apply them",
+             disc_info.title_id);
+      if (RelaunchProcess(path_to_file)) {
+        return X_STATUS_SUCCESS;
+      }
+    }
   }
 
   // Prevent crashing the emulator by not loading a game if a game is already
