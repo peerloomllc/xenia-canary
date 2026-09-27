@@ -1035,6 +1035,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantDirtyBboxPxOffset,
   };
   spv::Id uniform_system_constants_;
+  // Vertex shaders: the index offset (VGT_INDX_OFFSET) as a push constant, so
+  // draws differing only in it need no new constant buffer.
+  spv::Id push_constants_;
   spv::Id uniform_clip_plane_constants_;
   spv::Id uniform_float_constants_;
   spv::Id uniform_bool_loop_constants_;

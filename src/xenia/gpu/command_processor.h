@@ -532,6 +532,12 @@ class CommandProcessor {
   }
 
  protected:
+  // Set by a backend after a draw it can repeat cheaply; cleared by any
+  // register write other than VGT_INDX_OFFSET and by any packet other than
+  // draws and constant writes, so a following draw that only moved the index
+  // offset can skip the full state setup.
+  bool fast_draw_valid_ = false;
+
   // Scale area for the segment being closed.
   uint32_t GetZPDScaleArea() const {
     return zpd_active_segment_.scale_area

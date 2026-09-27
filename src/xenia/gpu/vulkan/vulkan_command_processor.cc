@@ -62,6 +62,13 @@ DEFINE_bool(gpu_time_stats, false,
             "Cumulative nanoseconds appear on the --stats_log_seconds line.",
             "GPU");
 
+DEFINE_bool(fast_repeat_draws, true,
+            "Issue a draw that differs from the previous one only in the index "
+            "offset (VGT_INDX_OFFSET) without redoing the full state setup. "
+            "Games that draw particles one small draw at a time run much "
+            "faster with it.",
+            "GPU");
+
 DECLARE_bool(log_wait_reg_mem);
 DECLARE_bool(clear_memory_page_state);
 DECLARE_bool(readback_resolve_half_pixel_offset);
@@ -1981,11 +1988,12 @@ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
              index == XE_GPU_REG_VGT_DMA_SIZE ||
              index == XE_GPU_REG_VGT_HOS_MAX_TESS_LEVEL ||
              index == XE_GPU_REG_VGT_HOS_MIN_TESS_LEVEL) {
-    // Source registers for the tessellation constant buffer. Invalidate it so
-    // the factor range and index parameters are refreshed per draw instead of
-    // staying stale from the first draw of the submission.
-    current_constant_buffers_up_to_date_ &=
-        ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferTessellation);
+    // Source registers for the tessellation constant buffer. Only a
+    // tessellated draw reads it, so it is invalidated at the next one (see
+    // IssueDraw) rather than here: games that move VGT_INDX_OFFSET between
+    // thousands of small draws would otherwise need a new constant buffer
+    // descriptor set for every draw.
+    tessellation_constants_stale_ = true;
   } else if ((index >= XE_GPU_REG_PA_CL_UCP_0_X &&
               index <= XE_GPU_REG_PA_CL_UCP_5_W) ||
              index == XE_GPU_REG_PA_CL_CLIP_CNTL) {
@@ -2909,8 +2917,14 @@ VulkanCommandProcessor::GetPipelineLayout(size_t texture_count_pixel,
   pipeline_layout_create_info.setLayoutCount =
       uint32_t(xe::countof(descriptor_set_layouts));
   pipeline_layout_create_info.pSetLayouts = descriptor_set_layouts;
-  pipeline_layout_create_info.pushConstantRangeCount = 0;
-  pipeline_layout_create_info.pPushConstantRanges = nullptr;
+  // The same range in every guest layout, so the pushed index offset stays
+  // valid across pipeline layout changes.
+  VkPushConstantRange push_constant_range;
+  push_constant_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+  push_constant_range.offset = 0;
+  push_constant_range.size = sizeof(int32_t);
+  pipeline_layout_create_info.pushConstantRangeCount = 1;
+  pipeline_layout_create_info.pPushConstantRanges = &push_constant_range;
   VkPipelineLayout pipeline_layout;
   if (dfn.vkCreatePipelineLayout(device, &pipeline_layout_create_info, nullptr,
                                  &pipeline_layout) != VK_SUCCESS) {
@@ -3087,6 +3101,124 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type,
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
 }
 
+void VulkanCommandProcessor::PushVertexBaseIndex() {
+  int32_t vgt_indx_offset =
+      register_file_->Get<int32_t>(XE_GPU_REG_VGT_INDX_OFFSET);
+  if (pushed_vertex_base_index_generation_ ==
+          deferred_command_buffer_.push_constants_generation() &&
+      pushed_vertex_base_index_ == vgt_indx_offset) {
+    return;
+  }
+  deferred_command_buffer_.CmdVkPushConstants(
+      current_guest_graphics_pipeline_layout_->GetPipelineLayout(),
+      VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(int32_t), &vgt_indx_offset);
+  pushed_vertex_base_index_ = vgt_indx_offset;
+  pushed_vertex_base_index_generation_ =
+      deferred_command_buffer_.push_constants_generation();
+}
+
+bool VulkanCommandProcessor::TryFastRepeatDraw(
+    xenos::PrimitiveType prim_type, uint32_t index_count,
+    IndexBufferInfo* index_buffer_info, bool major_mode_explicit) {
+  const FastDraw& f = fast_draw_;
+  if (prim_type != f.prim_type || index_count != f.index_count ||
+      major_mode_explicit != f.major_mode_explicit ||
+      (index_buffer_info != nullptr) != f.indexed) {
+    return false;
+  }
+  if (index_buffer_info &&
+      (index_buffer_info->format != f.index_buffer_info.format ||
+       index_buffer_info->endianness != f.index_buffer_info.endianness ||
+       index_buffer_info->count != f.index_buffer_info.count ||
+       index_buffer_info->length != f.index_buffer_info.length)) {
+    return false;
+  }
+  if (!submission_open_ || !frame_open_ ||
+      GetCurrentSubmission() != f.submission ||
+      texture_cache_->texture_became_outdated() ||
+      active_vertex_shader() != f.active_vertex_shader ||
+      active_pixel_shader() != f.active_pixel_shader) {
+    return false;
+  }
+
+  // One hold of the global critical region for both the index and the vertex
+  // buffer requests.
+  auto shared_memory_request_range_hoisted = global_critical_region::Acquire();
+
+  // Requests the index buffer range from the shared memory, as the full path
+  // does; the result must match the remembered one apart from where the
+  // indices are (each small draw may have its own).
+  PrimitiveProcessor::ProcessingResult result;
+  if (!primitive_processor_->Process(result)) {
+    return false;
+  }
+  const PrimitiveProcessor::ProcessingResult& fr =
+      f.primitive_processing_result;
+  if (result.host_draw_vertex_count != fr.host_draw_vertex_count ||
+      result.index_buffer_type != fr.index_buffer_type ||
+      result.host_index_format != fr.host_index_format ||
+      result.host_shader_index_endian != fr.host_shader_index_endian ||
+      result.host_vertex_shader_type != fr.host_vertex_shader_type ||
+      result.host_primitive_type != fr.host_primitive_type ||
+      result.host_primitive_reset_enabled != fr.host_primitive_reset_enabled ||
+      result.tessellation_mode != fr.tessellation_mode) {
+    return false;
+  }
+
+  for (uint32_t i = 0; i < f.vfetch_count; ++i) {
+    if (!shared_memory_->RequestRange(f.vfetch_addresses[i] << 2,
+                                      f.vfetch_sizes[i] << 2)) {
+      return false;
+    }
+  }
+  shared_memory_request_range_hoisted.unlock();
+
+  VkPipeline pipeline = f.pipeline->pipeline.load(std::memory_order_acquire);
+  if (pipeline == VK_NULL_HANDLE ||
+      current_guest_graphics_pipeline_layout_ != f.pipeline->pipeline_layout) {
+    return false;
+  }
+  if (current_guest_graphics_pipeline_ != pipeline) {
+    deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                               pipeline);
+    current_guest_graphics_pipeline_ = pipeline;
+    current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+  }
+
+  if (!UpdateBindings(f.vertex_shader, f.pixel_shader)) {
+    return false;
+  }
+
+  shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+
+  SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+      render_target_cache_->last_update_render_pass(),
+      render_target_cache_->last_update_framebuffer());
+
+  // The only register that changed.
+  PushVertexBaseIndex();
+
+  if (result.index_buffer_type ==
+      PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
+    deferred_command_buffer_.CmdVkDraw(result.host_draw_vertex_count, 1, 0, 0);
+  } else {
+    // Bind the whole shared memory once and select the indices with the
+    // first index, so a run of draws with their own indices needs no rebind.
+    bool index_16bit = result.host_index_format == xenos::IndexFormat::kInt16;
+    VkIndexType index_type =
+        index_16bit ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+    if (!deferred_command_buffer_.IsIndexBufferBound(shared_memory_->buffer(),
+                                                     0, index_type)) {
+      deferred_command_buffer_.CmdVkBindIndexBuffer(shared_memory_->buffer(),
+                                                    0, index_type);
+    }
+    deferred_command_buffer_.CmdVkDrawIndexed(
+        result.host_draw_vertex_count, 1,
+        result.guest_index_base >> (index_16bit ? 1 : 2), 0, 0);
+  }
+  return true;
+}
+
 bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
                                        uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
@@ -3104,6 +3236,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
   const RegisterFile& regs = *register_file_;
+
+  bool fast_draw_possible = fast_draw_valid_;
+  fast_draw_valid_ = false;
+  if (fast_draw_possible && cvars::fast_repeat_draws &&
+      TryFastRepeatDraw(prim_type, index_count, index_buffer_info,
+                        major_mode_explicit)) {
+    fast_draw_valid_ = true;
+    return true;
+  }
 
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
@@ -3495,6 +3636,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // primitive processor rather than a register, kNone for auto draws whose
   // factors were already converted on the host. A change between draws must
   // invalidate the tessellation constant buffer explicitly.
+  if (tessellation_constants_stale_ &&
+      primitive_processing_result.IsTessellated()) {
+    tessellation_constants_stale_ = false;
+    current_constant_buffers_up_to_date_ &=
+        ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferTessellation);
+  }
   if (current_tessellation_index_endian_ !=
       primitive_processing_result.host_shader_index_endian) {
     current_tessellation_index_endian_ =
@@ -3584,6 +3731,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       }
     }
 
+    fast_draw_.vfetch_count = vfetch_current_queued;
+    std::memcpy(fast_draw_.vfetch_addresses, vfetch_addresses,
+                sizeof(uint32_t) * vfetch_current_queued);
+    std::memcpy(fast_draw_.vfetch_sizes, vfetch_sizes,
+                sizeof(uint32_t) * vfetch_current_queued);
+
     if (vfetch_current_queued) {
       // Pre-acquire the critical region so we're not repeatedly re-acquiring
       // it in RequestRange - SharedMemory tracks dirty pages and only uploads
@@ -3645,6 +3798,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       render_target_cache_->last_update_render_pass(),
       render_target_cache_->last_update_framebuffer());
+  PushVertexBaseIndex();
 
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
@@ -3760,6 +3914,33 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
         }
       }
     }
+  }
+
+  // Remember this draw if the next one may repeat it with only the index
+  // offset changed.
+  if (memexport_ranges_.empty() && !dirty_bbox_enabled_ &&
+      !reshade_depth_active_ && !shader_32bit_index_dma &&
+      primitive_processing_result.host_vertex_shader_type ==
+          Shader::HostVertexShaderType::kVertex &&
+      (primitive_processing_result.index_buffer_type ==
+           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
+       primitive_processing_result.index_buffer_type ==
+           PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA)) {
+    fast_draw_.prim_type = prim_type;
+    fast_draw_.index_count = index_count;
+    fast_draw_.major_mode_explicit = major_mode_explicit;
+    fast_draw_.indexed = index_buffer_info != nullptr;
+    if (index_buffer_info) {
+      fast_draw_.index_buffer_info = *index_buffer_info;
+    }
+    fast_draw_.submission = GetCurrentSubmission();
+    fast_draw_.active_vertex_shader = active_vertex_shader();
+    fast_draw_.active_pixel_shader = active_pixel_shader();
+    fast_draw_.vertex_shader = vertex_shader;
+    fast_draw_.pixel_shader = pixel_shader;
+    fast_draw_.pipeline = pipeline;
+    fast_draw_.primitive_processing_result = primitive_processing_result;
+    fast_draw_valid_ = true;
   }
 
   return true;
@@ -5987,7 +6168,6 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
       regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF);
   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
   auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
-  auto vgt_indx_offset = regs.Get<int32_t>(XE_GPU_REG_VGT_INDX_OFFSET);
 
   bool edram_fragment_shader_interlock =
       render_target_cache_->GetPath() ==
@@ -6144,9 +6324,7 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   system_constants_.vertex_index_endian =
       primitive_processing_result.host_shader_index_endian;
 
-  // Vertex index offset.
-  dirty |= system_constants_.vertex_base_index != vgt_indx_offset;
-  system_constants_.vertex_base_index = vgt_indx_offset;
+  // The vertex index offset is a push constant (PushVertexBaseIndex).
 
   // Conversion to host normalized device coordinates.
   for (uint32_t i = 0; i < 3; ++i) {
@@ -6886,60 +7064,45 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     sampler_count_pixel = 0;
     texture_count_pixel = 0;
   }
-  // TODO(Triang3l): Reuse texture and sampler bindings if not changed.
-  current_graphics_descriptor_set_values_up_to_date_ &=
-      ~((UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex) |
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
-
-  // Make sure new descriptor sets are bound to the command buffer.
-
-  current_graphics_descriptor_sets_bound_up_to_date_ &=
-      current_graphics_descriptor_set_values_up_to_date_;
-
-  // Fill the texture and sampler write image infos.
-
-  bool write_vertex_textures =
-      (texture_count_vertex || sampler_count_vertex) &&
-      !(current_graphics_descriptor_set_values_up_to_date_ &
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex));
-  bool write_pixel_textures =
-      (texture_count_pixel || sampler_count_pixel) &&
-      !(current_graphics_descriptor_set_values_up_to_date_ &
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
+  // Fill the texture and sampler image infos of both stages, then keep the
+  // descriptor set of a stage whose images, samplers and set layout are the
+  // same as the ones last written into it, in the same submission (a texture
+  // is only destroyed after a submission that used it completes). Games that
+  // draw thousands of small objects, each changing only a constant, would
+  // otherwise allocate and write a new set per draw.
   descriptor_write_image_info_.clear();
-  descriptor_write_image_info_.reserve(
-      (write_vertex_textures ? texture_count_vertex + sampler_count_vertex
-                             : 0) +
-      (write_pixel_textures ? texture_count_pixel + sampler_count_pixel : 0));
+  descriptor_write_image_info_.reserve(texture_count_vertex +
+                                       sampler_count_vertex +
+                                       texture_count_pixel + sampler_count_pixel);
   size_t vertex_texture_image_info_offset = descriptor_write_image_info_.size();
-  if (write_vertex_textures && texture_count_vertex) {
-    for (const VulkanShader::TextureBinding& texture_binding :
-         textures_vertex) {
-      VkDescriptorImageInfo& descriptor_image_info =
-          descriptor_write_image_info_.emplace_back();
-      descriptor_image_info.imageView =
-          texture_cache_->GetActiveBindingOrNullImageView(
-              texture_binding.fetch_constant, texture_binding.dimension,
-              bool(texture_binding.is_signed));
-      descriptor_image_info.imageLayout =
-          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    }
+  for (const VulkanShader::TextureBinding& texture_binding : textures_vertex) {
+    VkDescriptorImageInfo& descriptor_image_info =
+        descriptor_write_image_info_.emplace_back();
+    descriptor_image_info.sampler = VK_NULL_HANDLE;
+    descriptor_image_info.imageView =
+        texture_cache_->GetActiveBindingOrNullImageView(
+            texture_binding.fetch_constant, texture_binding.dimension,
+            bool(texture_binding.is_signed));
+    descriptor_image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   }
   size_t vertex_sampler_image_info_offset = descriptor_write_image_info_.size();
-  if (write_vertex_textures && sampler_count_vertex) {
+  if (sampler_count_vertex) {
     for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>&
              sampler_pair : current_samplers_vertex_) {
       VkDescriptorImageInfo& descriptor_image_info =
           descriptor_write_image_info_.emplace_back();
       descriptor_image_info.sampler = sampler_pair.second;
+      descriptor_image_info.imageView = VK_NULL_HANDLE;
+      descriptor_image_info.imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     }
   }
   size_t pixel_texture_image_info_offset = descriptor_write_image_info_.size();
-  if (write_pixel_textures && texture_count_pixel) {
+  if (textures_pixel) {
     for (const VulkanShader::TextureBinding& texture_binding :
          *textures_pixel) {
       VkDescriptorImageInfo& descriptor_image_info =
           descriptor_write_image_info_.emplace_back();
+      descriptor_image_info.sampler = VK_NULL_HANDLE;
       descriptor_image_info.imageView =
           texture_cache_->GetActiveBindingOrNullImageView(
               texture_binding.fetch_constant, texture_binding.dimension,
@@ -6949,14 +7112,64 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     }
   }
   size_t pixel_sampler_image_info_offset = descriptor_write_image_info_.size();
-  if (write_pixel_textures && sampler_count_pixel) {
+  if (sampler_count_pixel) {
     for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>&
              sampler_pair : current_samplers_pixel_) {
       VkDescriptorImageInfo& descriptor_image_info =
           descriptor_write_image_info_.emplace_back();
       descriptor_image_info.sampler = sampler_pair.second;
+      descriptor_image_info.imageView = VK_NULL_HANDLE;
+      descriptor_image_info.imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     }
   }
+  size_t image_info_end = descriptor_write_image_info_.size();
+  uint64_t current_submission = GetCurrentSubmission();
+  for (uint32_t j = 0; j < 2; ++j) {
+    uint32_t set_index = j ? SpirvShaderTranslator::kDescriptorSetTexturesPixel
+                           : SpirvShaderTranslator::kDescriptorSetTexturesVertex;
+    size_t info_begin =
+        j ? pixel_texture_image_info_offset : vertex_texture_image_info_offset;
+    size_t info_end = j ? image_info_end : pixel_texture_image_info_offset;
+    VkDescriptorSetLayout set_layout =
+        j ? current_guest_graphics_pipeline_layout_
+                ->descriptor_set_layout_textures_pixel_ref()
+          : current_guest_graphics_pipeline_layout_
+                ->descriptor_set_layout_textures_vertex_ref();
+    std::vector<VkDescriptorImageInfo>& written = texture_set_written_infos_[j];
+    bool same =
+        (current_graphics_descriptor_set_values_up_to_date_ &
+         (UINT32_C(1) << set_index)) &&
+        texture_set_written_layout_[j] == set_layout &&
+        texture_set_written_submission_[j] == current_submission &&
+        written.size() == info_end - info_begin &&
+        (info_end == info_begin ||
+         !std::memcmp(written.data(),
+                      descriptor_write_image_info_.data() + info_begin,
+                      sizeof(VkDescriptorImageInfo) *
+                          (info_end - info_begin)));
+    if (!same) {
+      current_graphics_descriptor_set_values_up_to_date_ &=
+          ~(UINT32_C(1) << set_index);
+      written.assign(descriptor_write_image_info_.begin() + info_begin,
+                     descriptor_write_image_info_.begin() + info_end);
+      texture_set_written_layout_[j] = set_layout;
+      texture_set_written_submission_[j] = current_submission;
+    }
+  }
+
+  // Make sure new descriptor sets are bound to the command buffer.
+
+  current_graphics_descriptor_sets_bound_up_to_date_ &=
+      current_graphics_descriptor_set_values_up_to_date_;
+
+  bool write_vertex_textures =
+      (texture_count_vertex || sampler_count_vertex) &&
+      !(current_graphics_descriptor_set_values_up_to_date_ &
+        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex));
+  bool write_pixel_textures =
+      (texture_count_pixel || sampler_count_pixel) &&
+      !(current_graphics_descriptor_set_values_up_to_date_ &
+        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
 
   // Write the new descriptor sets.
 

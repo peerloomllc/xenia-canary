@@ -500,6 +500,7 @@ bool CommandProcessor::Restore(ByteStream* stream, bool has_edram_snapshot) {
   }
   stream->Read(register_file_->values, sizeof(register_file_->values[0]) *
                                            RegisterFile::kRegisterCount);
+  fast_draw_valid_ = false;
 
   std::vector<uint8_t>().swap(edram_snapshot_);
   if (has_edram_snapshot) {
@@ -786,6 +787,9 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   if (XE_LIKELY(index < RegisterFile::kRegisterCount)) {
     register_file_->values[index] = value;
+    if (index != XE_GPU_REG_VGT_INDX_OFFSET) {
+      fast_draw_valid_ = false;
+    }
 
     // quick pre-test
     // todo: figure out just how unlikely this is. if very (it ought to be,

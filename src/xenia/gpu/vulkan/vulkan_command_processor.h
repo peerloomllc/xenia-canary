@@ -959,6 +959,9 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // primitive processor for the current draw. Not a register, so changes
   // between draws invalidate the buffer separately from WriteRegister.
   xenos::Endian current_tessellation_index_endian_ = xenos::Endian::kNone;
+  // A source register of the tessellation constant buffer was written since
+  // it was last invalidated.
+  bool tessellation_constants_stale_ = true;
   VkDescriptorSet current_graphics_descriptor_sets_
       [SpirvShaderTranslator::kDescriptorSetCount];
   // Whether descriptor sets in current_graphics_descriptor_sets_ point to
@@ -980,6 +983,42 @@ class VulkanCommandProcessor final : public CommandProcessor {
       SpirvShaderTranslator::kDescriptorSetCount <=
           sizeof(current_graphics_descriptor_sets_bound_up_to_date_) * CHAR_BIT,
       "Bit fields storing descriptor set validity must be large enough");
+
+  // The last draw that can be repeated with only VGT_INDX_OFFSET changed
+  // (fast_draw_valid_ in CommandProcessor says whether it still can be).
+  bool TryFastRepeatDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
+                         IndexBufferInfo* index_buffer_info,
+                         bool major_mode_explicit);
+  // Records the index offset push constant for the next guest draw if it is
+  // not the last value pushed.
+  void PushVertexBaseIndex();
+  int32_t pushed_vertex_base_index_ = 0;
+  uint64_t pushed_vertex_base_index_generation_ = UINT64_MAX;
+
+  struct FastDraw {
+    xenos::PrimitiveType prim_type;
+    uint32_t index_count;
+    bool major_mode_explicit;
+    bool indexed;
+    IndexBufferInfo index_buffer_info;
+    uint64_t submission;
+    Shader* active_vertex_shader;
+    Shader* active_pixel_shader;
+    VulkanShader* vertex_shader;
+    VulkanShader* pixel_shader;
+    VulkanPipelineCache::Pipeline* pipeline;
+    PrimitiveProcessor::ProcessingResult primitive_processing_result;
+    uint32_t vfetch_count;
+    uint32_t vfetch_addresses[96];
+    uint32_t vfetch_sizes[96];
+  };
+  FastDraw fast_draw_;
+
+  // What was last written into each stage's texture descriptor set (vertex,
+  // pixel), to reuse the set while the draws keep the same bindings.
+  std::vector<VkDescriptorImageInfo> texture_set_written_infos_[2];
+  VkDescriptorSetLayout texture_set_written_layout_[2] = {};
+  uint64_t texture_set_written_submission_[2] = {};
 
   // Float constant usage masks of the last draw call.
   uint64_t current_float_constant_map_vertex_[4];
