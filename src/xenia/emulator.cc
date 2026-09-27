@@ -654,43 +654,58 @@ Emulator::FileSignatureType Emulator::GetFileSignature(
   return FileSignatureType::Unknown;
 }
 
+namespace {
+bool IsPlaylistPath(const std::filesystem::path& path) {
+  return path.extension() == ".m3u" || path.extension() == ".M3U";
+}
+
+// The discs an .m3u lists, one per line, in file order. Blank lines and #
+// comments are skipped; relative entries resolve against the playlist's own
+// folder; missing files are skipped. False if the playlist can't be read.
+bool ReadPlaylist(const std::filesystem::path& path,
+                  std::vector<std::filesystem::path>& entries_out) {
+  entries_out.clear();
+  std::ifstream list(path);
+  if (!list) {
+    return false;
+  }
+  std::string line;
+  while (std::getline(list, line)) {
+    while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) {
+      line.pop_back();
+    }
+    size_t first = line.find_first_not_of(" \t");
+    if (first == std::string::npos) {
+      continue;
+    }
+    line = line.substr(first);
+    if (line[0] == '#') {
+      continue;
+    }
+    std::filesystem::path entry = xe::to_path(line);
+    if (entry.is_relative()) {
+      entry = path.parent_path() / entry;
+    }
+    std::error_code ec;
+    if (!std::filesystem::exists(entry, ec)) {
+      XELOGW("Playlist entry not found, skipping: {}", entry.string());
+      continue;
+    }
+    entries_out.push_back(entry);
+  }
+  return true;
+}
+}  // namespace
+
 X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
   X_STATUS mount_result = X_STATUS_SUCCESS;
 
   // An .m3u is a plain list of the title's discs, one per line, so a
-  // multi-disc title can be opened once and swap discs by itself. Blank
-  // lines and # comments are skipped; relative entries resolve against the
-  // playlist's own folder.
-  if (path.extension() == ".m3u" || path.extension() == ".M3U") {
-    disc_playlist_.clear();
-    std::ifstream list(path);
-    if (!list) {
+  // multi-disc title can be opened once and swap discs by itself.
+  if (IsPlaylistPath(path)) {
+    if (!ReadPlaylist(path, disc_playlist_)) {
       XELOGE("Unable to read the playlist {}", path.string());
       return X_STATUS_NO_SUCH_FILE;
-    }
-    std::string line;
-    while (std::getline(list, line)) {
-      while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) {
-        line.pop_back();
-      }
-      size_t first = line.find_first_not_of(" \t");
-      if (first == std::string::npos) {
-        continue;
-      }
-      line = line.substr(first);
-      if (line[0] == '#') {
-        continue;
-      }
-      std::filesystem::path entry = xe::to_path(line);
-      if (entry.is_relative()) {
-        entry = path.parent_path() / entry;
-      }
-      std::error_code ec;
-      if (!std::filesystem::exists(entry, ec)) {
-        XELOGW("Playlist entry not found, skipping: {}", entry.string());
-        continue;
-      }
-      disc_playlist_.push_back(entry);
     }
     if (disc_playlist_.empty()) {
       XELOGE("The playlist {} lists no readable discs", path.string());
@@ -2134,6 +2149,12 @@ bool Emulator::ReadDiscInfo(const std::filesystem::path& path, DiscInfo* out) {
     return false;
   }
   *out = DiscInfo();
+  // A playlist: its first disc, which is the one a launch starts with.
+  if (IsPlaylistPath(path)) {
+    std::vector<std::filesystem::path> entries;
+    return ReadPlaylist(path, entries) && !entries.empty() &&
+           ReadDiscInfo(entries.front(), out);
+  }
   std::vector<uint8_t> header;
   std::unique_ptr<vfs::Device> device;
   switch (GetFileSignature(path)) {
@@ -2230,6 +2251,11 @@ bool Emulator::SwapDisc(const std::filesystem::path& path,
     return false;
   };
 
+  // ReadDiscInfo reads a playlist through its first disc, but a swap mounts
+  // the file itself.
+  if (IsPlaylistPath(path)) {
+    return reason("that is a playlist, not a disc image");
+  }
   DiscInfo info;
   if (!ReadDiscInfo(path, &info)) {
     return reason("that file is not a disc image this title can use");
