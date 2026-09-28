@@ -156,6 +156,7 @@ void SpirvShaderTranslator::Reset() {
   var_main_kill_pixel_ = spv::NoResult;
   var_main_fsi_color_written_ = spv::NoResult;
   std::ranges::fill(output_fragment_data_, spv::NoResult);
+  std::ranges::fill(output_fragment_data_companion_, spv::NoResult);
   output_or_var_fragment_depth_ = spv::NoResult;
   output_fragment_depth_ = spv::NoResult;
   main_fbo_depth_unbiased_ = spv::NoResult;
@@ -2635,6 +2636,7 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
     // to the Output variables at the end.
     if (!edram_fragment_shader_interlock_) {
       std::ranges::fill(output_fragment_data_, spv::NoResult);
+  std::ranges::fill(output_fragment_data_companion_, spv::NoResult);
       static const char* const kFragmentDataOutputNames[] = {
           "xe_out_fragment_data_0",
           "xe_out_fragment_data_1",
@@ -2659,6 +2661,27 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
         builder_->addDecoration(output_fragment_data_rt,
                                 spv::DecorationInvariant);
         main_interface_.push_back(output_fragment_data_rt);
+      }
+      static const char* const kFragmentDataCompanionOutputNames[] = {
+          "xe_out_fragment_data_companion_0",
+          "xe_out_fragment_data_companion_1",
+          "xe_out_fragment_data_companion_2",
+          "xe_out_fragment_data_companion_3",
+      };
+      uint32_t companions_remaining =
+          current_shader().writes_color_targets() &
+          shader_modification.pixel.color_7e3_alpha_companion_mask;
+      while (xe::bit_scan_forward(companions_remaining, &color_target_index)) {
+        companions_remaining &= ~(UINT32_C(1) << color_target_index);
+        spv::Id output_companion = builder_->createVariable(
+            spv::NoPrecision, spv::StorageClassOutput, type_float4_,
+            kFragmentDataCompanionOutputNames[color_target_index]);
+        output_fragment_data_companion_[color_target_index] = output_companion;
+        builder_->addDecoration(
+            output_companion, spv::DecorationLocation,
+            int(xenos::kMaxColorRenderTargets + color_target_index));
+        builder_->addDecoration(output_companion, spv::DecorationInvariant);
+        main_interface_.push_back(output_companion);
       }
     }
   }
