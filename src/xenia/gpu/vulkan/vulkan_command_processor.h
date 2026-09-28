@@ -388,14 +388,19 @@ class VulkanCommandProcessor final : public CommandProcessor {
     explicit PipelineLayout(
         VkPipelineLayout pipeline_layout,
         VkDescriptorSetLayout descriptor_set_layout_textures_vertex_ref,
-        VkDescriptorSetLayout descriptor_set_layout_textures_pixel_ref)
+        VkDescriptorSetLayout descriptor_set_layout_textures_pixel_ref,
+        VkPipelineLayout round_7e3_alpha_pipeline_layout = VK_NULL_HANDLE)
         : pipeline_layout_(pipeline_layout),
+          round_7e3_alpha_pipeline_layout_(round_7e3_alpha_pipeline_layout),
           descriptor_set_layout_textures_vertex_ref_(
               descriptor_set_layout_textures_vertex_ref),
           descriptor_set_layout_textures_pixel_ref_(
               descriptor_set_layout_textures_pixel_ref) {}
     VkPipelineLayout GetPipelineLayout() const override {
       return pipeline_layout_;
+    }
+    VkPipelineLayout GetRound7e3AlphaPipelineLayout() const override {
+      return round_7e3_alpha_pipeline_layout_;
     }
     VkDescriptorSetLayout descriptor_set_layout_textures_vertex_ref() const {
       return descriptor_set_layout_textures_vertex_ref_;
@@ -406,6 +411,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
    private:
     VkPipelineLayout pipeline_layout_;
+    VkPipelineLayout round_7e3_alpha_pipeline_layout_;
     VkDescriptorSetLayout descriptor_set_layout_textures_vertex_ref_;
     VkDescriptorSetLayout descriptor_set_layout_textures_pixel_ref_;
   };
@@ -989,6 +995,18 @@ class VulkanCommandProcessor final : public CommandProcessor {
   bool TryFastRepeatDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                          IndexBufferInfo* index_buffer_info,
                          bool major_mode_explicit);
+  // k_2_10_10_10_FLOAT alpha rounding (VulkanRenderTargetCache::
+  // Round7e3Alpha) of draws that don't overlap, waiting until something may
+  // read those pixels.
+  void FlushPendingRound7e3Alpha();
+  static constexpr uint32_t kMaxPendingRound7e3Alpha = 64;
+  VkRect2D pending_round_7e3_alpha_rects_[kMaxPendingRound7e3Alpha];
+  uint32_t pending_round_7e3_alpha_count_ = 0;
+  uint32_t pending_round_7e3_alpha_rt_mask_ = 0;
+  uint32_t pending_round_7e3_alpha_surface_info_ = 0;
+  uint32_t pending_round_7e3_alpha_color_info_[xenos::kMaxColorRenderTargets] =
+      {};
+
   // Records the index offset push constant for the next guest draw if it is
   // not the last value pushed.
   void PushVertexBaseIndex();

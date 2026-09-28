@@ -603,6 +603,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   XE_UI_VULKAN_LIMIT(maxImageDimension3D)
   XE_UI_VULKAN_LIMIT(maxImageDimensionCube)
   XE_UI_VULKAN_LIMIT(maxImageArrayLayers)
+  XE_UI_VULKAN_LIMIT(maxBoundDescriptorSets)
   XE_UI_VULKAN_LIMIT(maxStorageBufferRange)
   XE_UI_VULKAN_LIMIT(timestampPeriod)
   XE_UI_VULKAN_LIMIT(timestampComputeAndGraphics)
@@ -630,6 +631,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   XE_UI_VULKAN_ENUM_LIMIT(framebufferNoAttachmentsSampleCounts,
                           SampleCountFlags)
   XE_UI_VULKAN_ENUM_LIMIT(sampledImageColorSampleCounts, SampleCountFlags)
+  XE_UI_VULKAN_ENUM_LIMIT(storageImageSampleCounts, SampleCountFlags)
   XE_UI_VULKAN_ENUM_LIMIT(sampledImageIntegerSampleCounts, SampleCountFlags)
   XE_UI_VULKAN_ENUM_LIMIT(sampledImageDepthSampleCounts, SampleCountFlags)
   XE_UI_VULKAN_ENUM_LIMIT(sampledImageStencilSampleCounts, SampleCountFlags)
@@ -652,6 +654,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_FEATURE(pipelineStatisticsQuery)
     XE_UI_VULKAN_FEATURE(vertexPipelineStoresAndAtomics)
     XE_UI_VULKAN_FEATURE(fragmentStoresAndAtomics)
+    XE_UI_VULKAN_FEATURE(shaderStorageImageMultisample)
     XE_UI_VULKAN_FEATURE(shaderClipDistance)
     XE_UI_VULKAN_FEATURE(shaderCullDistance)
     XE_UI_VULKAN_FEATURE(sparseBinding)

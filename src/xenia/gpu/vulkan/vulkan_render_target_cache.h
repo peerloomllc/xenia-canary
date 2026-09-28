@@ -177,6 +177,39 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     return depth_float24_convert_in_pixel_shader_;
   }
 
+  // Whether Round7e3Alpha is available (host render targets only).
+  bool round_7e3_alpha_enabled() const {
+    return round_7e3_alpha_pipelines_[0] != VK_NULL_HANDLE;
+  }
+  // The Xenos keeps 2 bits of alpha in k_2_10_10_10_FLOAT render targets and
+  // rounds after every blend, while the host emulates them as
+  // R16G16B16A16_SFLOAT. Rounds the alpha of the render targets of the last
+  // Update in rt_mask (bits 0-3, color render target indices) that have that
+  // format, within rect in host pixels, so blending repeatedly over them
+  // behaves as on the console. Call after the draw.
+  void Round7e3Alpha(uint32_t rt_mask, const VkRect2D* rects,
+                     uint32_t rect_count);
+  // Rounding by drawing the guest draw's geometry again with a fragment shader
+  // that rounds the pixels it covers (VulkanPipelineCache::
+  // GetRound7e3AlphaPipeline) - far less work than a rectangle. Available if
+  // the device can bind a fifth descriptor set and render without
+  // attachments.
+  bool round_7e3_alpha_redraw_enabled() const {
+    return round_7e3_alpha_redraw_render_pass_ != VK_NULL_HANDLE;
+  }
+  VkDescriptorSetLayout descriptor_set_layout_storage_image() const {
+    return descriptor_set_layout_storage_image_;
+  }
+  VkRenderPass round_7e3_alpha_redraw_render_pass() const {
+    return round_7e3_alpha_redraw_render_pass_;
+  }
+  // Records the redraw for the color render target rt_index of the last
+  // Update, which must be a k_2_10_10_10_FLOAT one. Ends the current render
+  // pass; draw records the draw command. False if it can't be done.
+  bool Round7e3AlphaByRedraw(uint32_t rt_index, VkPipeline pipeline,
+                             VkPipelineLayout pipeline_layout,
+                             const std::function<void()>& draw);
+
   bool msaa_2x_attachments_supported() const {
     return msaa_2x_attachments_supported_;
   }
@@ -367,6 +400,19 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   std::unique_ptr<ui::vulkan::SingleLayoutDescriptorSetPool>
       descriptor_set_pool_sampled_image_x2_;
 
+  // Round7e3Alpha: one storage image, and pipelines for single-sampled [0]
+  // and multisampled [1] render targets.
+  VkDescriptorSetLayout descriptor_set_layout_storage_image_ = VK_NULL_HANDLE;
+  std::unique_ptr<ui::vulkan::SingleLayoutDescriptorSetPool>
+      descriptor_set_pool_storage_image_;
+  VkPipelineLayout round_7e3_alpha_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline round_7e3_alpha_pipelines_[2] = {};
+  // Render pass without attachments for the redraw, and its framebuffers by
+  // width and height.
+  VkRenderPass round_7e3_alpha_redraw_render_pass_ = VK_NULL_HANDLE;
+  std::unordered_map<uint64_t, VkFramebuffer>
+      round_7e3_alpha_redraw_framebuffers_;
+
   VkDeviceMemory edram_buffer_memory_ = VK_NULL_HANDLE;
   VkBuffer edram_buffer_ = VK_NULL_HANDLE;
 
@@ -519,6 +565,15 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                  ? view_color_transfer_separate_
                  : view_depth_color_;
     }
+    // SIZE_MAX if the render target has no storage image descriptor (only
+    // k_2_10_10_10_FLOAT targets get one, for Round7e3Alpha).
+    size_t descriptor_set_index_storage() const {
+      return descriptor_set_index_storage_;
+    }
+    void set_descriptor_set_index_storage(size_t index) {
+      descriptor_set_index_storage_ = index;
+    }
+
     VkDescriptorSet GetDescriptorSetTransferSource() const {
       ui::vulkan::SingleLayoutDescriptorSetPool& descriptor_set_pool =
           key().is_depth
@@ -580,6 +635,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
     // 2 sampled images for depth / stencil, 1 sampled image for color.
     size_t descriptor_set_index_transfer_source_;
+    size_t descriptor_set_index_storage_ = SIZE_MAX;
 
     VkPipelineStageFlags current_stage_mask_ = 0;
     VkAccessFlags current_access_mask_ = 0;
