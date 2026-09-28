@@ -34,6 +34,14 @@
 DECLARE_bool(dirty_region_tracking);
 
 DEFINE_bool(
+    round_7e3_alpha, true,
+    "Host render target path: round the alpha of k_2_10_10_10_FLOAT render "
+    "targets to the 2 bits the Xbox 360 keeps after each blended draw that "
+    "writes it. Blending many translucent layers (Blue Dragon's fur) "
+    "otherwise wears the host's more precise alpha down until it rounds to 0 "
+    "later.",
+    "GPU");
+DEFINE_bool(
     log_rt_transfer_map, false,
     "Every ~5 seconds, log the most frequent render target ownership "
     "transfers (source -> destination, EDRAM tile range, count) to find "
@@ -82,6 +90,8 @@ namespace vulkan {
 
 // Generated with `xb buildshaders`.
 namespace shaders {
+#include "xenia/gpu/shaders/bytecode/vulkan_spirv/edram_7e3_alpha_round_cs.h"
+#include "xenia/gpu/shaders/bytecode/vulkan_spirv/edram_7e3_alpha_round_ms_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/host_depth_store_1xmsaa_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/host_depth_store_2xmsaa_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/host_depth_store_4xmsaa_cs.h"
@@ -380,6 +390,108 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
       std::make_unique<ui::vulkan::SingleLayoutDescriptorSetPool>(
           vulkan_device, 256, 1, &descriptor_set_layout_size,
           descriptor_set_layout_sampled_image_x2_);
+
+  // 2-bit alpha rounding for k_2_10_10_10_FLOAT host render targets.
+  if (path_ == Path::kHostRenderTargets && cvars::round_7e3_alpha) {
+    VkFormatProperties round_format_properties;
+    ifn.vkGetPhysicalDeviceFormatProperties(physical_device,
+                                            VK_FORMAT_R16G16B16A16_SFLOAT,
+                                            &round_format_properties);
+    VkSampleCountFlags round_samples_needed =
+        VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT |
+        (msaa_2x_attachments_supported_ ? VK_SAMPLE_COUNT_2_BIT : 0);
+    if (device_properties.shaderStorageImageMultisample &&
+        (round_format_properties.optimalTilingFeatures &
+         VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) &&
+        (device_properties.storageImageSampleCounts & round_samples_needed) ==
+            round_samples_needed) {
+      VkDescriptorSetLayoutBinding storage_binding;
+      storage_binding.binding = 0;
+      storage_binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+      storage_binding.descriptorCount = 1;
+      storage_binding.stageFlags =
+          VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+      storage_binding.pImmutableSamplers = nullptr;
+      VkDescriptorSetLayoutCreateInfo storage_layout_create_info = {};
+      storage_layout_create_info.sType =
+          VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+      storage_layout_create_info.bindingCount = 1;
+      storage_layout_create_info.pBindings = &storage_binding;
+      VkPushConstantRange round_push_constants;
+      round_push_constants.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+      round_push_constants.offset = 0;
+      round_push_constants.size = sizeof(uint32_t) * 4;
+      VkPipelineLayoutCreateInfo round_pipeline_layout_create_info = {};
+      round_pipeline_layout_create_info.sType =
+          VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+      round_pipeline_layout_create_info.setLayoutCount = 1;
+      round_pipeline_layout_create_info.pSetLayouts =
+          &descriptor_set_layout_storage_image_;
+      round_pipeline_layout_create_info.pushConstantRangeCount = 1;
+      round_pipeline_layout_create_info.pPushConstantRanges =
+          &round_push_constants;
+      if (dfn.vkCreateDescriptorSetLayout(
+              device, &storage_layout_create_info, nullptr,
+              &descriptor_set_layout_storage_image_) == VK_SUCCESS &&
+          dfn.vkCreatePipelineLayout(
+              device, &round_pipeline_layout_create_info, nullptr,
+              &round_7e3_alpha_pipeline_layout_) == VK_SUCCESS) {
+        descriptor_set_layout_size.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        descriptor_set_layout_size.descriptorCount = 1;
+        descriptor_set_pool_storage_image_ =
+            std::make_unique<ui::vulkan::SingleLayoutDescriptorSetPool>(
+                vulkan_device, 64, 1, &descriptor_set_layout_size,
+                descriptor_set_layout_storage_image_);
+        round_7e3_alpha_pipelines_[0] = ui::vulkan::util::CreateComputePipeline(
+            vulkan_device, round_7e3_alpha_pipeline_layout_,
+            shaders::edram_7e3_alpha_round_cs,
+            sizeof(shaders::edram_7e3_alpha_round_cs));
+        round_7e3_alpha_pipelines_[1] = ui::vulkan::util::CreateComputePipeline(
+            vulkan_device, round_7e3_alpha_pipeline_layout_,
+            shaders::edram_7e3_alpha_round_ms_cs,
+            sizeof(shaders::edram_7e3_alpha_round_ms_cs));
+      }
+      // The redraw binds the storage image as a fifth set after the guest
+      // ones, draws without attachments, and stores from fragment shaders.
+      VkSampleCountFlags redraw_samples_needed =
+          VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT |
+          (msaa_2x_attachments_supported_ ? VK_SAMPLE_COUNT_2_BIT : 0);
+      if (round_7e3_alpha_pipelines_[0] != VK_NULL_HANDLE &&
+          round_7e3_alpha_pipelines_[1] != VK_NULL_HANDLE &&
+          device_properties.maxBoundDescriptorSets >=
+              SpirvShaderTranslator::kDescriptorSetCount + 1 &&
+          device_properties.fragmentStoresAndAtomics &&
+          (device_properties.framebufferNoAttachmentsSampleCounts &
+           redraw_samples_needed) == redraw_samples_needed) {
+        VkSubpassDescription redraw_subpass = {};
+        redraw_subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        VkRenderPassCreateInfo redraw_render_pass_create_info = {};
+        redraw_render_pass_create_info.sType =
+            VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        redraw_render_pass_create_info.subpassCount = 1;
+        redraw_render_pass_create_info.pSubpasses = &redraw_subpass;
+        if (dfn.vkCreateRenderPass(
+                device, &redraw_render_pass_create_info, nullptr,
+                &round_7e3_alpha_redraw_render_pass_) != VK_SUCCESS) {
+          round_7e3_alpha_redraw_render_pass_ = VK_NULL_HANDLE;
+        }
+      }
+      if (round_7e3_alpha_pipelines_[0] == VK_NULL_HANDLE ||
+          round_7e3_alpha_pipelines_[1] == VK_NULL_HANDLE) {
+        XELOGW(
+            "VulkanRenderTargetCache: Failed to set up 2-bit alpha rounding "
+            "for k_2_10_10_10_FLOAT render targets");
+        ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                               round_7e3_alpha_pipelines_[0]);
+        ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                               round_7e3_alpha_pipelines_[1]);
+      }
+    } else {
+      XELOGI(
+          "VulkanRenderTargetCache: 2-bit alpha rounding for "
+          "k_2_10_10_10_FLOAT render targets is not supported by the device");
+    }
+  }
 
   // EDRAM contents reinterpretation buffer.
   // 90 MB with 9x resolution scaling - within the minimum
@@ -1151,6 +1263,23 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
 
   descriptor_set_pool_sampled_image_x2_.reset();
   descriptor_set_pool_sampled_image_.reset();
+
+  for (auto& round_framebuffer : round_7e3_alpha_redraw_framebuffers_) {
+    dfn.vkDestroyFramebuffer(device, round_framebuffer.second, nullptr);
+  }
+  round_7e3_alpha_redraw_framebuffers_.clear();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyRenderPass, device,
+                                         round_7e3_alpha_redraw_render_pass_);
+  for (VkPipeline& round_pipeline : round_7e3_alpha_pipelines_) {
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                           round_pipeline);
+  }
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         round_7e3_alpha_pipeline_layout_);
+  descriptor_set_pool_storage_image_.reset();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout,
+                                         device,
+                                         descriptor_set_layout_storage_image_);
 
   ui::vulkan::util::DestroyAndNullHandle(
       dfn.vkDestroyDescriptorSetLayout, device,
@@ -2703,6 +2832,10 @@ VulkanRenderTargetCache::VulkanRenderTarget::~VulkanRenderTarget() {
           ? *render_target_cache_.descriptor_set_pool_sampled_image_x2_
           : *render_target_cache_.descriptor_set_pool_sampled_image_;
   descriptor_set_pool.Free(descriptor_set_index_transfer_source_);
+  if (descriptor_set_index_storage_ != SIZE_MAX) {
+    render_target_cache_.descriptor_set_pool_storage_image_->Free(
+        descriptor_set_index_storage_);
+  }
   if (view_color_transfer_separate_ != VK_NULL_HANDLE) {
     dfn.vkDestroyImageView(device, view_color_transfer_separate_, nullptr);
   }
@@ -2715,6 +2848,166 @@ VulkanRenderTargetCache::VulkanRenderTarget::~VulkanRenderTarget() {
   dfn.vkDestroyImageView(device, view_depth_color_, nullptr);
   dfn.vkDestroyImage(device, image_, nullptr);
   dfn.vkFreeMemory(device, memory_, nullptr);
+}
+
+void VulkanRenderTargetCache::Round7e3Alpha(uint32_t rt_mask,
+                                            const VkRect2D* rects,
+                                            uint32_t rect_count) {
+  if (!round_7e3_alpha_enabled() || !rect_count) {
+    return;
+  }
+  DeferredCommandBuffer& command_buffer =
+      command_processor_.deferred_command_buffer();
+  uint32_t rt_index;
+  while (xe::bit_scan_forward(rt_mask, &rt_index)) {
+    rt_mask &= ~(UINT32_C(1) << rt_index);
+    if (rt_index >= xenos::kMaxColorRenderTargets) {
+      break;
+    }
+    auto* rt = static_cast<VulkanRenderTarget*>(
+        GetLastUpdateColorRenderTarget(rt_index));
+    if (!rt || rt->descriptor_set_index_storage() == SIZE_MAX) {
+      continue;
+    }
+    RenderTargetKey key = rt->key();
+    uint32_t width = key.GetWidth() * GetKeyScaleX(key);
+    uint32_t height =
+        GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples) *
+        GetKeyScaleY(key);
+    bool pipeline_bound = false;
+    VkImageSubresourceRange subresource_range =
+        ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT);
+    for (uint32_t i = 0; i < rect_count; ++i) {
+      const VkRect2D& rect = rects[i];
+      uint32_t x0 = std::min(uint32_t(std::max(rect.offset.x, 0)), width);
+      uint32_t y0 = std::min(uint32_t(std::max(rect.offset.y, 0)), height);
+      uint32_t x1 = std::min(x0 + rect.extent.width, width);
+      uint32_t y1 = std::min(y0 + rect.extent.height, height);
+      if (x1 <= x0 || y1 <= y0) {
+        continue;
+      }
+      if (!pipeline_bound) {
+        pipeline_bound = true;
+        command_processor_.PushImageMemoryBarrier(
+            rt->image(), subresource_range, rt->current_stage_mask(),
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, rt->current_access_mask(),
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            rt->current_layout(), VK_IMAGE_LAYOUT_GENERAL);
+        command_processor_.BindExternalComputePipeline(
+            round_7e3_alpha_pipelines_
+                [key.msaa_samples != xenos::MsaaSamples::k1X ? 1 : 0]);
+        VkDescriptorSet descriptor_set =
+            descriptor_set_pool_storage_image_->Get(
+                rt->descriptor_set_index_storage());
+        command_buffer.CmdVkBindDescriptorSets(
+            VK_PIPELINE_BIND_POINT_COMPUTE, round_7e3_alpha_pipeline_layout_, 0,
+            1, &descriptor_set, 0, nullptr);
+        command_processor_.SubmitBarriers(true);
+      }
+      // The rectangles don't overlap, so no barriers between them.
+      uint32_t push_constants[4] = {x0, y0, x1 - x0, y1 - y0};
+      command_buffer.CmdVkPushConstants(round_7e3_alpha_pipeline_layout_,
+                                        VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                        sizeof(push_constants), push_constants);
+      command_buffer.CmdVkDispatch((x1 - x0 + 7) / 8, (y1 - y0 + 7) / 8, 1);
+    }
+    if (!pipeline_bound) {
+      continue;
+    }
+    // Back to drawing, like the rest of the render targets of the draw.
+    VkPipelineStageFlags draw_stage_mask;
+    VkAccessFlags draw_access_mask;
+    VkImageLayout draw_layout;
+    rt->GetDrawUsage(&draw_stage_mask, &draw_access_mask, &draw_layout);
+    command_processor_.PushImageMemoryBarrier(
+        rt->image(), subresource_range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        draw_stage_mask, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        draw_access_mask, VK_IMAGE_LAYOUT_GENERAL, draw_layout);
+    rt->SetUsage(draw_stage_mask, draw_access_mask, draw_layout);
+  }
+}
+
+bool VulkanRenderTargetCache::Round7e3AlphaByRedraw(
+    uint32_t rt_index, VkPipeline pipeline, VkPipelineLayout pipeline_layout,
+    const std::function<void()>& draw) {
+  if (!round_7e3_alpha_redraw_enabled() ||
+      rt_index >= xenos::kMaxColorRenderTargets) {
+    return false;
+  }
+  auto* rt = static_cast<VulkanRenderTarget*>(
+      GetLastUpdateColorRenderTarget(rt_index));
+  if (!rt || rt->descriptor_set_index_storage() == SIZE_MAX) {
+    return false;
+  }
+  RenderTargetKey key = rt->key();
+  uint32_t width = key.GetWidth() * GetKeyScaleX(key);
+  uint32_t height =
+      GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples) *
+      GetKeyScaleY(key);
+
+  uint64_t framebuffer_key = (uint64_t(width) << 32) | height;
+  VkFramebuffer framebuffer;
+  auto framebuffer_it =
+      round_7e3_alpha_redraw_framebuffers_.find(framebuffer_key);
+  if (framebuffer_it != round_7e3_alpha_redraw_framebuffers_.end()) {
+    framebuffer = framebuffer_it->second;
+  } else {
+    const ui::vulkan::VulkanDevice* const vulkan_device =
+        command_processor_.GetVulkanDevice();
+    VkFramebufferCreateInfo framebuffer_create_info = {};
+    framebuffer_create_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    framebuffer_create_info.renderPass = round_7e3_alpha_redraw_render_pass_;
+    framebuffer_create_info.width = width;
+    framebuffer_create_info.height = height;
+    framebuffer_create_info.layers = 1;
+    if (vulkan_device->functions().vkCreateFramebuffer(
+            vulkan_device->device(), &framebuffer_create_info, nullptr,
+            &framebuffer) != VK_SUCCESS) {
+      return false;
+    }
+    round_7e3_alpha_redraw_framebuffers_.emplace(framebuffer_key, framebuffer);
+  }
+
+  VkImageSubresourceRange subresource_range =
+      ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT);
+  command_processor_.PushImageMemoryBarrier(
+      rt->image(), subresource_range, rt->current_stage_mask(),
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, rt->current_access_mask(),
+      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+      rt->current_layout(), VK_IMAGE_LAYOUT_GENERAL);
+  // Ends the guest render pass.
+  command_processor_.SubmitBarriers(true);
+
+  DeferredCommandBuffer& command_buffer =
+      command_processor_.deferred_command_buffer();
+  VkRenderPassBeginInfo render_pass_begin_info = {};
+  render_pass_begin_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+  render_pass_begin_info.renderPass = round_7e3_alpha_redraw_render_pass_;
+  render_pass_begin_info.framebuffer = framebuffer;
+  render_pass_begin_info.renderArea.extent.width = width;
+  render_pass_begin_info.renderArea.extent.height = height;
+  command_buffer.CmdVkBeginRenderPass(&render_pass_begin_info,
+                                      VK_SUBPASS_CONTENTS_INLINE);
+  command_processor_.BindExternalGraphicsPipeline(pipeline, true, true, true);
+  VkDescriptorSet descriptor_set = descriptor_set_pool_storage_image_->Get(
+      rt->descriptor_set_index_storage());
+  command_buffer.CmdVkBindDescriptorSets(
+      VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
+      SpirvShaderTranslator::kDescriptorSetCount, 1, &descriptor_set, 0,
+      nullptr);
+  draw();
+  command_buffer.CmdVkEndRenderPass();
+
+  VkPipelineStageFlags draw_stage_mask;
+  VkAccessFlags draw_access_mask;
+  VkImageLayout draw_layout;
+  rt->GetDrawUsage(&draw_stage_mask, &draw_access_mask, &draw_layout);
+  command_processor_.PushImageMemoryBarrier(
+      rt->image(), subresource_range, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+      draw_stage_mask, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+      draw_access_mask, VK_IMAGE_LAYOUT_GENERAL, draw_layout);
+  rt->SetUsage(draw_stage_mask, draw_access_mask, draw_layout);
+  return true;
 }
 
 bool VulkanRenderTargetCache::IsGammaFormatHostStorageSeparate() const {
@@ -2782,6 +3075,13 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
     xenos::ColorRenderTargetFormat color_format = key.GetColorFormat();
     image_create_info.format = GetColorVulkanFormat(color_format);
     transfer_format = GetColorOwnershipTransferVulkanFormat(color_format);
+    if (round_7e3_alpha_enabled() &&
+        image_create_info.format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+        (color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+         color_format == xenos::ColorRenderTargetFormat::
+                             k_2_10_10_10_FLOAT_AS_16_16_16_16)) {
+      image_create_info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    }
     if (image_create_info.format != transfer_format) {
       image_create_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     }
@@ -2944,10 +3244,36 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
   dfn.vkUpdateDescriptorSets(device, key.is_depth ? 2 : 1, descriptor_set_write,
                              0, nullptr);
 
-  return new VulkanRenderTarget(key, *this, image, memory, view_depth_color,
-                                view_depth_stencil, view_stencil,
-                                view_color_transfer_separate,
-                                descriptor_set_index_transfer_source);
+  auto* render_target = new VulkanRenderTarget(
+      key, *this, image, memory, view_depth_color, view_depth_stencil,
+      view_stencil, view_color_transfer_separate,
+      descriptor_set_index_transfer_source);
+  if (image_create_info.usage & VK_IMAGE_USAGE_STORAGE_BIT) {
+    size_t descriptor_set_index_storage =
+        descriptor_set_pool_storage_image_->Allocate();
+    if (descriptor_set_index_storage != SIZE_MAX) {
+      VkDescriptorImageInfo storage_image_info;
+      storage_image_info.sampler = VK_NULL_HANDLE;
+      storage_image_info.imageView = view_depth_color;
+      storage_image_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+      VkWriteDescriptorSet storage_write;
+      storage_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      storage_write.pNext = nullptr;
+      storage_write.dstSet =
+          descriptor_set_pool_storage_image_->Get(descriptor_set_index_storage);
+      storage_write.dstBinding = 0;
+      storage_write.dstArrayElement = 0;
+      storage_write.descriptorCount = 1;
+      storage_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+      storage_write.pImageInfo = &storage_image_info;
+      storage_write.pBufferInfo = nullptr;
+      storage_write.pTexelBufferView = nullptr;
+      dfn.vkUpdateDescriptorSets(device, 1, &storage_write, 0, nullptr);
+      render_target->set_descriptor_set_index_storage(
+          descriptor_set_index_storage);
+    }
+  }
+  return render_target;
 }
 
 bool VulkanRenderTargetCache::IsHostDepthEncodingDifferent(

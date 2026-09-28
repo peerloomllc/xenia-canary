@@ -50,6 +50,8 @@ namespace shaders {
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/discrete_quad_4cp_hs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/discrete_triangle_1cp_hs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/discrete_triangle_3cp_hs.h"
+#include "xenia/gpu/shaders/bytecode/vulkan_spirv/edram_7e3_alpha_round_ms_ps.h"
+#include "xenia/gpu/shaders/bytecode/vulkan_spirv/edram_7e3_alpha_round_ps.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/tessellation_adaptive_vs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/tessellation_indexed_vs.h"
 // Placeholder pixel shader for pipeline hot-swap.
@@ -338,8 +340,16 @@ void VulkanPipelineCache::Shutdown() {
     if (pipeline_pair.second.pipeline != VK_NULL_HANDLE) {
       dfn.vkDestroyPipeline(device, pipeline_pair.second.pipeline, nullptr);
     }
+    if (pipeline_pair.second.round_7e3_alpha_pipeline != VK_NULL_HANDLE) {
+      dfn.vkDestroyPipeline(
+          device, pipeline_pair.second.round_7e3_alpha_pipeline, nullptr);
+    }
   }
   pipelines_.clear();
+  for (VkShaderModule& round_shader : round_7e3_alpha_fragment_shaders_) {
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
+                                           round_shader);
+  }
 
   // Destroy the pipeline cache.
   if (vk_pipeline_cache_ != VK_NULL_HANDLE) {
@@ -611,6 +621,83 @@ bool VulkanPipelineCache::EnsureShadersTranslated(
     }
   }
   return true;
+}
+
+VkPipeline VulkanPipelineCache::GetRound7e3AlphaPipeline(
+    Pipeline* pipeline, VulkanShader::VulkanTranslation* vertex_shader,
+    VulkanShader::VulkanTranslation* pixel_shader) {
+  VkPipeline round_pipeline =
+      pipeline->round_7e3_alpha_pipeline.load(std::memory_order_acquire);
+  if (round_pipeline != VK_NULL_HANDLE ||
+      pipeline->round_7e3_alpha_state.load(std::memory_order_acquire)) {
+    return round_pipeline;
+  }
+  if (!last_pipeline_ || &last_pipeline_->second != pipeline) {
+    return VK_NULL_HANDLE;
+  }
+  const PipelineDescription& description = last_pipeline_->first;
+  if (description.tessellation_mode != PipelineTessellationMode::kNone ||
+      pipeline->pipeline_layout->GetRound7e3AlphaPipelineLayout() ==
+          VK_NULL_HANDLE ||
+      !render_target_cache_.round_7e3_alpha_redraw_enabled()) {
+    pipeline->round_7e3_alpha_state.store(2, std::memory_order_release);
+    return VK_NULL_HANDLE;
+  }
+  if (round_7e3_alpha_fragment_shaders_[0] == VK_NULL_HANDLE) {
+    const ui::vulkan::VulkanDevice* vulkan_device =
+        command_processor_.GetVulkanDevice();
+    round_7e3_alpha_fragment_shaders_[0] = ui::vulkan::util::CreateShaderModule(
+        vulkan_device, shaders::edram_7e3_alpha_round_ps,
+        sizeof(shaders::edram_7e3_alpha_round_ps));
+    round_7e3_alpha_fragment_shaders_[1] = ui::vulkan::util::CreateShaderModule(
+        vulkan_device, shaders::edram_7e3_alpha_round_ms_ps,
+        sizeof(shaders::edram_7e3_alpha_round_ms_ps));
+  }
+  if (round_7e3_alpha_fragment_shaders_[0] == VK_NULL_HANDLE ||
+      round_7e3_alpha_fragment_shaders_[1] == VK_NULL_HANDLE) {
+    pipeline->round_7e3_alpha_state.store(2, std::memory_order_release);
+    return VK_NULL_HANDLE;
+  }
+
+  VkShaderModule geometry_shader = VK_NULL_HANDLE;
+  PipelineGeometryShader host_geometry_shader =
+      GetHostGeometryShader(description);
+  if (host_geometry_shader != PipelineGeometryShader::kNone) {
+    GeometryShaderKey geometry_shader_key;
+    GetGeometryShaderKey(
+        host_geometry_shader,
+        SpirvShaderTranslator::Modification(vertex_shader->modification()),
+        SpirvShaderTranslator::Modification(
+            pixel_shader ? pixel_shader->modification() : 0),
+        geometry_shader_key);
+    geometry_shader = GetGeometryShader(geometry_shader_key);
+    if (geometry_shader == VK_NULL_HANDLE) {
+      pipeline->round_7e3_alpha_state.store(2, std::memory_order_release);
+      return VK_NULL_HANDLE;
+    }
+  }
+
+  pipeline->round_7e3_alpha_state.store(1, std::memory_order_release);
+  PipelineCreationArguments creation_arguments;
+  creation_arguments.pipeline = last_pipeline_;
+  creation_arguments.vertex_shader = vertex_shader;
+  creation_arguments.pixel_shader = nullptr;
+  creation_arguments.geometry_shader = geometry_shader;
+  creation_arguments.tessellation_vertex_shader = VK_NULL_HANDLE;
+  creation_arguments.tessellation_control_shader = VK_NULL_HANDLE;
+  creation_arguments.render_pass =
+      render_target_cache_.round_7e3_alpha_redraw_render_pass();
+  creation_arguments.round_7e3_alpha = true;
+  if (creation_threads_.empty()) {
+    EnsurePipelineCreated(creation_arguments);
+    return pipeline->round_7e3_alpha_pipeline.load(std::memory_order_acquire);
+  }
+  {
+    std::lock_guard<std::mutex> lock(creation_request_lock_);
+    creation_queue_.push(creation_arguments);
+  }
+  creation_request_cond_.notify_one();
+  return VK_NULL_HANDLE;
 }
 
 bool VulkanPipelineCache::ConfigurePipeline(
@@ -916,7 +1003,8 @@ void VulkanPipelineCache::CreationThread() {
     }
     // On failure: if a placeholder exists it will remain in use permanently.
     // Clear the flag so we're not in a misleading "waiting for real" state.
-    if (creation_arguments.pipeline->second.is_placeholder.load(
+    if (!creation_arguments.round_7e3_alpha &&
+        creation_arguments.pipeline->second.is_placeholder.load(
             std::memory_order_acquire)) {
       XELOGW(
           "Real pipeline creation failed - placeholder will remain in use "
@@ -2707,8 +2795,14 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
   bool is_placeholder = creation_arguments.pipeline->second.is_placeholder.load(
       std::memory_order_acquire);
   bool creating_placeholder = fragment_shader_override != VK_NULL_HANDLE;
+  bool creating_round_7e3_alpha = creation_arguments.round_7e3_alpha;
 
-  if (existing_pipeline != VK_NULL_HANDLE) {
+  if (creating_round_7e3_alpha) {
+    if (creation_arguments.pipeline->second.round_7e3_alpha_pipeline.load(
+            std::memory_order_acquire) != VK_NULL_HANDLE) {
+      return true;
+    }
+  } else if (existing_pipeline != VK_NULL_HANDLE) {
     if (!is_placeholder || creating_placeholder) {
       // Already have a real pipeline, or trying to create another placeholder.
       return true;
@@ -2840,7 +2934,10 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
   shader_stage_fragment.module = VK_NULL_HANDLE;
   shader_stage_fragment.pName = "main";
   shader_stage_fragment.pSpecializationInfo = nullptr;
-  if (fragment_shader_override != VK_NULL_HANDLE) {
+  if (creating_round_7e3_alpha) {
+    shader_stage_fragment.module = round_7e3_alpha_fragment_shaders_
+        [description.render_pass_key.msaa_samples != xenos::MsaaSamples::k1X];
+  } else if (fragment_shader_override != VK_NULL_HANDLE) {
     // Use the override shader (for placeholder pipelines).
     shader_stage_fragment.module = fragment_shader_override;
   } else if (creation_arguments.pixel_shader) {
@@ -2979,7 +3076,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
   // used (the guest shader can't access Z), enabling only when there's a
   // depth / stencil attachment for correctness.
   rasterization_state.depthBiasEnable =
-      (!edram_fragment_shader_interlock &&
+      (!edram_fragment_shader_interlock && !creating_round_7e3_alpha &&
        (description.render_pass_key.depth_and_color_used & 0b1))
           ? VK_TRUE
           : VK_FALSE;
@@ -3011,7 +3108,9 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
   depth_stencil_state.sType =
       VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
   depth_stencil_state.pNext = nullptr;
-  if (!edram_fragment_shader_interlock) {
+  // The alpha rounding redraw has no attachments - it covers every pixel the
+  // geometry does, a superset of what the guest draw wrote, which is fine.
+  if (!edram_fragment_shader_interlock && !creating_round_7e3_alpha) {
     if (description.depth_write_enable ||
         description.depth_compare_op != xenos::CompareFunction::kAlways) {
       depth_stencil_state.depthTestEnable = VK_TRUE;
@@ -3055,7 +3154,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
       VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
   VkPipelineColorBlendAttachmentState
       color_blend_attachments[xenos::kMaxColorRenderTargets] = {};
-  if (!edram_fragment_shader_interlock) {
+  if (!edram_fragment_shader_interlock && !creating_round_7e3_alpha) {
     uint32_t color_rts_used =
         description.render_pass_key.depth_and_color_used >> 1;
     {
@@ -3207,7 +3306,11 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
   pipeline_create_info.pColorBlendState = &color_blend_state;
   pipeline_create_info.pDynamicState = &dynamic_state;
   pipeline_create_info.layout =
-      creation_arguments.pipeline->second.pipeline_layout->GetPipelineLayout();
+      creating_round_7e3_alpha
+          ? creation_arguments.pipeline->second.pipeline_layout
+                ->GetRound7e3AlphaPipelineLayout()
+          : creation_arguments.pipeline->second.pipeline_layout
+                ->GetPipelineLayout();
   pipeline_create_info.renderPass = creation_arguments.render_pass;
   pipeline_create_info.subpass = 0;
   pipeline_create_info.basePipelineHandle = VK_NULL_HANDLE;
@@ -3218,6 +3321,16 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
   VkPipeline pipeline;
   VkResult result = dfn.vkCreateGraphicsPipelines(
       device, vk_pipeline_cache_, 1, &pipeline_create_info, nullptr, &pipeline);
+  if (result != VK_SUCCESS && creating_round_7e3_alpha) {
+    XELOGE(
+        "Failed to create the alpha rounding pipeline for VS {:016X} "
+        "(result={})",
+        creation_arguments.vertex_shader->shader().ucode_data_hash(),
+        static_cast<int>(result));
+    creation_arguments.pipeline->second.round_7e3_alpha_state.store(
+        2, std::memory_order_release);
+    return false;
+  }
   if (result != VK_SUCCESS) {
     if (creation_arguments.pixel_shader) {
       XELOGE(
@@ -3234,6 +3347,12 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
           is_tessellated, static_cast<int>(result));
     }
     return false;
+  }
+
+  if (creating_round_7e3_alpha) {
+    creation_arguments.pipeline->second.round_7e3_alpha_pipeline.store(
+        pipeline, std::memory_order_release);
+    return true;
   }
 
   // Store the new pipeline, handling placeholder hot-swap.

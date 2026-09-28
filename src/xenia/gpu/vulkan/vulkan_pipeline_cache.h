@@ -54,6 +54,11 @@ class VulkanPipelineCache {
    public:
     virtual ~PipelineLayoutProvider() {}
     virtual VkPipelineLayout GetPipelineLayout() const = 0;
+    // The guest layout plus the storage image set for the k_2_10_10_10_FLOAT
+    // alpha rounding redraw, or VK_NULL_HANDLE.
+    virtual VkPipelineLayout GetRound7e3AlphaPipelineLayout() const {
+      return VK_NULL_HANDLE;
+    }
 
    protected:
     PipelineLayoutProvider() = default;
@@ -70,6 +75,12 @@ class VulkanPipelineCache {
     // the real pipeline is being compiled in the background.
     std::atomic<bool> is_placeholder{false};
 
+    // Variant drawing the same geometry to round the alpha of a
+    // k_2_10_10_10_FLOAT render target (GetRound7e3AlphaPipeline), and
+    // whether it's 0 not requested, 1 requested, 2 unavailable.
+    std::atomic<VkPipeline> round_7e3_alpha_pipeline{VK_NULL_HANDLE};
+    std::atomic<uint8_t> round_7e3_alpha_state{0};
+
     Pipeline(const PipelineLayoutProvider* pipeline_layout_provider)
         : pipeline_layout(pipeline_layout_provider) {}
 
@@ -77,15 +88,21 @@ class VulkanPipelineCache {
     Pipeline(const Pipeline& other)
         : pipeline(other.pipeline.load(std::memory_order_acquire)),
           pipeline_layout(other.pipeline_layout),
-          is_placeholder(other.is_placeholder.load(std::memory_order_acquire)) {
-    }
+          is_placeholder(other.is_placeholder.load(std::memory_order_acquire)),
+          round_7e3_alpha_pipeline(
+              other.round_7e3_alpha_pipeline.load(std::memory_order_acquire)),
+          round_7e3_alpha_state(
+              other.round_7e3_alpha_state.load(std::memory_order_acquire)) {}
 
     // Move constructor
     Pipeline(Pipeline&& other) noexcept
         : pipeline(other.pipeline.load(std::memory_order_acquire)),
           pipeline_layout(other.pipeline_layout),
-          is_placeholder(other.is_placeholder.load(std::memory_order_acquire)) {
-    }
+          is_placeholder(other.is_placeholder.load(std::memory_order_acquire)),
+          round_7e3_alpha_pipeline(
+              other.round_7e3_alpha_pipeline.load(std::memory_order_acquire)),
+          round_7e3_alpha_state(
+              other.round_7e3_alpha_state.load(std::memory_order_acquire)) {}
 
     // Deleted copy assignment to prevent accidental copying
     Pipeline& operator=(const Pipeline&) = delete;
@@ -139,6 +156,15 @@ class VulkanPipelineCache {
 
   bool EnsureShadersTranslated(VulkanShader::VulkanTranslation* vertex_shader,
                                VulkanShader::VulkanTranslation* pixel_shader);
+  // The variant of pipeline, the last one ConfigurePipeline returned, that
+  // draws the same geometry to round the alpha of the k_2_10_10_10_FLOAT
+  // render target it covers (VulkanRenderTargetCache::Round7e3AlphaByRedraw).
+  // Created in the background on the first request; VK_NULL_HANDLE until it's
+  // ready or if it can't be made (tessellation).
+  VkPipeline GetRound7e3AlphaPipeline(
+      Pipeline* pipeline, VulkanShader::VulkanTranslation* vertex_shader,
+      VulkanShader::VulkanTranslation* pixel_shader);
+
   bool ConfigurePipeline(
       VulkanShader::VulkanTranslation* vertex_shader,
       VulkanShader::VulkanTranslation* pixel_shader,
@@ -303,6 +329,8 @@ class VulkanPipelineCache {
     VkShaderModule tessellation_vertex_shader;   // VS for passing data to TCS.
     VkShaderModule tessellation_control_shader;  // TCS (hull shader).
     VkRenderPass render_pass;
+    // Create Pipeline::round_7e3_alpha_pipeline instead of the pipeline.
+    bool round_7e3_alpha = false;
     // Priority for async compilation (higher = compiled sooner).
     // Pipelines that write to visible render targets get higher priority.
     uint8_t priority = 0;
@@ -461,6 +489,9 @@ class VulkanPipelineCache {
   // Placeholder pixel shader for pipeline hot-swap to reduce stutter.
   // Outputs transparent black while the real shader compiles in background.
   VkShaderModule placeholder_pixel_shader_ = VK_NULL_HANDLE;
+  // Fragment shaders of the alpha rounding redraw, single-sampled and
+  // multisampled.
+  VkShaderModule round_7e3_alpha_fragment_shaders_[2] = {};
 
   // Tessellation shaders.
   // Vertex shaders for tessellation - pass indices/factors to TCS.

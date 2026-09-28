@@ -1868,6 +1868,12 @@ void VulkanCommandProcessor::ShutdownContext() {
   for (const auto& pipeline_layout_pair : pipeline_layouts_) {
     dfn.vkDestroyPipelineLayout(
         device, pipeline_layout_pair.second.GetPipelineLayout(), nullptr);
+    if (pipeline_layout_pair.second.GetRound7e3AlphaPipelineLayout() !=
+        VK_NULL_HANDLE) {
+      dfn.vkDestroyPipelineLayout(
+          device, pipeline_layout_pair.second.GetRound7e3AlphaPipelineLayout(),
+          nullptr);
+    }
   }
   pipeline_layouts_.clear();
   for (const auto& descriptor_set_layout_pair :
@@ -2934,11 +2940,34 @@ VulkanCommandProcessor::GetPipelineLayout(size_t texture_count_pixel,
         texture_count_pixel, texture_count_vertex);
     return nullptr;
   }
+  // The same layout with the storage image of the k_2_10_10_10_FLOAT alpha
+  // rounding redraw as one more set - compatible with the guest layout for
+  // the guest sets and the push constants, which stay bound.
+  VkPipelineLayout round_7e3_alpha_pipeline_layout = VK_NULL_HANDLE;
+  if (render_target_cache_->round_7e3_alpha_redraw_enabled()) {
+    VkDescriptorSetLayout
+        round_set_layouts[SpirvShaderTranslator::kDescriptorSetCount + 1];
+    std::memcpy(round_set_layouts, descriptor_set_layouts,
+                sizeof(descriptor_set_layouts));
+    round_set_layouts[SpirvShaderTranslator::kDescriptorSetCount] =
+        render_target_cache_->descriptor_set_layout_storage_image();
+    VkPipelineLayoutCreateInfo round_pipeline_layout_create_info =
+        pipeline_layout_create_info;
+    round_pipeline_layout_create_info.setLayoutCount =
+        uint32_t(xe::countof(round_set_layouts));
+    round_pipeline_layout_create_info.pSetLayouts = round_set_layouts;
+    if (dfn.vkCreatePipelineLayout(device, &round_pipeline_layout_create_info,
+                                   nullptr, &round_7e3_alpha_pipeline_layout) !=
+        VK_SUCCESS) {
+      round_7e3_alpha_pipeline_layout = VK_NULL_HANDLE;
+    }
+  }
   auto emplaced_pair = pipeline_layouts_.emplace(
       std::piecewise_construct, std::forward_as_tuple(pipeline_layout_key),
       std::forward_as_tuple(pipeline_layout,
                             descriptor_set_layout_textures_vertex,
-                            descriptor_set_layout_textures_pixel));
+                            descriptor_set_layout_textures_pixel,
+                            round_7e3_alpha_pipeline_layout));
   // unordered_map insertion doesn't invalidate element references.
   return &emplaced_pair.first->second;
 }
@@ -3117,10 +3146,23 @@ void VulkanCommandProcessor::PushVertexBaseIndex() {
       deferred_command_buffer_.push_constants_generation();
 }
 
+void VulkanCommandProcessor::FlushPendingRound7e3Alpha() {
+  if (!pending_round_7e3_alpha_count_) {
+    return;
+  }
+  render_target_cache_->Round7e3Alpha(pending_round_7e3_alpha_rt_mask_,
+                                      pending_round_7e3_alpha_rects_,
+                                      pending_round_7e3_alpha_count_);
+  pending_round_7e3_alpha_count_ = 0;
+}
+
 bool VulkanCommandProcessor::TryFastRepeatDraw(
     xenos::PrimitiveType prim_type, uint32_t index_count,
     IndexBufferInfo* index_buffer_info, bool major_mode_explicit) {
   const FastDraw& f = fast_draw_;
+  if (pending_round_7e3_alpha_count_) {
+    return false;
+  }
   if (prim_type != f.prim_type || index_count != f.index_count ||
       major_mode_explicit != f.major_mode_explicit ||
       (index_buffer_info != nullptr) != f.indexed) {
@@ -3472,6 +3514,120 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
             samplers_overflowed_count);
     assert_true(sampler_overflow_await_submission <= GetCurrentSubmission());
     CheckSubmissionCompletionAndDeviceLoss(sampler_overflow_await_submission);
+  }
+
+  // The Xenos keeps 2 bits of alpha in k_2_10_10_10_FLOAT render targets and
+  // rounds after every blend; the host keeps 16-bit float alpha, which wears
+  // down under many translucent layers. The alpha this draw blends into such
+  // targets is rounded after it, in batches of draws that don't overlap: the
+  // rounding waits until something may read those pixels.
+  uint32_t round_7e3_alpha_rt_mask = 0;
+  VkRect2D round_7e3_alpha_rect = {};
+  bool round_7e3_alpha_redrawn = false;
+  if (render_target_cache_->round_7e3_alpha_enabled() &&
+      render_target_cache_->GetPath() ==
+          RenderTargetCache::Path::kHostRenderTargets) {
+    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+      if (!((normalized_color_mask >> (4 * i)) & 0b1000)) {
+        continue;
+      }
+      xenos::ColorRenderTargetFormat color_format =
+          regs.Get<reg::RB_COLOR_INFO>(
+                  reg::RB_COLOR_INFO::rt_register_indices[i])
+              .color_format;
+      if (color_format != xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT &&
+          color_format != xenos::ColorRenderTargetFormat::
+                              k_2_10_10_10_FLOAT_AS_16_16_16_16) {
+        continue;
+      }
+      auto blend_control = regs.Get<reg::RB_BLENDCONTROL>(
+          reg::RB_BLENDCONTROL::rt_register_indices[i]);
+      if (blend_control.alpha_srcblend != xenos::BlendFactor::kOne ||
+          blend_control.alpha_destblend != xenos::BlendFactor::kZero ||
+          blend_control.alpha_comb_fcn != xenos::BlendOp::kAdd) {
+        round_7e3_alpha_rt_mask |= UINT32_C(1) << i;
+      }
+    }
+    if (round_7e3_alpha_rt_mask) {
+      // The scissor in host pixels.
+      int32_t scale_x = int32_t(render_target_cache_->GetDrawScaleX());
+      int32_t scale_y = int32_t(render_target_cache_->GetDrawScaleY());
+      draw_util::Scissor round_scissor;
+      draw_util::GetScissor(regs, round_scissor);
+      int32_t x0 = int32_t(round_scissor.offset[0]);
+      int32_t y0 = int32_t(round_scissor.offset[1]);
+      int32_t x1 = x0 + int32_t(round_scissor.extent[0]);
+      int32_t y1 = y0 + int32_t(round_scissor.extent[1]);
+      round_7e3_alpha_rect.offset.x = x0 * scale_x;
+      round_7e3_alpha_rect.offset.y = y0 * scale_y;
+      round_7e3_alpha_rect.extent.width =
+          uint32_t(std::max(x1 - x0, 0) * scale_x);
+      round_7e3_alpha_rect.extent.height =
+          uint32_t(std::max(y1 - y0, 0) * scale_y);
+    }
+  }
+  // Narrows the rectangle to the vertices of a small draw (overlays, sprites,
+  // whose scissor is usually far larger than what they cover), only when the
+  // rectangle is needed: to check overlap with rounding that waits, or for the
+  // rectangle rounding.
+  bool round_7e3_alpha_rect_refined = false;
+  auto refine_round_7e3_alpha_rect = [&]() {
+    if (round_7e3_alpha_rect_refined || !round_7e3_alpha_rt_mask) {
+      return;
+    }
+    round_7e3_alpha_rect_refined = true;
+    int32_t bounds_left, bounds_top, bounds_right, bounds_bottom;
+    if (!render_target_cache_->EstimateDrawVertexBounds(
+            *vertex_shader, 64, bounds_left, bounds_top, bounds_right,
+            bounds_bottom)) {
+      return;
+    }
+    int32_t scale_x = int32_t(render_target_cache_->GetDrawScaleX());
+    int32_t scale_y = int32_t(render_target_cache_->GetDrawScaleY());
+    int32_t x0 = std::max(round_7e3_alpha_rect.offset.x, bounds_left * scale_x);
+    int32_t y0 = std::max(round_7e3_alpha_rect.offset.y, bounds_top * scale_y);
+    int32_t x1 = std::min(round_7e3_alpha_rect.offset.x +
+                              int32_t(round_7e3_alpha_rect.extent.width),
+                          bounds_right * scale_x);
+    int32_t y1 = std::min(round_7e3_alpha_rect.offset.y +
+                              int32_t(round_7e3_alpha_rect.extent.height),
+                          bounds_bottom * scale_y);
+    round_7e3_alpha_rect.offset.x = x0;
+    round_7e3_alpha_rect.offset.y = y0;
+    round_7e3_alpha_rect.extent.width = uint32_t(std::max(x1 - x0, 0));
+    round_7e3_alpha_rect.extent.height = uint32_t(std::max(y1 - y0, 0));
+  };
+  if (pending_round_7e3_alpha_count_) {
+    refine_round_7e3_alpha_rect();
+    // Keep waiting only for a draw that rounds into the same render targets,
+    // set up the same way, without touching the waiting pixels.
+    bool keep_pending =
+        round_7e3_alpha_rt_mask == pending_round_7e3_alpha_rt_mask_ &&
+        regs[XE_GPU_REG_RB_SURFACE_INFO] ==
+            pending_round_7e3_alpha_surface_info_;
+    for (uint32_t i = 0; keep_pending && i < xenos::kMaxColorRenderTargets;
+         ++i) {
+      keep_pending = regs[reg::RB_COLOR_INFO::rt_register_indices[i]] ==
+                     pending_round_7e3_alpha_color_info_[i];
+    }
+    for (uint32_t i = 0; keep_pending && i < pending_round_7e3_alpha_count_;
+         ++i) {
+      const VkRect2D& pending_rect = pending_round_7e3_alpha_rects_[i];
+      keep_pending =
+          round_7e3_alpha_rect.offset.x >=
+              pending_rect.offset.x + int32_t(pending_rect.extent.width) ||
+          pending_rect.offset.x >=
+              round_7e3_alpha_rect.offset.x +
+                  int32_t(round_7e3_alpha_rect.extent.width) ||
+          round_7e3_alpha_rect.offset.y >=
+              pending_rect.offset.y + int32_t(pending_rect.extent.height) ||
+          pending_rect.offset.y >=
+              round_7e3_alpha_rect.offset.y +
+                  int32_t(round_7e3_alpha_rect.extent.height);
+    }
+    if (!keep_pending) {
+      FlushPendingRound7e3Alpha();
+    }
   }
 
   // Set up the render targets - this may perform dispatches and draws.
@@ -3916,10 +4072,60 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
     }
   }
 
+  // Queue the 2-bit alpha rounding of this draw (see the planning before the
+  // render target update).
+  // Round by drawing the same geometry again when possible - only the pixels
+  // the draw covers. Otherwise queue the rectangle.
+  if (round_7e3_alpha_rt_mask && xe::bit_count(round_7e3_alpha_rt_mask) == 1 &&
+      memexport_ranges_.empty() &&
+      render_target_cache_->round_7e3_alpha_redraw_enabled()) {
+    VkPipeline round_pipeline = pipeline_cache_->GetRound7e3AlphaPipeline(
+        pipeline, vertex_shader_translation, pixel_shader_translation);
+    if (round_pipeline != VK_NULL_HANDLE) {
+      bool round_indexed =
+          primitive_processing_result.index_buffer_type !=
+              PrimitiveProcessor::ProcessedIndexBufferType::kNone &&
+          !shader_32bit_index_dma;
+      uint32_t round_vertex_count =
+          primitive_processing_result.host_draw_vertex_count;
+      if (render_target_cache_->Round7e3AlphaByRedraw(
+              xe::tzcnt(round_7e3_alpha_rt_mask), round_pipeline,
+              pipeline_layout->GetRound7e3AlphaPipelineLayout(),
+              [this, round_indexed, round_vertex_count]() {
+                if (round_indexed) {
+                  deferred_command_buffer_.CmdVkDrawIndexed(round_vertex_count,
+                                                            1, 0, 0, 0);
+                } else {
+                  deferred_command_buffer_.CmdVkDraw(round_vertex_count, 1, 0,
+                                                     0);
+                }
+              })) {
+        round_7e3_alpha_redrawn = true;
+      }
+    }
+  }
+  if (round_7e3_alpha_rt_mask && !round_7e3_alpha_redrawn) {
+    refine_round_7e3_alpha_rect();
+    if (pending_round_7e3_alpha_count_ >= kMaxPendingRound7e3Alpha) {
+      FlushPendingRound7e3Alpha();
+    }
+    if (!pending_round_7e3_alpha_count_) {
+      pending_round_7e3_alpha_rt_mask_ = round_7e3_alpha_rt_mask;
+      pending_round_7e3_alpha_surface_info_ = regs[XE_GPU_REG_RB_SURFACE_INFO];
+      for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+        pending_round_7e3_alpha_color_info_[i] =
+            regs[reg::RB_COLOR_INFO::rt_register_indices[i]];
+      }
+    }
+    pending_round_7e3_alpha_rects_[pending_round_7e3_alpha_count_++] =
+        round_7e3_alpha_rect;
+  }
+
   // Remember this draw if the next one may repeat it with only the index
   // offset changed.
-  if (memexport_ranges_.empty() && !dirty_bbox_enabled_ &&
-      !reshade_depth_active_ && !shader_32bit_index_dma &&
+  if (!round_7e3_alpha_rt_mask && memexport_ranges_.empty() &&
+      !dirty_bbox_enabled_ && !reshade_depth_active_ &&
+      !shader_32bit_index_dma &&
       primitive_processing_result.host_vertex_shader_type ==
           Shader::HostVertexShaderType::kVertex &&
       (primitive_processing_result.index_buffer_type ==
@@ -3954,6 +4160,7 @@ bool VulkanCommandProcessor::IssueCopy() {
   if (!BeginSubmission(true)) {
     return false;
   }
+  FlushPendingRound7e3Alpha();
 
   uint32_t written_address, written_length;
   reg::RB_COPY_DEST_INFO copy_dest_info;
@@ -5575,6 +5782,10 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
   ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
+
+  if (submission_open_) {
+    FlushPendingRound7e3Alpha();
+  }
 
   // Make sure everything needed for submitting exist.
   if (submission_open_) {

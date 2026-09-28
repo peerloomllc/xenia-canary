@@ -261,6 +261,15 @@ class RenderTargetCache {
   uint32_t GetLastUpdateBoundRenderTargets(
       uint32_t* depth_and_color_formats_out = nullptr) const;
 
+  // See DrawExtentEstimator::EstimateVertexBounds.
+  bool EstimateDrawVertexBounds(const Shader& vertex_shader,
+                                uint32_t max_vertices, int32_t& left_out,
+                                int32_t& top_out, int32_t& right_out,
+                                int32_t& bottom_out) {
+    return draw_extent_estimator_.EstimateVertexBounds(
+        vertex_shader, max_vertices, left_out, top_out, right_out, bottom_out);
+  }
+
  protected:
   RenderTargetCache(const RegisterFile& register_file, const Memory& memory,
                     TraceWriter* trace_writer, uint32_t draw_resolution_scale_x,
@@ -708,6 +717,9 @@ class RenderTargetCache {
   // cached render targets without exposing the private storage.
   RenderTarget* GetLastUpdateDepthRenderTarget() const {
     return last_update_used_render_targets_[0];
+  }
+  RenderTarget* GetLastUpdateColorRenderTarget(uint32_t index) const {
+    return last_update_used_render_targets_[1 + index];
   }
   // Whether the last update bound at least one colour render target (i.e. it
   // was a scene pass, not a depth-only shadow pass).
