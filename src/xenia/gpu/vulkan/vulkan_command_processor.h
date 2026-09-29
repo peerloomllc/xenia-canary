@@ -300,6 +300,13 @@ class VulkanCommandProcessor final : public CommandProcessor {
   XE_FORCEINLINE
   virtual void WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
                                      uint32_t num_registers) override;
+  void WriteRegisterRangeFromRing(xe::RingBuffer* ring, uint32_t base,
+                                  uint32_t num_registers) override;
+  // Writes of shader constants, which games do in bulk, with the bookkeeping
+  // of WriteRegister done once for the range. False if the range isn't only
+  // float or only fetch constants (then nothing is written).
+  bool WriteConstantRange(uint32_t start_index, const uint32_t* values,
+                          uint32_t count);
 
   void OnGammaRamp256EntryTableValueWritten() override;
   void OnGammaRampPWLValueWritten() override;
@@ -756,6 +763,33 @@ class VulkanCommandProcessor final : public CommandProcessor {
   std::deque<std::pair<uint64_t, VkDescriptorSet>>
       constants_transient_descriptors_used_;
   std::vector<VkDescriptorSet> constants_transient_descriptors_free_;
+
+  // The constant buffers are dynamic uniform buffers, all covering
+  // constants_dynamic_range_ bytes from the start of their upload pages
+  // (uniform_buffer_pool_ keeps that much free at the end of every page), so
+  // a draw only changes the dynamic offsets, and there is one descriptor set
+  // per combination of pages, written once.
+  uint32_t constants_dynamic_range_ = 0;
+  struct ConstantsDescriptorSetKey {
+    VkBuffer buffers[SpirvShaderTranslator::kConstantBufferCount];
+    bool operator==(const ConstantsDescriptorSetKey& other) const {
+      return !std::memcmp(buffers, other.buffers, sizeof(buffers));
+    }
+    struct Hasher {
+      size_t operator()(const ConstantsDescriptorSetKey& key) const {
+        return size_t(XXH3_64bits(key.buffers, sizeof(key.buffers)));
+      }
+    };
+  };
+  std::unordered_map<ConstantsDescriptorSetKey, VkDescriptorSet,
+                     ConstantsDescriptorSetKey::Hasher>
+      constants_descriptor_sets_;
+  std::vector<VkDescriptorPool> constants_descriptor_pools_;
+  uint32_t constants_descriptor_pool_sets_left_ = 0;
+  uint32_t current_constant_buffer_dynamic_offsets_
+      [SpirvShaderTranslator::kConstantBufferCount] = {};
+  VkDescriptorSet GetConstantsDescriptorSet();
+  void ClearConstantsDescriptorSets();
 
   ui::vulkan::LinkedTypeDescriptorSetAllocator
       transient_descriptor_allocator_textures_;

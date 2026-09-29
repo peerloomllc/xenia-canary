@@ -39,6 +39,13 @@ class GraphicsUploadBufferPool {
   // implementation doesn't require explicit flushing.
   void FlushWrites();
 
+  // Keeps this many bytes free at the end of every page, so a view of that
+  // size starting at any allocation stays within the page (for dynamic
+  // uniform buffer descriptors covering a fixed range).
+  void set_page_tail_reserve(size_t page_tail_reserve) {
+    page_tail_reserve_ = page_tail_reserve;
+  }
+
  protected:
   // Extended by the implementation.
   struct Page {
@@ -65,6 +72,7 @@ class GraphicsUploadBufferPool {
   // to avoid wasting space if the real allocation turns out to be bigger than
   // the specified page size.
   size_t page_size_;
+  size_t page_tail_reserve_ = 0;
 
   // A list of buffers with free space, with the first buffer being the one
   // currently being filled.
