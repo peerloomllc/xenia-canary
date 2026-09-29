@@ -583,28 +583,11 @@ VulkanPipelineCache::GetCurrentPixelShaderModification(
       }
     }
 
-    // The same color also goes to the 2-bit alpha companion of each
-    // k_2_10_10_10_FLOAT render target (see
+    // The same colors also go to the 2-bit alpha companions of
+    // k_2_10_10_10_FLOAT render targets (see
     // VulkanRenderTargetCache::round_7e3_alpha_companion_enabled).
-    if (render_target_cache_.round_7e3_alpha_companion_enabled()) {
-      uint32_t companion_mask = 0;
-      for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
-        if (!shader.writes_color_target(i)) {
-          continue;
-        }
-        xenos::ColorRenderTargetFormat color_format =
-            regs.Get<reg::RB_COLOR_INFO>(
-                    reg::RB_COLOR_INFO::rt_register_indices[i])
-                .color_format;
-        if (color_format ==
-                xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
-            color_format == xenos::ColorRenderTargetFormat::
-                                k_2_10_10_10_FLOAT_AS_16_16_16_16) {
-          companion_mask |= uint32_t(1) << i;
-        }
-      }
-      modification.pixel.color_7e3_alpha_companion_mask = companion_mask;
-    }
+    modification.pixel.color_7e3_alpha_companion =
+        uint32_t(render_target_cache_.round_7e3_alpha_companion_enabled());
   }
 
   return modification;

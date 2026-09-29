@@ -35,7 +35,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // prototyping stage (easier to do small granular updates with an
     // incremental counter).
     // 19: fetch addresses masked to physical (has207/xenia-edge@2fce2d895).
-    static constexpr uint32_t kVersion = 20;
+    static constexpr uint32_t kVersion = 21;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -92,6 +92,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
       // in SPIR-V the spacing lives in the domain shader). Discrete uses equal
       // spacing, continuous and adaptive use fractional even.
       xenos::TessellationMode tessellation_mode : 2;
+      // For a batch of draws in one host draw call, one instance per guest
+      // draw: pass the instance index to the pixel shader (flat, at
+      // kInstanceIndexLocation).
+      uint32_t output_instance_index : 1;
     } vertex;
     struct PixelShaderModification {
       // uint32_t 0.
@@ -121,9 +125,14 @@ class SpirvShaderTranslator : public ShaderTranslator {
       // from the draw. This is only set when the draw is native because of a
       // set scale threshold (FBO only).
       uint32_t resolution_scale_native : 1;
-      // For host render targets - color render targets whose output is also
-      // written to location 4 + the index, for their 2-bit alpha companions.
-      uint32_t color_7e3_alpha_companion_mask : xenos::kMaxColorRenderTargets;
+      // For host render targets - each color output is also written to
+      // location 4 + its index, for the 2-bit alpha companions of
+      // k_2_10_10_10_FLOAT render targets (discarded where there is none).
+      uint32_t color_7e3_alpha_companion : 1;
+      // For a batch of draws in one host draw call: the float constants are
+      // an array of blocks, one per instance (the instance index input from
+      // the vertex shader), each packed as for a single draw.
+      uint32_t float_constants_per_instance : 1;
     } pixel;
     uint64_t value = 0;
 
@@ -414,6 +423,14 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // "Xenia Emulator Microcode Translator".
   // https://github.com/KhronosGroup/SPIRV-Headers/blob/c43a43c7cc3af55910b9bec2a71e3e8a622443cf/include/spirv/spir-v.xml#L79
   static constexpr uint32_t kSpirvMagicToolId = 26;
+
+  // Batched draws: the location of the flat instance index passed from the
+  // vertex shader to the pixel shader, past every other inter-stage variable.
+  static constexpr uint32_t kInstanceIndexLocation = 20;
+  // Batched draws: the float constant array of the pixel shader, 64 KB - the
+  // minimum maxUniformBufferRange guaranteed by Vulkan is 16 KB, the batching
+  // code must check the device limit.
+  static constexpr uint32_t kFloatConstantsPerInstanceMaxVectors = 4096;
 
   struct Features {
     explicit Features(const ui::vulkan::VulkanDevice* vulkan_device);
@@ -1110,6 +1127,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // These are write-only and populated at the end of the shader from
   // output_or_var_fragment_data_.
   std::array<spv::Id, xenos::kMaxColorRenderTargets> output_fragment_data_;
+  // Batched draws (Modification::vertex.output_instance_index,
+  // pixel.float_constants_per_instance).
+  spv::Id input_instance_index_;
+  spv::Id output_instance_index_;
+  spv::Id input_pixel_instance_index_;
+  // In the pixel shader, the index of the instance's first float constant.
+  spv::Id main_float_constant_instance_base_;
   // The same colors for the 2-bit alpha companions, at location 4 + index.
   std::array<spv::Id, xenos::kMaxColorRenderTargets>
       output_fragment_data_companion_;

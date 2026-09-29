@@ -787,7 +787,10 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   if (XE_LIKELY(index < RegisterFile::kRegisterCount)) {
     register_file_->values[index] = value;
-    if (index != XE_GPU_REG_VGT_INDX_OFFSET) {
+    // Shader constant changes are noted by the backend.
+    if (index != XE_GPU_REG_VGT_INDX_OFFSET &&
+        (index < XE_GPU_REG_SHADER_CONSTANT_000_X ||
+         index > XE_GPU_REG_SHADER_CONSTANT_FLUSH_FETCH_2)) {
       fast_draw_valid_ = false;
     }
 
