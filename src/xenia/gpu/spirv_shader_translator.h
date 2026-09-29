@@ -35,7 +35,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // prototyping stage (easier to do small granular updates with an
     // incremental counter).
     // 19: fetch addresses masked to physical (has207/xenia-edge@2fce2d895).
-    static constexpr uint32_t kVersion = 19;
+    static constexpr uint32_t kVersion = 20;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -121,6 +121,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
       // from the draw. This is only set when the draw is native because of a
       // set scale threshold (FBO only).
       uint32_t resolution_scale_native : 1;
+      // For host render targets - color render targets whose output is also
+      // written to location 4 + the index, for their 2-bit alpha companions.
+      uint32_t color_7e3_alpha_companion_mask : xenos::kMaxColorRenderTargets;
     } pixel;
     uint64_t value = 0;
 
@@ -1107,6 +1110,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // These are write-only and populated at the end of the shader from
   // output_or_var_fragment_data_.
   std::array<spv::Id, xenos::kMaxColorRenderTargets> output_fragment_data_;
+  // The same colors for the 2-bit alpha companions, at location 4 + index.
+  std::array<spv::Id, xenos::kMaxColorRenderTargets>
+      output_fragment_data_companion_;
 
   // Function-scoped staging variable for guest oDepth writes. Used by both
   // FSI (which writes the value to the EDRAM buffer inside the interlock)

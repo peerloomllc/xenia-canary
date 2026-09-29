@@ -3524,7 +3524,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   uint32_t round_7e3_alpha_rt_mask = 0;
   VkRect2D round_7e3_alpha_rect = {};
   bool round_7e3_alpha_redrawn = false;
+  // Not needed with the 2-bit alpha companions, which round in the blending.
   if (render_target_cache_->round_7e3_alpha_enabled() &&
+      !render_target_cache_->round_7e3_alpha_companion_enabled() &&
       render_target_cache_->GetPath() ==
           RenderTargetCache::Path::kHostRenderTargets) {
     for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {

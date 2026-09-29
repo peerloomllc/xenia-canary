@@ -582,6 +582,29 @@ VulkanPipelineCache::GetCurrentPixelShaderModification(
             xenos::BlendFactor::kSrcAlpha;
       }
     }
+
+    // The same color also goes to the 2-bit alpha companion of each
+    // k_2_10_10_10_FLOAT render target (see
+    // VulkanRenderTargetCache::round_7e3_alpha_companion_enabled).
+    if (render_target_cache_.round_7e3_alpha_companion_enabled()) {
+      uint32_t companion_mask = 0;
+      for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+        if (!shader.writes_color_target(i)) {
+          continue;
+        }
+        xenos::ColorRenderTargetFormat color_format =
+            regs.Get<reg::RB_COLOR_INFO>(
+                    reg::RB_COLOR_INFO::rt_register_indices[i])
+                .color_format;
+        if (color_format ==
+                xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+            color_format == xenos::ColorRenderTargetFormat::
+                                k_2_10_10_10_FLOAT_AS_16_16_16_16) {
+          companion_mask |= uint32_t(1) << i;
+        }
+      }
+      modification.pixel.color_7e3_alpha_companion_mask = companion_mask;
+    }
   }
 
   return modification;
@@ -3152,8 +3175,9 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
   VkPipelineColorBlendStateCreateInfo color_blend_state = {};
   color_blend_state.sType =
       VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+  // Guest render targets, then their 2-bit alpha companions.
   VkPipelineColorBlendAttachmentState
-      color_blend_attachments[xenos::kMaxColorRenderTargets] = {};
+      color_blend_attachments[2 * xenos::kMaxColorRenderTargets] = {};
   if (!edram_fragment_shader_interlock && !creating_round_7e3_alpha) {
     uint32_t color_rts_used =
         description.render_pass_key.depth_and_color_used >> 1;
@@ -3239,6 +3263,25 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
       }
     }
     color_blend_state.attachmentCount = 32 - xe::lzcnt(color_rts_used);
+    // A companion blends the same alpha as its render target, and only the
+    // alpha is written.
+    uint32_t companion_mask = render_target_cache_.GetRenderPassCompanionMask(
+        description.render_pass_key);
+    if (companion_mask) {
+      uint32_t companions_remaining = companion_mask;
+      uint32_t companion_rt_index;
+      while (xe::bit_scan_forward(companions_remaining, &companion_rt_index)) {
+        companions_remaining &= ~(uint32_t(1) << companion_rt_index);
+        VkPipelineColorBlendAttachmentState& companion_blend_attachment =
+            color_blend_attachments[xenos::kMaxColorRenderTargets +
+                                    companion_rt_index];
+        companion_blend_attachment =
+            color_blend_attachments[companion_rt_index];
+        companion_blend_attachment.colorWriteMask &= VK_COLOR_COMPONENT_A_BIT;
+      }
+      color_blend_state.attachmentCount =
+          xenos::kMaxColorRenderTargets + 32 - xe::lzcnt(companion_mask);
+    }
     color_blend_state.pAttachments = color_blend_attachments;
   }
 

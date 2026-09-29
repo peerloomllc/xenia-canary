@@ -210,6 +210,56 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                              VkPipelineLayout pipeline_layout,
                              const std::function<void()>& draw);
 
+  // Copies the alpha between a render target and its companion (to_target:
+  // companion -> render target, before the render target is read; otherwise
+  // render target -> companion, after something other than guest draws has
+  // written the render target). Without rectangles, the whole image, only if
+  // the destination is behind, and the two are in sync afterwards. With
+  // rectangles (guest pixels), only there, and the state doesn't change.
+  // Records outside a render pass. No-op for render targets without a
+  // companion.
+  void SyncCompanionAlpha(RenderTarget* rt, bool to_target,
+                          const Transfer::Rectangle* rectangles = nullptr,
+                          uint32_t rectangle_count = 0);
+  // Barrier for drawing into the companion of the render target, if it has
+  // one.
+  void UseCompanionForDrawing(RenderTarget* rt);
+
+  // Instead of rounding after draws: every k_2_10_10_10_FLOAT render target
+  // has a companion image with 2-bit alpha (A2B10G10R10_UNORM), bound next to
+  // it at color attachment location 4 + its index in guest and ownership
+  // transfer render passes. Pixel shaders, transfers and resolve clears write
+  // the same color there with the same alpha blending, so the host rounds the
+  // alpha after every blend as the Xenos does, without breaking the render
+  // pass. Resolves take the alpha from the companion; before a transfer reads
+  // a render target, the companion's alpha is copied into it there.
+  bool round_7e3_alpha_companion_enabled() const {
+    return round_7e3_alpha_companion_pipelines_[0] != VK_NULL_HANDLE;
+  }
+  // Color render target indices (bits 0-3) that have a companion attachment
+  // in guest render passes with this key.
+  uint32_t GetRenderPassCompanionMask(RenderPassKey key) const {
+    // Also in ownership transfer passes: a k_2_10_10_10_FLOAT render target
+    // is transferred in its drawing format, and transfers into it write the
+    // companion too.
+    if (!round_7e3_alpha_companion_enabled()) {
+      return 0;
+    }
+    uint32_t mask = 0;
+    xenos::ColorRenderTargetFormat formats[] = {
+        key.color_0_view_format, key.color_1_view_format,
+        key.color_2_view_format, key.color_3_view_format};
+    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+      if ((key.depth_and_color_used & (uint32_t(1) << (1 + i))) &&
+          (formats[i] == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+           formats[i] == xenos::ColorRenderTargetFormat::
+                             k_2_10_10_10_FLOAT_AS_16_16_16_16)) {
+        mask |= uint32_t(1) << i;
+      }
+    }
+    return mask;
+  }
+
   bool msaa_2x_attachments_supported() const {
     return msaa_2x_attachments_supported_;
   }
@@ -412,6 +462,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   VkRenderPass round_7e3_alpha_redraw_render_pass_ = VK_NULL_HANDLE;
   std::unordered_map<uint64_t, VkFramebuffer>
       round_7e3_alpha_redraw_framebuffers_;
+  // Companion alpha copies: the render target and the companion as two
+  // storage image sets, for single-sampled [0] and multisampled [1] targets.
+  VkPipelineLayout round_7e3_alpha_companion_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline round_7e3_alpha_companion_pipelines_[2] = {};
 
   VkDeviceMemory edram_buffer_memory_ = VK_NULL_HANDLE;
   VkBuffer edram_buffer_ = VK_NULL_HANDLE;
@@ -574,6 +628,81 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       descriptor_set_index_storage_ = index;
     }
 
+    // The 2-bit alpha companion (round_7e3_alpha_companion_enabled), or null.
+    enum class CompanionState {
+      // Both hold the same alpha.
+      kInSync,
+      // Guest draws have blended into the companion; the render target's
+      // alpha is stale except in the in-sync rectangles.
+      kCompanionAhead,
+      // The companion is new and holds nothing yet; it takes the render
+      // target's alpha before the first guest draw.
+      kTargetAhead,
+    };
+    VkImage companion_image() const { return companion_image_; }
+    VkImageView companion_view() const { return companion_view_; }
+    size_t companion_descriptor_set_index() const {
+      return companion_descriptor_set_index_;
+    }
+    // The render target and the companion as two sampled images, for dumping.
+    size_t companion_dump_descriptor_set_index() const {
+      return companion_dump_descriptor_set_index_;
+    }
+    void set_companion_dump_descriptor_set_index(size_t index) {
+      companion_dump_descriptor_set_index_ = index;
+    }
+    void SetCompanion(VkImage image, VkDeviceMemory memory, VkImageView view,
+                      size_t descriptor_set_index) {
+      companion_image_ = image;
+      companion_memory_ = memory;
+      companion_view_ = view;
+      companion_descriptor_set_index_ = descriptor_set_index;
+    }
+    CompanionState companion_state() const { return companion_state_; }
+    void set_companion_state(CompanionState state) {
+      companion_state_ = state;
+      companion_in_sync_rect_count_ = 0;
+    }
+    // Rectangles (host pixels) where the render target and the companion
+    // hold the same alpha since guest draws last blended into the companion,
+    // so copies within them can be skipped.
+    bool IsCompanionInSync(const VkRect2D& rect) const {
+      for (uint32_t i = 0; i < companion_in_sync_rect_count_; ++i) {
+        const VkRect2D& in_sync = companion_in_sync_rects_[i];
+        if (rect.offset.x >= in_sync.offset.x &&
+            rect.offset.y >= in_sync.offset.y &&
+            rect.offset.x + rect.extent.width <=
+                in_sync.offset.x + in_sync.extent.width &&
+            rect.offset.y + rect.extent.height <=
+                in_sync.offset.y + in_sync.extent.height) {
+          return true;
+        }
+      }
+      return false;
+    }
+    void AddCompanionInSyncRect(const VkRect2D& rect) {
+      if (companion_in_sync_rect_count_ <
+          uint32_t(xe::countof(companion_in_sync_rects_))) {
+        companion_in_sync_rects_[companion_in_sync_rect_count_++] = rect;
+      } else {
+        companion_in_sync_rects_[companion_in_sync_rect_next_++ %
+                                 xe::countof(companion_in_sync_rects_)] = rect;
+      }
+    }
+    VkPipelineStageFlags companion_stage_mask() const {
+      return companion_stage_mask_;
+    }
+    VkAccessFlags companion_access_mask() const {
+      return companion_access_mask_;
+    }
+    VkImageLayout companion_layout() const { return companion_layout_; }
+    void SetCompanionUsage(VkPipelineStageFlags stage_mask,
+                           VkAccessFlags access_mask, VkImageLayout layout) {
+      companion_stage_mask_ = stage_mask;
+      companion_access_mask_ = access_mask;
+      companion_layout_ = layout;
+    }
+
     VkDescriptorSet GetDescriptorSetTransferSource() const {
       ui::vulkan::SingleLayoutDescriptorSetPool& descriptor_set_pool =
           key().is_depth
@@ -636,6 +765,19 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     // 2 sampled images for depth / stencil, 1 sampled image for color.
     size_t descriptor_set_index_transfer_source_;
     size_t descriptor_set_index_storage_ = SIZE_MAX;
+
+    VkImage companion_image_ = VK_NULL_HANDLE;
+    VkDeviceMemory companion_memory_ = VK_NULL_HANDLE;
+    VkImageView companion_view_ = VK_NULL_HANDLE;
+    size_t companion_descriptor_set_index_ = SIZE_MAX;
+    size_t companion_dump_descriptor_set_index_ = SIZE_MAX;
+    CompanionState companion_state_ = CompanionState::kTargetAhead;
+    VkRect2D companion_in_sync_rects_[8];
+    uint32_t companion_in_sync_rect_count_ = 0;
+    uint32_t companion_in_sync_rect_next_ = 0;
+    VkPipelineStageFlags companion_stage_mask_ = 0;
+    VkAccessFlags companion_access_mask_ = 0;
+    VkImageLayout companion_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
 
     VkPipelineStageFlags current_stage_mask_ = 0;
     VkAccessFlags current_access_mask_ = 0;
@@ -993,6 +1135,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       // source_scale_native only.
       // Address the EDRAM buffer with the plain 1x1 tile layout.
       uint32_t native_layout : 1;
+      // Take the alpha from the render target's 2-bit alpha companion, the
+      // second image of the source (like stencil for depth).
+      uint32_t alpha_companion : 1;
     };
 
     DumpPipelineKey() : key(0) { static_assert_size(*this, sizeof(key)); }
