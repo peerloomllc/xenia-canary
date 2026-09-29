@@ -68,6 +68,12 @@ DEFINE_bool(fast_repeat_draws, true,
             "Games that draw particles one small draw at a time run much "
             "faster with it.",
             "GPU");
+DEFINE_bool(batch_repeat_draws, true,
+            "With --fast_repeat_draws: draw a run of small draws that differ "
+            "only in pixel shader constants and in where their vertices are "
+            "(one after another in memory) with one pipeline and one "
+            "constant buffer, one instance per draw.",
+            "GPU");
 
 DECLARE_bool(log_wait_reg_mem);
 DECLARE_bool(clear_memory_page_state);
@@ -1954,6 +1960,9 @@ void VulkanCommandProcessor::ShutdownContext() {
 }
 
 void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+  uint32_t old_value = index < RegisterFile::kRegisterCount
+                           ? register_file_->values[index]
+                           : value;
   CommandProcessor::WriteRegister(index, value);
 
   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
@@ -1973,6 +1982,9 @@ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
             (1ull << (float_constant_index & 63))) {
           current_constant_buffers_up_to_date_ &= ~(
               UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatVertex);
+          if (value != old_value) {
+            fast_draw_vertex_float_changed_ = true;
+          }
         }
       }
     }
@@ -1980,10 +1992,19 @@ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
              index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
     current_constant_buffers_up_to_date_ &=
         ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferBoolLoop);
+    if (value != old_value) {
+      fast_draw_bool_loop_changed_ = true;
+    }
   } else if (index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
              index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
     current_constant_buffers_up_to_date_ &=
         ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch);
+    if (value != old_value) {
+      uint32_t vfetch_index =
+          (index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) >> 1;
+      fast_draw_vfetch_changed_[vfetch_index >> 5] |= UINT32_C(1)
+                                                      << (vfetch_index & 31);
+    }
     if (texture_cache_) {
       texture_cache_->TextureFetchConstantWritten(
           (index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 6);
@@ -3159,7 +3180,7 @@ void VulkanCommandProcessor::FlushPendingRound7e3Alpha() {
 bool VulkanCommandProcessor::TryFastRepeatDraw(
     xenos::PrimitiveType prim_type, uint32_t index_count,
     IndexBufferInfo* index_buffer_info, bool major_mode_explicit) {
-  const FastDraw& f = fast_draw_;
+  FastDraw& f = fast_draw_;
   if (pending_round_7e3_alpha_count_) {
     return false;
   }
@@ -3181,6 +3202,35 @@ bool VulkanCommandProcessor::TryFastRepeatDraw(
       active_vertex_shader() != f.active_vertex_shader ||
       active_pixel_shader() != f.active_pixel_shader) {
     return false;
+  }
+
+  // Float, bool and loop constants may change: UpdateBindings uploads them.
+  // Vertex fetch constants may change if no texture is sampled through their
+  // slot; the vertex buffer ranges are then read again.
+  bool vfetch_changed = false;
+  for (uint32_t i = 0; i < 3; ++i) {
+    uint32_t vfetch_changed_bits = fast_draw_vfetch_changed_[i];
+    uint32_t vfetch_bit;
+    while (xe::bit_scan_forward(vfetch_changed_bits, &vfetch_bit)) {
+      vfetch_changed_bits &= ~(UINT32_C(1) << vfetch_bit);
+      if ((f.texture_fetch_mask >> ((i * 32 + vfetch_bit) / 3)) & 1) {
+        return false;
+      }
+      vfetch_changed = true;
+    }
+  }
+  const RegisterFile& regs = *register_file_;
+  if (vfetch_changed) {
+    for (uint32_t i = 0; i < f.vfetch_count; ++i) {
+      xenos::xe_gpu_vertex_fetch_t vfetch_constant =
+          regs.GetVertexFetch(f.vfetch_indices[i]);
+      if (vfetch_constant.type != xenos::FetchConstantType::kVertex) {
+        return false;
+      }
+      f.vfetch_addresses[i] =
+          xenos::CpuToGpu(vfetch_constant.address << 2) >> 2;
+      f.vfetch_sizes[i] = vfetch_constant.size;
+    }
   }
 
   // One hold of the global critical region for both the index and the vertex
@@ -3251,13 +3301,405 @@ bool VulkanCommandProcessor::TryFastRepeatDraw(
         index_16bit ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
     if (!deferred_command_buffer_.IsIndexBufferBound(shared_memory_->buffer(),
                                                      0, index_type)) {
-      deferred_command_buffer_.CmdVkBindIndexBuffer(shared_memory_->buffer(),
-                                                    0, index_type);
+      deferred_command_buffer_.CmdVkBindIndexBuffer(shared_memory_->buffer(), 0,
+                                                    index_type);
     }
     deferred_command_buffer_.CmdVkDrawIndexed(
         result.host_draw_vertex_count, 1,
         result.guest_index_base >> (index_16bit ? 1 : 2), 0, 0);
   }
+  return true;
+}
+
+void VulkanCommandProcessor::SaveBatchTextureConstants() {
+  DrawBatch& b = draw_batch_;
+  uint32_t texture_slots_remaining = fast_draw_.texture_fetch_mask;
+  uint32_t texture_slot;
+  while (xe::bit_scan_forward(texture_slots_remaining, &texture_slot)) {
+    texture_slots_remaining &= ~(UINT32_C(1) << texture_slot);
+    b.texture_host_swizzles[texture_slot] =
+        texture_cache_->GetActiveTextureHostSwizzle(texture_slot);
+    b.texture_signs_and_scaling[texture_slot] =
+        uint32_t(texture_cache_->GetActiveTextureSwizzledSigns(texture_slot)) |
+        (uint32_t(texture_cache_->IsActiveTextureResolutionScaled(texture_slot))
+         << 8);
+    b.texture_integer_scale_bits[texture_slot] =
+        texture_cache_->GetActiveIntegerScaleBits(texture_slot);
+  }
+}
+
+bool VulkanCommandProcessor::AreBatchTextureConstantsSame() const {
+  const DrawBatch& b = draw_batch_;
+  uint32_t texture_slots_remaining = fast_draw_.texture_fetch_mask;
+  uint32_t texture_slot;
+  while (xe::bit_scan_forward(texture_slots_remaining, &texture_slot)) {
+    texture_slots_remaining &= ~(UINT32_C(1) << texture_slot);
+    if (b.texture_host_swizzles[texture_slot] !=
+            texture_cache_->GetActiveTextureHostSwizzle(texture_slot) ||
+        b.texture_signs_and_scaling[texture_slot] !=
+            (uint32_t(
+                 texture_cache_->GetActiveTextureSwizzledSigns(texture_slot)) |
+             (uint32_t(
+                  texture_cache_->IsActiveTextureResolutionScaled(texture_slot))
+              << 8)) ||
+        b.texture_integer_scale_bits[texture_slot] !=
+            texture_cache_->GetActiveIntegerScaleBits(texture_slot)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void VulkanCommandProcessor::EndDrawBatch() {
+  if (!draw_batch_.active) {
+    return;
+  }
+  draw_batch_.active = false;
+  // The batch's fetch and pixel float constant buffers are laid out for it.
+  current_constant_buffers_up_to_date_ &=
+      ~((UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatPixel) |
+        (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch));
+}
+
+bool VulkanCommandProcessor::TryBatchDraw(xenos::PrimitiveType prim_type,
+                                          uint32_t index_count,
+                                          IndexBufferInfo* index_buffer_info,
+                                          bool major_mode_explicit) {
+  FastDraw& f = fast_draw_;
+  DrawBatch& b = draw_batch_;
+  // The vertex count may differ - every draw of the batch is its own host
+  // draw.
+  if (pending_round_7e3_alpha_count_ || index_buffer_info || f.indexed ||
+      prim_type != f.prim_type ||
+      major_mode_explicit != f.major_mode_explicit || f.vfetch_count != 1 ||
+      !f.pixel_shader || f.batch_pipeline_state == 2) {
+    return false;
+  }
+  if (!submission_open_ || !frame_open_ ||
+      GetCurrentSubmission() != f.submission ||
+      texture_cache_->texture_became_outdated() ||
+      active_vertex_shader() != f.active_vertex_shader ||
+      active_pixel_shader() != f.active_pixel_shader) {
+    return false;
+  }
+  const PrimitiveProcessor::ProcessingResult& fr =
+      f.primitive_processing_result;
+  if (fr.index_buffer_type !=
+          PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
+      fr.host_vertex_shader_type != Shader::HostVertexShaderType::kVertex ||
+      fr.host_primitive_reset_enabled || !fr.host_draw_vertex_count) {
+    return false;
+  }
+
+  // Constants changed since the previous draw: only the pixel shader's float
+  // constants (copied for every draw) and the address and size of the one
+  // vertex fetch constant may change (the endianness is checked below).
+  const RegisterFile& regs = *register_file_;
+  uint32_t vfetch_index = f.vfetch_indices[0];
+  if (fast_draw_vertex_float_changed_ || fast_draw_bool_loop_changed_) {
+    return false;
+  }
+  // Texture fetch constants may change within a batch only in the base and
+  // mip addresses: another texture of the same format and sampling.
+  uint32_t texture_slots_changed = 0;
+  for (uint32_t i = 0; i < 3; ++i) {
+    uint32_t vfetch_changed_bits = fast_draw_vfetch_changed_[i];
+    uint32_t vfetch_bit;
+    while (xe::bit_scan_forward(vfetch_changed_bits, &vfetch_bit)) {
+      vfetch_changed_bits &= ~(UINT32_C(1) << vfetch_bit);
+      uint32_t changed_vfetch_index = i * 32 + vfetch_bit;
+      if (changed_vfetch_index != vfetch_index &&
+          ((f.texture_fetch_mask >> (changed_vfetch_index / 3)) & 1)) {
+        texture_slots_changed |= UINT32_C(1) << (changed_vfetch_index / 3);
+      }
+    }
+  }
+  if (texture_slots_changed) {
+    if (!b.active) {
+      return false;
+    }
+    uint32_t texture_slots_remaining = texture_slots_changed;
+    uint32_t texture_slot;
+    while (xe::bit_scan_forward(texture_slots_remaining, &texture_slot)) {
+      texture_slots_remaining &= ~(UINT32_C(1) << texture_slot);
+      const uint32_t* fetch =
+          &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + texture_slot * 6];
+      const uint32_t* batch_fetch = &b.fetch_constants[texture_slot * 6];
+      if (fetch[0] != batch_fetch[0] || fetch[2] != batch_fetch[2] ||
+          fetch[3] != batch_fetch[3] || fetch[4] != batch_fetch[4] ||
+          ((fetch[1] ^ batch_fetch[1]) & ((UINT32_C(1) << 12) - 1)) ||
+          ((fetch[5] ^ batch_fetch[5]) & ((UINT32_C(1) << 12) - 1))) {
+        return false;
+      }
+    }
+  }
+  xenos::xe_gpu_vertex_fetch_t vfetch_constant =
+      regs.GetVertexFetch(vfetch_index);
+  if (vfetch_constant.type != xenos::FetchConstantType::kVertex) {
+    return false;
+  }
+  uint32_t vfetch_address = xenos::CpuToGpu(vfetch_constant.address << 2) >> 2;
+  PrimitiveProcessor::ProcessingResult result;
+  if (!primitive_processor_->Process(result) ||
+      result.index_buffer_type !=
+          PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
+      result.host_vertex_shader_type != fr.host_vertex_shader_type ||
+      result.host_primitive_type != fr.host_primitive_type ||
+      result.host_primitive_reset_enabled || !result.host_draw_vertex_count ||
+      result.tessellation_mode != fr.tessellation_mode) {
+    return false;
+  }
+  uint32_t vertex_count = result.host_draw_vertex_count;
+
+  if (b.active && (b.submission != GetCurrentSubmission() ||
+                   current_guest_graphics_pipeline_ != b.pipeline)) {
+    EndDrawBatch();
+  }
+  // The vertex data is addressed from the batch's first draw: this draw's
+  // first vertex is the distance from there in whole vertices.
+  uint32_t first_vertex = 0;
+  if (b.active) {
+    if (b.instance_count >= b.capacity || vfetch_address < b.base_address ||
+        (vfetch_address - b.base_address) % b.stride ||
+        (vfetch_address - b.base_address) / b.stride + vertex_count >
+            b.window_vertices ||
+        vertex_count * b.stride > vfetch_constant.size ||
+        vfetch_constant.endian != b.vfetch_endian ||
+        regs[XE_GPU_REG_VGT_INDX_OFFSET] != b.vertex_base_index) {
+      return false;
+    }
+    first_vertex = (vfetch_address - b.base_address) / b.stride;
+  } else {
+    uint32_t stride = 0;
+    for (const Shader::VertexBinding& vertex_binding :
+         f.vertex_shader->vertex_bindings()) {
+      if (vertex_binding.fetch_constant == vfetch_index) {
+        stride = vertex_binding.stride_words;
+        break;
+      }
+    }
+    // The batch reads through a wider window than each draw's own buffer, so
+    // no draw may reach past its buffer (where the Xenos reads zeros).
+    if (!stride || vertex_count * stride > vfetch_constant.size) {
+      return false;
+    }
+    // The fetch window of the batch, in dwords from its first draw's vertex
+    // data - the size field has 24 bits, and the window must stay within the
+    // 512 MB of physical memory.
+    uint32_t window =
+        std::min((UINT32_C(1) << 24) - 1,
+                 (UINT32_C(1) << (29 - 2)) -
+                     std::min(vfetch_address, (UINT32_C(1) << (29 - 2))));
+    uint32_t window_vertices = window / stride;
+    if (window_vertices < vertex_count) {
+      return false;
+    }
+
+    const Shader::ConstantRegisterMap& pixel_constant_map =
+        f.pixel_shader->constant_register_map();
+    if (pixel_constant_map.float_dynamic_addressing) {
+      f.batch_pipeline_state = 2;
+      return false;
+    }
+    uint32_t pixel_float_constant_count = pixel_constant_map.float_count;
+
+    // The pipeline with the batched shader variants.
+    const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+    const ui::vulkan::VulkanDevice::Properties& device_properties =
+        vulkan_device->properties();
+    if (f.batch_pipeline_state == 0) {
+      f.batch_pipeline_state = 2;
+      if (device_properties.maxVertexOutputComponents <
+              4 * (SpirvShaderTranslator::kInstanceIndexLocation + 1) ||
+          device_properties.maxFragmentInputComponents <
+              4 * (SpirvShaderTranslator::kInstanceIndexLocation + 1)) {
+        return false;
+      }
+      SpirvShaderTranslator::Modification vertex_modification(
+          f.vertex_shader_modification);
+      vertex_modification.vertex.output_instance_index = 1;
+      SpirvShaderTranslator::Modification pixel_modification(
+          f.pixel_shader_modification);
+      pixel_modification.pixel.float_constants_per_instance = 1;
+      auto* vertex_translation = static_cast<VulkanShader::VulkanTranslation*>(
+          f.vertex_shader->GetOrCreateTranslation(vertex_modification.value));
+      auto* pixel_translation = static_cast<VulkanShader::VulkanTranslation*>(
+          f.pixel_shader->GetOrCreateTranslation(pixel_modification.value));
+      if (!pipeline_cache_->EnsureShadersTranslated(vertex_translation,
+                                                    pixel_translation)) {
+        return false;
+      }
+      VulkanPipelineCache::Pipeline* batch_pipeline;
+      if (!pipeline_cache_->ConfigurePipeline(
+              vertex_translation, pixel_translation, fr,
+              f.normalized_depth_control, f.normalized_color_mask,
+              f.render_pass_key, &batch_pipeline)) {
+        return false;
+      }
+      f.batch_pipeline = batch_pipeline;
+      f.batch_pipeline_state = 1;
+    }
+    VkPipeline pipeline =
+        f.batch_pipeline->pipeline.load(std::memory_order_acquire);
+    if (pipeline == VK_NULL_HANDLE ||
+        f.batch_pipeline->is_placeholder.load(std::memory_order_acquire) ||
+        f.batch_pipeline->pipeline_layout !=
+            current_guest_graphics_pipeline_layout_) {
+      // Compiled in the background, or not compatible.
+      return false;
+    }
+
+    uint32_t capacity =
+        SpirvShaderTranslator::kFloatConstantsPerInstanceMaxVectors;
+    if (pixel_float_constant_count) {
+      capacity = std::min(
+          SpirvShaderTranslator::kFloatConstantsPerInstanceMaxVectors /
+              pixel_float_constant_count,
+          device_properties.maxUniformBufferRange /
+              uint32_t(sizeof(float) * 4 * pixel_float_constant_count));
+    }
+    if (capacity < 2) {
+      f.batch_pipeline_state = 2;
+      return false;
+    }
+
+    size_t uniform_buffer_alignment =
+        size_t(device_properties.minUniformBufferOffsetAlignment);
+    // The fetch constants, with the size of the moving vertex fetch constant
+    // covering the whole batch.
+    constexpr size_t kFetchConstantsSize =
+        sizeof(uint32_t) * xenos::kTextureFetchConstantCount * 6;
+    VkDescriptorBufferInfo& fetch_buffer_info = current_constant_buffer_infos_
+        [SpirvShaderTranslator::kConstantBufferFetch];
+    uint8_t* fetch_mapping = uniform_buffer_pool_->Request(
+        frame_current_, kFetchConstantsSize, uniform_buffer_alignment,
+        fetch_buffer_info.buffer, fetch_buffer_info.offset);
+    if (!fetch_mapping) {
+      return false;
+    }
+    fetch_buffer_info.range = VkDeviceSize(kFetchConstantsSize);
+    std::memcpy(fetch_mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0],
+                kFetchConstantsSize);
+    reinterpret_cast<uint32_t*>(fetch_mapping)[vfetch_index * 2 + 1] =
+        (vfetch_constant.dword_1 & ~(((UINT32_C(1) << 24) - 1) << 2)) |
+        ((window_vertices * stride) << 2);
+    uint8_t* pixel_float_constants = nullptr;
+    if (pixel_float_constant_count) {
+      VkDescriptorBufferInfo& pixel_float_buffer_info =
+          current_constant_buffer_infos_
+              [SpirvShaderTranslator::kConstantBufferFloatPixel];
+      size_t pixel_float_constants_size =
+          sizeof(float) * 4 * pixel_float_constant_count * capacity;
+      pixel_float_constants = uniform_buffer_pool_->Request(
+          frame_current_, pixel_float_constants_size, uniform_buffer_alignment,
+          pixel_float_buffer_info.buffer, pixel_float_buffer_info.offset);
+      if (!pixel_float_constants) {
+        current_constant_buffers_up_to_date_ &=
+            ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch);
+        return false;
+      }
+      pixel_float_buffer_info.range = VkDeviceSize(pixel_float_constants_size);
+    }
+    current_constant_buffers_up_to_date_ |=
+        (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch) |
+        (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatPixel);
+    current_graphics_descriptor_set_values_up_to_date_ &=
+        ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants);
+
+    b.active = true;
+    b.submission = GetCurrentSubmission();
+    b.pipeline = pipeline;
+    b.instance_count = 0;
+    b.capacity = capacity;
+    b.vfetch_index = vfetch_index;
+    b.base_address = vfetch_address;
+    b.stride = stride;
+    b.window_vertices = window_vertices;
+    b.vfetch_endian = vfetch_constant.endian;
+    b.vertex_base_index = regs[XE_GPU_REG_VGT_INDX_OFFSET];
+    b.pixel_float_constant_count = pixel_float_constant_count;
+    b.pixel_float_constants = pixel_float_constants;
+    std::memcpy(b.fetch_constants, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0],
+                sizeof(b.fetch_constants));
+    SaveBatchTextureConstants();
+
+    if (current_guest_graphics_pipeline_ != pipeline) {
+      deferred_command_buffer_.CmdVkBindPipeline(
+          VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+      current_guest_graphics_pipeline_ = pipeline;
+      current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+    }
+    if (!UpdateBindings(f.vertex_shader, f.pixel_shader)) {
+      EndDrawBatch();
+      return false;
+    }
+  }
+
+  // Another texture: bind it, keeping the batch's constant buffers.
+  if (texture_slots_changed) {
+    uint32_t texture_slots_remaining = texture_slots_changed;
+    uint32_t texture_slot;
+    while (xe::bit_scan_forward(texture_slots_remaining, &texture_slot)) {
+      texture_slots_remaining &= ~(UINT32_C(1) << texture_slot);
+      b.fetch_constants[texture_slot * 6 + 1] =
+          regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + texture_slot * 6 + 1];
+      b.fetch_constants[texture_slot * 6 + 5] =
+          regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + texture_slot * 6 + 5];
+    }
+    texture_cache_->RequestTextures(f.texture_fetch_mask);
+    if (!AreBatchTextureConstantsSame()) {
+      EndDrawBatch();
+      return false;
+    }
+    current_constant_buffers_up_to_date_ |=
+        (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch) |
+        (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatPixel);
+    if (!UpdateBindings(f.vertex_shader, f.pixel_shader)) {
+      EndDrawBatch();
+      return false;
+    }
+  }
+
+  // This draw's pixel shader float constants, packed as for a single draw.
+  if (b.pixel_float_constant_count) {
+    uint8_t* constants =
+        b.pixel_float_constants +
+        sizeof(float) * 4 * b.pixel_float_constant_count * b.instance_count;
+    for (uint32_t i = 0; i < 4; ++i) {
+      uint64_t float_constant_map_entry = current_float_constant_map_pixel_[i];
+      uint32_t float_constant_index;
+      while (xe::bit_scan_forward(float_constant_map_entry,
+                                  &float_constant_index)) {
+        float_constant_map_entry &= ~(UINT64_C(1) << float_constant_index);
+        std::memcpy(constants,
+                    &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (i << 8) +
+                          (float_constant_index << 2)],
+                    sizeof(float) * 4);
+        constants += sizeof(float) * 4;
+      }
+    }
+  }
+
+  // This draw's vertex data.
+  {
+    auto shared_memory_request_range_hoisted =
+        global_critical_region::Acquire();
+    if (!shared_memory_->RequestRange(vfetch_address << 2,
+                                      vfetch_constant.size << 2)) {
+      return false;
+    }
+  }
+  f.vfetch_addresses[0] = vfetch_address;
+  f.vfetch_sizes[0] = vfetch_constant.size;
+  shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+
+  SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+      render_target_cache_->last_update_render_pass(),
+      render_target_cache_->last_update_framebuffer());
+  PushVertexBaseIndex();
+  deferred_command_buffer_.CmdVkDraw(vertex_count, 1, first_vertex,
+                                     b.instance_count);
+  ++b.instance_count;
   return true;
 }
 
@@ -3281,12 +3723,21 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
 
   bool fast_draw_possible = fast_draw_valid_;
   fast_draw_valid_ = false;
-  if (fast_draw_possible && cvars::fast_repeat_draws &&
-      TryFastRepeatDraw(prim_type, index_count, index_buffer_info,
-                        major_mode_explicit)) {
-    fast_draw_valid_ = true;
-    return true;
+  if (fast_draw_possible && cvars::fast_repeat_draws) {
+    if (cvars::batch_repeat_draws &&
+        TryBatchDraw(prim_type, index_count, index_buffer_info,
+                     major_mode_explicit)) {
+      SetFastDrawValid();
+      return true;
+    }
+    EndDrawBatch();
+    if (TryFastRepeatDraw(prim_type, index_count, index_buffer_info,
+                          major_mode_explicit)) {
+      SetFastDrawValid();
+      return true;
+    }
   }
+  EndDrawBatch();
 
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
@@ -3830,6 +4281,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   const Shader::ConstantRegisterMap& constant_map_vertex =
       vertex_shader->constant_register_map();
   {
+    uint8_t vfetch_indices[96];
     uint32_t vfetch_addresses[96];
     uint32_t vfetch_sizes[96];
     uint32_t vfetch_current_queued = 0;
@@ -3883,6 +4335,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
             return false;
         }
         // Mask to physical like the shader - the guest may use a mirror window.
+        vfetch_indices[vfetch_current_queued] = uint8_t(vfetch_index);
         vfetch_addresses[vfetch_current_queued] =
             xenos::CpuToGpu(vfetch_constant.address << 2) >> 2;
         vfetch_sizes[vfetch_current_queued++] = vfetch_constant.size;
@@ -3890,6 +4343,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
     }
 
     fast_draw_.vfetch_count = vfetch_current_queued;
+    std::memcpy(fast_draw_.vfetch_indices, vfetch_indices,
+                sizeof(uint8_t) * vfetch_current_queued);
     std::memcpy(fast_draw_.vfetch_addresses, vfetch_addresses,
                 sizeof(uint32_t) * vfetch_current_queued);
     std::memcpy(fast_draw_.vfetch_sizes, vfetch_sizes,
@@ -4148,7 +4603,18 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
     fast_draw_.pixel_shader = pixel_shader;
     fast_draw_.pipeline = pipeline;
     fast_draw_.primitive_processing_result = primitive_processing_result;
-    fast_draw_valid_ = true;
+    fast_draw_.vertex_shader_modification = vertex_shader_modification.value;
+    fast_draw_.pixel_shader_modification = pixel_shader_modification.value;
+    fast_draw_.normalized_depth_control = normalized_depth_control;
+    fast_draw_.normalized_color_mask = normalized_color_mask;
+    fast_draw_.render_pass_key =
+        render_target_cache_->last_update_render_pass_key();
+    fast_draw_.batch_pipeline_state = 0;
+    fast_draw_.batch_pipeline = nullptr;
+    fast_draw_.texture_fetch_mask =
+        vertex_shader->GetUsedTextureMaskAfterTranslation() |
+        (pixel_shader ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
+    SetFastDrawValid();
   }
 
   return true;

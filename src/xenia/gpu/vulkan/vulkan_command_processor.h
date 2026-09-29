@@ -1026,11 +1026,71 @@ class VulkanCommandProcessor final : public CommandProcessor {
     VulkanShader* pixel_shader;
     VulkanPipelineCache::Pipeline* pipeline;
     PrimitiveProcessor::ProcessingResult primitive_processing_result;
+    // Fetch constant slots the shaders sample textures from.
+    uint32_t texture_fetch_mask;
     uint32_t vfetch_count;
+    uint8_t vfetch_indices[96];
     uint32_t vfetch_addresses[96];
     uint32_t vfetch_sizes[96];
+    // For the batched variant of the draw (see DrawBatch).
+    uint64_t vertex_shader_modification;
+    uint64_t pixel_shader_modification;
+    reg::RB_DEPTHCONTROL normalized_depth_control;
+    uint32_t normalized_color_mask;
+    VulkanRenderTargetCache::RenderPassKey render_pass_key;
+    // 0 - not looked up yet, 1 - batch_pipeline is set, 2 - can't be batched.
+    uint8_t batch_pipeline_state;
+    VulkanPipelineCache::Pipeline* batch_pipeline;
   };
   FastDraw fast_draw_;
+
+  // A run of draws that repeat the remembered one with the same state apart
+  // from the vertex count, the pixel shader float constants and the address
+  // of the one vertex fetch constant, at or after that of the run's first
+  // draw (Blue Dragon draws thousands of small water quads like this). The run
+  // is drawn with a variant of the pipeline whose pixel shader takes its float
+  // constants from an array indexed by the instance, and every draw of the run
+  // is recorded as one host draw of one instance, with the instance index
+  // selecting its constants and the first vertex selecting its vertex data, so
+  // no constants or descriptors are updated between them.
+  struct DrawBatch {
+    bool active = false;
+    uint64_t submission;
+    VkPipeline pipeline;
+    uint32_t instance_count;
+    uint32_t capacity;
+    uint32_t vfetch_index;
+    // Of the first draw's vertex data, in dwords.
+    uint32_t base_address;
+    // In dwords.
+    uint32_t stride;
+    // Vertices from base_address the batch's fetch constant covers.
+    uint32_t window_vertices;
+    xenos::Endian vfetch_endian;
+    uint32_t vertex_base_index;
+    uint32_t pixel_float_constant_count;
+    uint8_t* pixel_float_constants;
+    // The texture fetch constants, which may change only in the base address
+    // (another texture of the same format and sampling) within the batch.
+    uint32_t fetch_constants[xenos::kTextureFetchConstantCount * 6];
+    // What the texture-dependent system constants were made from.
+    uint32_t texture_host_swizzles[xenos::kTextureFetchConstantCount];
+    uint32_t texture_signs_and_scaling[xenos::kTextureFetchConstantCount];
+    uint32_t texture_integer_scale_bits[xenos::kTextureFetchConstantCount];
+  };
+  // Whether the active textures give the texture-dependent system constants
+  // the batch was started with.
+  bool AreBatchTextureConstantsSame() const;
+  void SaveBatchTextureConstants();
+  DrawBatch draw_batch_;
+  // Appends the draw to the current batch or starts one; false if it can't
+  // be batched.
+  bool TryBatchDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
+                    IndexBufferInfo* index_buffer_info,
+                    bool major_mode_explicit);
+  // Before anything else draws: the batch's constant buffers must not be
+  // reused by other draws.
+  void EndDrawBatch();
 
   // What was last written into each stage's texture descriptor set (vertex,
   // pixel), to reuse the set while the draws keep the same bindings.

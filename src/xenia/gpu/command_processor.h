@@ -533,10 +533,26 @@ class CommandProcessor {
 
  protected:
   // Set by a backend after a draw it can repeat cheaply; cleared by any
-  // register write other than VGT_INDX_OFFSET and by any packet other than
-  // draws and constant writes, so a following draw that only moved the index
-  // offset can skip the full state setup.
+  // register write other than VGT_INDX_OFFSET and the shader constants and by
+  // any packet other than draws and constant writes, so a following draw that
+  // only moved the index offset or changed constants can skip the full state
+  // setup.
   bool fast_draw_valid_ = false;
+  // Shader constant changes since that draw, noted by the backend when a
+  // write changes a value: vertex fetch constants (bit per vertex fetch
+  // constant, 3 per fetch constant slot), used vertex shader float constants,
+  // bool and loop constants. Pixel shader float constants aren't noted.
+  uint32_t fast_draw_vfetch_changed_[3] = {};
+  bool fast_draw_vertex_float_changed_ = false;
+  bool fast_draw_bool_loop_changed_ = false;
+  void SetFastDrawValid() {
+    fast_draw_valid_ = true;
+    fast_draw_vfetch_changed_[0] = 0;
+    fast_draw_vfetch_changed_[1] = 0;
+    fast_draw_vfetch_changed_[2] = 0;
+    fast_draw_vertex_float_changed_ = false;
+    fast_draw_bool_loop_changed_ = false;
+  }
 
   // Scale area for the segment being closed.
   uint32_t GetZPDScaleArea() const {
