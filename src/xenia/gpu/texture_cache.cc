@@ -307,6 +307,40 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled,
   shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
 }
 
+std::vector<std::pair<uint32_t, uint32_t>>
+TextureCache::GetScaledResolvedRanges() {
+  std::vector<std::pair<uint32_t, uint32_t>> ranges;
+  if (!IsDrawResolutionScaled()) {
+    return ranges;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  uint32_t run_start = UINT32_MAX;
+  uint32_t page_count = SharedMemory::kBufferSize >> 12;
+  for (uint32_t page = 0; page < page_count; ++page) {
+    if (!(page & 31) && !(scaled_resolve_pages_l2_[page >> 11] &
+                          (UINT64_C(1) << ((page >> 5) & 63)))) {
+      if (run_start != UINT32_MAX) {
+        ranges.emplace_back(run_start << 12, (page - run_start) << 12);
+        run_start = UINT32_MAX;
+      }
+      page += 31;
+      continue;
+    }
+    bool scaled =
+        (scaled_resolve_pages_[page >> 5] & (UINT32_C(1) << (page & 31))) != 0;
+    if (scaled && run_start == UINT32_MAX) {
+      run_start = page;
+    } else if (!scaled && run_start != UINT32_MAX) {
+      ranges.emplace_back(run_start << 12, (page - run_start) << 12);
+      run_start = UINT32_MAX;
+    }
+  }
+  if (run_start != UINT32_MAX) {
+    ranges.emplace_back(run_start << 12, (page_count - run_start) << 12);
+  }
+  return ranges;
+}
+
 uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle,
                                           uint32_t host_format_swizzle) {
   uint32_t host_swizzle = 0;

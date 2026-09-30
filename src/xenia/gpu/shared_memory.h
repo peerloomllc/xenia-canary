@@ -114,6 +114,9 @@ class SharedMemory {
   // the pages they touch, the CPU data is properly loaded to the unmodified
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
+  // Runs of pages that hold data written on the GPU, as (start, length) in
+  // bytes, ascending. For save states.
+  std::vector<std::pair<uint32_t, uint32_t>> GetGpuWrittenRanges();
 
  protected:
   SharedMemory(Memory& memory);

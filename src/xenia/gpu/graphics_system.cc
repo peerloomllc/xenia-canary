@@ -497,7 +497,12 @@ bool GraphicsSystem::Restore(ByteStream* stream) {
   bool has_edram_snapshot =
       kernel_state_ && kernel_state_->emulator() &&
       kernel_state_->emulator()->save_state_version() >= 8;
-  if (!command_processor_->Restore(stream, has_edram_snapshot)) {
+  // Format 10 adds the memory only the GPU holds.
+  bool has_gpu_memory_snapshot =
+      kernel_state_ && kernel_state_->emulator() &&
+      kernel_state_->emulator()->save_state_version() >= 10;
+  if (!command_processor_->Restore(stream, has_edram_snapshot,
+                                   has_gpu_memory_snapshot)) {
     return false;
   }
   // Guest memory and the register file were rewritten behind the host GPU
@@ -513,6 +518,7 @@ bool GraphicsSystem::Restore(ByteStream* stream) {
     cp->TracePlaybackWroteMemory(0, 0x20000000);
     cp->ClearCaches();
     cp->RestoreSavedEdramSnapshot();
+    cp->RestoreSavedGpuMemorySnapshot();
   });
   return true;
 }

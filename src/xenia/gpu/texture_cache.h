@@ -110,6 +110,9 @@ class TextureCache {
   // scaled state of the range.
   void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled,
                            bool resolution_scaled);
+  // Runs of 4 KB pages whose data is in the scaled resolve address space, as
+  // (start, length) in unscaled bytes, ascending. For save states.
+  std::vector<std::pair<uint32_t, uint32_t>> GetScaledResolvedRanges();
   // Ensures the memory backing the range in the scaled resolve address space is
   // allocated and returns whether it is.
   virtual bool EnsureScaledResolveMemoryCommitted(
