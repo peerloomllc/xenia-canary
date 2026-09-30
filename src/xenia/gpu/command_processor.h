@@ -219,8 +219,33 @@ class CommandProcessor {
   // Uploads the snapshot Restore() read, if any; worker thread.
   void RestoreSavedEdramSnapshot();
 
+  // Save states (format 10): memory that only the GPU holds. Resolves and
+  // memexport write the host GPU's copy of guest memory (or, with a
+  // resolution scale, the scaled resolve buffers) and not guest memory
+  // unless readback_resolve is on, so a restore that reloads guest memory
+  // loses them. `scaled` ranges carry length * scale_x * scale_y bytes.
+  struct GpuMemorySnapshotRange {
+    uint32_t start = 0;
+    uint32_t length = 0;
+    bool scaled = false;
+    std::vector<uint8_t> data;
+  };
+  virtual bool CaptureGpuMemorySnapshot(
+      std::vector<GpuMemorySnapshotRange>& out) {
+    return false;
+  }
+  virtual bool RestoreGpuMemorySnapshot(
+      const std::vector<GpuMemorySnapshotRange>& ranges, uint32_t scale_x,
+      uint32_t scale_y) {
+    return false;
+  }
+  // Uploads the ranges Restore() read, if any; worker thread, after the
+  // caches were cleared.
+  void RestoreSavedGpuMemorySnapshot();
+
   bool Save(ByteStream* stream);
-  bool Restore(ByteStream* stream, bool has_edram_snapshot);
+  bool Restore(ByteStream* stream, bool has_edram_snapshot,
+               bool has_gpu_memory_snapshot);
 
  protected:
   struct IndexBufferInfo {
@@ -604,6 +629,7 @@ class CommandProcessor {
   std::vector<uint8_t> edram_snapshot_;
   uint32_t edram_snapshot_scale_x_ = 1;
   uint32_t edram_snapshot_scale_y_ = 1;
+  std::vector<GpuMemorySnapshotRange> gpu_memory_snapshot_;
 
   // By default (such as for tools), post-processing is disabled.
   // "Desired" is for the external thread managing the post-processing effect.

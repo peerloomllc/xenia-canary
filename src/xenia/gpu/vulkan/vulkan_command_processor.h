@@ -155,6 +155,11 @@ class VulkanCommandProcessor final : public CommandProcessor {
   bool CaptureEdramSnapshot(std::vector<uint8_t>& out) override;
   bool RestoreEdramSnapshotSized(const void* data, size_t size,
                                  uint32_t scale_x, uint32_t scale_y) override;
+  bool CaptureGpuMemorySnapshot(
+      std::vector<GpuMemorySnapshotRange>& out) override;
+  bool RestoreGpuMemorySnapshot(
+      const std::vector<GpuMemorySnapshotRange>& ranges, uint32_t scale_x,
+      uint32_t scale_y) override;
 
   void PollCompletedSubmission() override;
 

@@ -243,6 +243,363 @@ bool VulkanCommandProcessor::RestoreEdramSnapshotSized(const void* data,
   return render_target_cache_->RestoreEdramSnapshot(data, size);
 }
 
+namespace {
+// Splits [start, start + length) into page-aligned pieces of at most
+// max_piece bytes.
+void AppendGpuMemoryPieces(
+    uint32_t start, uint32_t length, bool scaled, uint32_t max_piece,
+    std::vector<CommandProcessor::GpuMemorySnapshotRange>& out) {
+  while (length) {
+    uint32_t piece = std::min(length, max_piece);
+    CommandProcessor::GpuMemorySnapshotRange& range = out.emplace_back();
+    range.start = start;
+    range.length = piece;
+    range.scaled = scaled;
+    start += piece;
+    length -= piece;
+  }
+}
+}  // namespace
+
+bool VulkanCommandProcessor::CaptureGpuMemorySnapshot(
+    std::vector<GpuMemorySnapshotRange>& out) {
+  out.clear();
+  if (device_lost_) {
+    return false;
+  }
+  const uint32_t scale_area = texture_cache_->draw_resolution_scale_x() *
+                              texture_cache_->draw_resolution_scale_y();
+  // Pieces of at most 16 MB of host data each, so one never outgrows a batch.
+  const uint32_t max_piece_unscaled = std::max(
+      UINT32_C(4096), ((UINT32_C(16) << 20) / scale_area) & ~UINT32_C(4095));
+  std::vector<std::pair<uint32_t, uint32_t>> scaled_ranges =
+      texture_cache_->GetScaledResolvedRanges();
+  std::vector<std::pair<uint32_t, uint32_t>> written_ranges =
+      shared_memory_->GetGpuWrittenRanges();
+  // A scaled page's data is in the scaled resolve buffers; its shared memory
+  // copy is not what the guest would read.
+  std::vector<GpuMemorySnapshotRange> ranges;
+  size_t scaled_index = 0;
+  for (const std::pair<uint32_t, uint32_t>& written : written_ranges) {
+    uint64_t current = written.first;
+    uint64_t end = uint64_t(written.first) + written.second;
+    while (scaled_index < scaled_ranges.size() &&
+           uint64_t(scaled_ranges[scaled_index].first) +
+                   scaled_ranges[scaled_index].second <=
+               current) {
+      ++scaled_index;
+    }
+    for (size_t i = scaled_index; current < end; ++i) {
+      if (i < scaled_ranges.size() && scaled_ranges[i].first < end) {
+        if (scaled_ranges[i].first > current) {
+          AppendGpuMemoryPieces(uint32_t(current),
+                                uint32_t(scaled_ranges[i].first - current),
+                                false, UINT32_C(16) << 20, ranges);
+        }
+        current = std::max(current, uint64_t(scaled_ranges[i].first) +
+                                        scaled_ranges[i].second);
+      } else {
+        AppendGpuMemoryPieces(uint32_t(current), uint32_t(end - current), false,
+                              UINT32_C(16) << 20, ranges);
+        current = end;
+      }
+    }
+  }
+  for (const std::pair<uint32_t, uint32_t>& scaled : scaled_ranges) {
+    AppendGpuMemoryPieces(scaled.first, scaled.second, true, max_piece_unscaled,
+                          ranges);
+  }
+  if (ranges.empty()) {
+    return true;
+  }
+
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  constexpr VkDeviceSize kBatchBytes = VkDeviceSize(64) << 20;
+  struct PendingCopy {
+    size_t range_index;
+    VkBuffer source;
+    VkDeviceSize source_offset;
+    VkDeviceSize readback_offset;
+    VkDeviceSize size;
+  };
+  std::vector<PendingCopy> batch;
+  VkDeviceSize batch_bytes = 0;
+  auto flush = [&]() -> bool {
+    if (batch.empty()) {
+      return true;
+    }
+    VkBuffer readback_buffer = RequestReadbackBuffer(uint32_t(batch_bytes));
+    if (readback_buffer == VK_NULL_HANDLE) {
+      return false;
+    }
+    // Resolves write the buffers in compute shaders, memexport in draws.
+    VkMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    deferred_command_buffer_.CmdVkPipelineBarrier(
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+        1, &barrier, 0, nullptr, 0, nullptr);
+    for (const PendingCopy& copy : batch) {
+      VkBufferCopy region = {};
+      region.srcOffset = copy.source_offset;
+      region.dstOffset = copy.readback_offset;
+      region.size = copy.size;
+      deferred_command_buffer_.CmdVkCopyBuffer(copy.source, readback_buffer, 1,
+                                               &region);
+    }
+    if (!AwaitAllQueueOperationsCompletion()) {
+      XELOGE("GPU memory snapshot: the queue did not complete");
+      return false;
+    }
+    void* mapped_data = nullptr;
+    if (dfn.vkMapMemory(device, memexport_readback_buffer_memory_, 0,
+                        batch_bytes, 0, &mapped_data) != VK_SUCCESS ||
+        !mapped_data) {
+      XELOGE("GPU memory snapshot: could not map the readback buffer");
+      return false;
+    }
+    for (const PendingCopy& copy : batch) {
+      const uint8_t* source =
+          static_cast<const uint8_t*>(mapped_data) + copy.readback_offset;
+      ranges[copy.range_index].data.assign(source, source + copy.size);
+    }
+    dfn.vkUnmapMemory(device, memexport_readback_buffer_memory_);
+    batch.clear();
+    batch_bytes = 0;
+    return BeginSubmission(true);
+  };
+
+  if (!BeginSubmission(true)) {
+    return false;
+  }
+  EndRenderPass();
+  shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+  size_t range_count = ranges.size();
+  for (size_t i = 0; i < range_count; ++i) {
+    GpuMemorySnapshotRange& range = ranges[i];
+    VkBuffer source;
+    VkDeviceSize source_offset;
+    VkDeviceSize size;
+    if (range.scaled) {
+      if (!texture_cache_->MakeScaledResolveRangeCurrent(range.start,
+                                                         range.length)) {
+        if (range.length > 4096) {
+          // Spans two scaled resolve buffers: one page at a time.
+          uint32_t start = range.start, length = range.length;
+          range.length = 0;
+          AppendGpuMemoryPieces(start, length, true, 4096, ranges);
+          range_count = ranges.size();
+        }
+        continue;
+      }
+      source = texture_cache_->GetCurrentScaledResolveBuffer();
+      source_offset = VkDeviceSize(range.start) * scale_area -
+                      texture_cache_->GetCurrentScaledResolveBufferBaseOffset();
+      size = VkDeviceSize(range.length) * scale_area;
+    } else {
+      source = shared_memory_->buffer();
+      source_offset = range.start;
+      size = range.length;
+    }
+    if (source == VK_NULL_HANDLE) {
+      range.length = 0;
+      continue;
+    }
+    if (batch_bytes + size > kBatchBytes && !flush()) {
+      out.clear();
+      return false;
+    }
+    batch.push_back({i, source, source_offset, batch_bytes, size});
+    batch_bytes += size;
+  }
+  if (!flush()) {
+    out.clear();
+    return false;
+  }
+  uint64_t total_bytes = 0;
+  for (GpuMemorySnapshotRange& range : ranges) {
+    if (range.length && !range.data.empty()) {
+      total_bytes += range.data.size();
+      out.push_back(std::move(range));
+    }
+  }
+  XELOGI("GPU memory snapshot: {} bytes in {} ranges ({} scaled)", total_bytes,
+         out.size(),
+         std::count_if(
+             out.begin(), out.end(),
+             [](const GpuMemorySnapshotRange& range) { return range.scaled; }));
+  return true;
+}
+
+bool VulkanCommandProcessor::RestoreGpuMemorySnapshot(
+    const std::vector<GpuMemorySnapshotRange>& ranges, uint32_t scale_x,
+    uint32_t scale_y) {
+  if (device_lost_) {
+    return false;
+  }
+  const uint32_t scale_area = texture_cache_->draw_resolution_scale_x() *
+                              texture_cache_->draw_resolution_scale_y();
+  bool scale_matches = scale_x == texture_cache_->draw_resolution_scale_x() &&
+                       scale_y == texture_cache_->draw_resolution_scale_y();
+  VkDeviceSize total_bytes = 0;
+  for (const GpuMemorySnapshotRange& range : ranges) {
+    VkDeviceSize expected =
+        VkDeviceSize(range.length) * (range.scaled ? scale_area : 1);
+    if (range.scaled && !scale_matches) {
+      continue;
+    }
+    if (range.data.size() != expected ||
+        uint64_t(range.start) + range.length > SharedMemory::kBufferSize) {
+      XELOGE("GPU memory snapshot: range {:08X}+{:X} holds {} bytes",
+             range.start, range.length, range.data.size());
+      return false;
+    }
+    total_bytes += expected;
+  }
+  if (!total_bytes) {
+    return true;
+  }
+  if (!scale_matches) {
+    XELOGW(
+        "GPU memory snapshot: saved at {}x{} resolution scale, running at "
+        "{}x{}; scaled resolve data not restored",
+        scale_x, scale_y, texture_cache_->draw_resolution_scale_x(),
+        texture_cache_->draw_resolution_scale_y());
+  }
+
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  VkBuffer upload_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory upload_memory = VK_NULL_HANDLE;
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, total_bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+          ui::vulkan::util::MemoryPurpose::kUpload, upload_buffer,
+          upload_memory)) {
+    XELOGE("GPU memory snapshot: could not create the {} byte upload buffer",
+           total_bytes);
+    return false;
+  }
+  void* mapping = nullptr;
+  if (dfn.vkMapMemory(device, upload_memory, 0, total_bytes, 0, &mapping) !=
+          VK_SUCCESS ||
+      !mapping) {
+    XELOGE("GPU memory snapshot: could not map the upload buffer");
+    dfn.vkDestroyBuffer(device, upload_buffer, nullptr);
+    dfn.vkFreeMemory(device, upload_memory, nullptr);
+    return false;
+  }
+
+  AwaitAllQueueOperationsCompletion();
+  bool ok = BeginSubmission(true);
+  if (ok) {
+    EndRenderPass();
+    // Shared memory pages not yet valid would be uploaded from guest memory
+    // over the copies; request them first.
+    for (const GpuMemorySnapshotRange& range : ranges) {
+      if (!range.scaled &&
+          !shared_memory_->RequestRange(range.start, range.length)) {
+        ok = false;
+        break;
+      }
+    }
+  }
+  std::vector<bool> copied(ranges.size(), false);
+  if (ok) {
+    shared_memory_->Use(VulkanSharedMemory::Usage::kTransferDestination);
+    VkMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask =
+        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    deferred_command_buffer_.CmdVkPipelineBarrier(
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+        1, &barrier, 0, nullptr, 0, nullptr);
+    VkDeviceSize upload_offset = 0;
+    for (size_t i = 0; i < ranges.size(); ++i) {
+      const GpuMemorySnapshotRange& range = ranges[i];
+      if (range.scaled && !scale_matches) {
+        continue;
+      }
+      std::memcpy(static_cast<uint8_t*>(mapping) + upload_offset,
+                  range.data.data(), range.data.size());
+      if (range.scaled) {
+        // One copy if the range lies in one scaled resolve buffer, otherwise
+        // one per page.
+        uint32_t step = texture_cache_->MakeScaledResolveRangeCurrent(
+                            range.start, range.length)
+                            ? range.length
+                            : 4096;
+        copied[i] = true;
+        for (uint32_t offset = 0; offset < range.length; offset += step) {
+          uint32_t length = std::min(step, range.length - offset);
+          VkBuffer target = VK_NULL_HANDLE;
+          if (texture_cache_->MakeScaledResolveRangeCurrent(
+                  range.start + offset, length)) {
+            target = texture_cache_->GetCurrentScaledResolveBuffer();
+          }
+          if (target == VK_NULL_HANDLE) {
+            copied[i] = false;
+            break;
+          }
+          VkBufferCopy region = {};
+          region.srcOffset = upload_offset + VkDeviceSize(offset) * scale_area;
+          region.dstOffset =
+              VkDeviceSize(range.start + offset) * scale_area -
+              texture_cache_->GetCurrentScaledResolveBufferBaseOffset();
+          region.size = VkDeviceSize(length) * scale_area;
+          deferred_command_buffer_.CmdVkCopyBuffer(upload_buffer, target, 1,
+                                                   &region);
+        }
+      } else if (shared_memory_->buffer() != VK_NULL_HANDLE) {
+        VkBufferCopy region = {};
+        region.srcOffset = upload_offset;
+        region.dstOffset = range.start;
+        region.size = range.data.size();
+        deferred_command_buffer_.CmdVkCopyBuffer(
+            upload_buffer, shared_memory_->buffer(), 1, &region);
+        copied[i] = true;
+      }
+      upload_offset += range.data.size();
+    }
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask =
+        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    deferred_command_buffer_.CmdVkPipelineBarrier(
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+        1, &barrier, 0, nullptr, 0, nullptr);
+  }
+  dfn.vkUnmapMemory(device, upload_memory);
+  // The copies must finish before the upload buffer goes.
+  AwaitAllQueueOperationsCompletion();
+  dfn.vkDestroyBuffer(device, upload_buffer, nullptr);
+  dfn.vkFreeMemory(device, upload_memory, nullptr);
+  if (!ok) {
+    return false;
+  }
+
+  size_t scaled_ranges = 0;
+  for (size_t i = 0; i < ranges.size(); ++i) {
+    if (!copied[i]) {
+      continue;
+    }
+    const GpuMemorySnapshotRange& range = ranges[i];
+    if (range.scaled) {
+      texture_cache_->MarkRangeAsResolved(range.start, range.length, true);
+      ++scaled_ranges;
+    } else {
+      shared_memory_->RangeWrittenByGpu(range.start, range.length);
+    }
+  }
+  XELOGI("GPU memory snapshot: {} bytes restored ({} ranges, {} scaled)",
+         total_bytes, std::count(copied.begin(), copied.end(), true),
+         scaled_ranges);
+  return BeginSubmission(true);
+}
+
 std::string VulkanCommandProcessor::GetWindowTitleText() const {
   std::ostringstream title;
   title << "Vulkan";
