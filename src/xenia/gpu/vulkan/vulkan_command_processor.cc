@@ -77,6 +77,11 @@ DEFINE_bool(batch_repeat_draws, true,
 
 DECLARE_bool(log_wait_reg_mem);
 DECLARE_bool(clear_memory_page_state);
+DEFINE_bool(clear_memory_page_state_batched, true,
+            "With clear_memory_page_state, upload the pages the last frame "
+            "used again in one batch at the start of the next frame, instead "
+            "of one upload per draw that each end the render pass.",
+            "GPU");
 DECLARE_bool(readback_resolve_half_pixel_offset);
 
 namespace xe {
@@ -6368,6 +6373,10 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     primitive_processor_->BeginFrame();
 
     texture_cache_->BeginFrame();
+
+    // Pages clear_memory_page_state invalidated at the end of the last frame
+    // that the draws used, uploaded before any render pass is open.
+    shared_memory_->UploadPendingRefresh();
   }
 
   return true;
@@ -6616,8 +6625,15 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
 
   if (is_closing_frame) {
     if (cvars::clear_memory_page_state) {
-      shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
+      if (cvars::clear_memory_page_state_batched) {
+        shared_memory_
+            ->SetSystemPageBlocksValidWithGpuDataWrittenAndCollectUsed();
+      } else {
+        shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
+      }
     }
+    shared_memory_->set_track_page_use(cvars::clear_memory_page_state &&
+                                       cvars::clear_memory_page_state_batched);
 
     frame_open_ = false;
     // Submission already closed now, so minus 1.
