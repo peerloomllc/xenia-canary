@@ -47,6 +47,9 @@ bool SharedMemory::InitializeCommon() {
   memset(system_page_flags_valid_, 0, 8 * num_system_page_flags_entries);
   memset(system_page_flags_valid_and_gpu_written_, 0,
          8 * num_system_page_flags_entries);
+  system_page_flags_used_.assign(num_system_page_flags_entries, 0);
+  system_page_flags_pending_refresh_.assign(num_system_page_flags_entries, 0);
+  pending_refresh_ = false;
   memory_invalidation_callback_handle_ =
       memory_.RegisterPhysicalMemoryInvalidationCallback(
           MemoryInvalidationCallbackThunk, this);
@@ -133,6 +136,59 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
   for (unsigned i = 0; i < num_system_page_flags_; ++i) {
     system_page_flags_valid_[i] = system_page_flags_valid_and_gpu_written_[i];
   }
+}
+
+void SharedMemory::SetSystemPageBlocksValidWithGpuDataWrittenAndCollectUsed() {
+  auto global_lock = global_critical_region_.Acquire();
+
+  bool any = false;
+  for (unsigned i = 0; i < num_system_page_flags_; ++i) {
+    uint64_t gpu_written = system_page_flags_valid_and_gpu_written_[i];
+    uint64_t refresh = system_page_flags_used_[i] & ~gpu_written;
+    system_page_flags_pending_refresh_[i] = refresh;
+    any |= refresh != 0;
+    system_page_flags_used_[i] = 0;
+    system_page_flags_valid_[i] = gpu_written;
+  }
+  pending_refresh_ = any;
+}
+
+bool SharedMemory::UploadPendingRefresh() {
+  if (!pending_refresh_) {
+    return true;
+  }
+  pending_refresh_ = false;
+  std::vector<std::pair<uint32_t, uint32_t>> ranges;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    uint32_t range_start = UINT32_MAX;
+    for (unsigned i = 0; i < num_system_page_flags_; ++i) {
+      // Pages the CPU made valid again since (a watched write followed by a
+      // request) need no second upload.
+      uint64_t refresh =
+          system_page_flags_pending_refresh_[i] & ~system_page_flags_valid_[i];
+      system_page_flags_pending_refresh_[i] = 0;
+      for (uint32_t bit = 0; bit < 64; ++bit) {
+        uint32_t page = i * 64 + bit;
+        if ((refresh >> bit) & 1) {
+          if (range_start == UINT32_MAX) {
+            range_start = page;
+          }
+        } else if (range_start != UINT32_MAX) {
+          ranges.push_back(std::make_pair(range_start, page - range_start));
+          range_start = UINT32_MAX;
+        }
+      }
+    }
+    if (range_start != UINT32_MAX) {
+      ranges.push_back(std::make_pair(
+          range_start, num_system_page_flags_ * 64 - range_start));
+    }
+  }
+  if (ranges.empty()) {
+    return true;
+  }
+  return UploadRanges(ranges.data(), uint32_t(ranges.size()));
 }
 
 SharedMemory::GlobalWatchHandle SharedMemory::RegisterGlobalWatch(
@@ -404,6 +460,18 @@ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
 
   {
     auto global_lock = global_critical_region_.Acquire();
+    if (track_page_use_) {
+      for (uint32_t i = block_first; i <= block_last; ++i) {
+        uint64_t bits = UINT64_MAX;
+        if (i == block_first) {
+          bits &= UINT64_MAX << (page_first & 63);
+        }
+        if (i == block_last) {
+          bits &= UINT64_MAX >> (63 - (page_last & 63));
+        }
+        system_page_flags_used_[i] |= bits;
+      }
+    }
     TryFindUploadRange(block_first, block_last, page_first, page_last,
                        range_start, current_upload_range, uploads);
   }
