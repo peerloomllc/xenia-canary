@@ -9,7 +9,13 @@
 
 #include "xenia/gpu/vulkan/vulkan_shared_memory.h"
 
+#include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <cstring>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
@@ -31,6 +37,96 @@ DEFINE_bool(vulkan_sparse_shared_memory, true,
 namespace xe {
 namespace gpu {
 namespace vulkan {
+
+namespace {
+// Large UploadRanges copies (the batched clear_memory_page_state refresh,
+// tens of MB a frame) done in the background by a few helper threads. The
+// copies only have to be finished before the submission that reads the
+// upload buffer, so EndSubmission waits for them, not UploadRanges.
+class UploadCopyPool {
+ public:
+  struct Piece {
+    uint8_t* dst;
+    const uint8_t* src;
+    size_t size;
+  };
+  static UploadCopyPool& Get() {
+    static UploadCopyPool pool;
+    return pool;
+  }
+  void Start(std::vector<Piece>&& pieces) {
+    Wait();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      pieces_owned_ = std::move(pieces);
+      pieces_ = &pieces_owned_;
+      next_.store(0, std::memory_order_relaxed);
+      remaining_.store(pieces_owned_.size(), std::memory_order_relaxed);
+      ++generation_;
+    }
+    cv_.notify_all();
+  }
+  // Copies what is left on the calling thread, then waits for the helpers.
+  void Wait() {
+    const std::vector<Piece>* pieces;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      pieces = pieces_;
+    }
+    if (!pieces) {
+      return;
+    }
+    Work(pieces);
+    while (remaining_.load(std::memory_order_acquire) ||
+           active_.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    pieces_ = nullptr;
+    pieces_owned_.clear();
+  }
+
+ private:
+  static constexpr unsigned kHelpers = 3;
+  UploadCopyPool() {
+    for (unsigned i = 0; i < kHelpers; ++i) {
+      std::thread([this] { HelperMain(); }).detach();
+    }
+  }
+  void Work(const std::vector<Piece>* pieces) {
+    size_t i;
+    while ((i = next_.fetch_add(1, std::memory_order_relaxed)) <
+           pieces->size()) {
+      const Piece& piece = (*pieces)[i];
+      std::memcpy(piece.dst, piece.src, piece.size);
+      remaining_.fetch_sub(1, std::memory_order_release);
+    }
+  }
+  void HelperMain() {
+    uint64_t seen = 0;
+    while (true) {
+      const std::vector<Piece>* pieces;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [&] { return generation_ != seen && pieces_; });
+        seen = generation_;
+        pieces = pieces_;
+        active_.fetch_add(1, std::memory_order_relaxed);
+      }
+      Work(pieces);
+      active_.fetch_sub(1, std::memory_order_release);
+    }
+  }
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  const std::vector<Piece>* pieces_ = nullptr;
+  std::vector<Piece> pieces_owned_;
+  uint64_t generation_ = 0;
+  std::atomic<size_t> next_{0};
+  std::atomic<size_t> remaining_{0};
+  std::atomic<unsigned> active_{0};
+};
+}  // namespace
 
 VulkanSharedMemory::VulkanSharedMemory(
     VulkanCommandProcessor& command_processor, Memory& memory,
@@ -191,6 +287,7 @@ bool VulkanSharedMemory::Initialize() {
 }
 
 void VulkanSharedMemory::Shutdown(bool from_destructor) {
+  UploadCopyPool::Get().Wait();
   ResetTraceDownload();
 
   upload_buffer_pool_.reset();
@@ -214,6 +311,7 @@ void VulkanSharedMemory::Shutdown(bool from_destructor) {
 }
 
 void VulkanSharedMemory::ClearCache() {
+  UploadCopyPool::Get().Wait();
   SharedMemory::ClearCache();
 
   upload_buffer_pool_->ClearCache();
@@ -223,7 +321,10 @@ void VulkanSharedMemory::CompletedSubmissionUpdated() {
   upload_buffer_pool_->Reclaim(command_processor_.GetCompletedSubmission());
 }
 
-void VulkanSharedMemory::EndSubmission() { upload_buffer_pool_->FlushWrites(); }
+void VulkanSharedMemory::EndSubmission() {
+  UploadCopyPool::Get().Wait();
+  upload_buffer_pool_->FlushWrites();
+}
 
 void VulkanSharedMemory::Use(Usage usage,
                              std::pair<uint32_t, uint32_t> written_range) {
@@ -402,6 +503,8 @@ bool VulkanSharedMemory::UploadRanges(
   bool successful = true;
   upload_regions_.clear();
   VkBuffer upload_buffer_previous = VK_NULL_HANDLE;
+  std::vector<UploadCopyPool::Piece> copies;
+  size_t copy_bytes = 0;
 
   // for (auto upload_range : upload_page_ranges) {
   for (unsigned int i = 0; i < num_upload_ranges; ++i) {
@@ -448,18 +551,11 @@ bool VulkanSharedMemory::UploadRanges(
       MakeRangeValid(upload_range_start << page_size_log2(),
                      uint32_t(upload_buffer_size), false);
 
-      if (upload_buffer_size < (1ULL << 32) && upload_buffer_size > 8192) {
-        memory::vastcpy(
-            upload_buffer_mapping,
-            memory().TranslatePhysical(upload_range_start << page_size_log2()),
-            static_cast<uint32_t>(upload_buffer_size));
-        swcache::WriteFence();
-      } else {
-        std::memcpy(
-            upload_buffer_mapping,
-            memory().TranslatePhysical(upload_range_start << page_size_log2()),
-            upload_buffer_size);
-      }
+      copies.push_back(
+          {upload_buffer_mapping,
+           memory().TranslatePhysical(upload_range_start << page_size_log2()),
+           size_t(upload_buffer_size)});
+      copy_bytes += size_t(upload_buffer_size);
       if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
         assert_true(upload_buffer_previous != VK_NULL_HANDLE);
         command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
@@ -488,6 +584,32 @@ bool VulkanSharedMemory::UploadRanges(
                                    uint32_t(upload_regions_.size()),
                                    upload_regions_.data());
     upload_regions_.clear();
+  }
+  // The ranges were made valid above before any of the copies, as
+  // MakeRangeValid requires. Large uploads are copied in the background
+  // until EndSubmission.
+  constexpr size_t kBackgroundCopyMinBytes = size_t(4) << 20;
+  if (copy_bytes >= kBackgroundCopyMinBytes) {
+    constexpr size_t kPieceBytes = size_t(1) << 20;
+    std::vector<UploadCopyPool::Piece> pieces;
+    pieces.reserve(copy_bytes / kPieceBytes + copies.size());
+    for (const UploadCopyPool::Piece& copy : copies) {
+      for (size_t offset = 0; offset < copy.size; offset += kPieceBytes) {
+        pieces.push_back({copy.dst + offset, copy.src + offset,
+                          std::min(kPieceBytes, copy.size - offset)});
+      }
+    }
+    UploadCopyPool::Get().Start(std::move(pieces));
+  } else {
+    for (const UploadCopyPool::Piece& copy : copies) {
+      if (copy.size > 8192 && copy.size < (size_t(1) << 32)) {
+        memory::vastcpy(copy.dst, const_cast<uint8_t*>(copy.src),
+                        uint32_t(copy.size));
+      } else {
+        std::memcpy(copy.dst, copy.src, copy.size);
+      }
+    }
+    swcache::WriteFence();
   }
   return successful;
 }
