@@ -208,8 +208,16 @@ void SDLInputDriver::LoadGameControllerDB() {
   }
 
   if (!std::filesystem::exists(cvars::mappings_file)) {
-    XELOGW("SDL GameControllerDB: file '{}' does not exist.",
-           cvars::mappings_file);
+    // The file only adds mappings to the ones SDL has built in, so the
+    // default name being absent (the usual case) is not a problem.
+    if (cvars::mappings_file == "gamecontrollerdb.txt") {
+      XELOGI(
+          "SDL GameControllerDB: no gamecontrollerdb.txt, using SDL's "
+          "built-in mappings");
+    } else {
+      XELOGW("SDL GameControllerDB: file '{}' does not exist.",
+             cvars::mappings_file);
+    }
     return;
   }
 
