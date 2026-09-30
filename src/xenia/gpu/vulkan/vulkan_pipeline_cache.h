@@ -537,6 +537,10 @@ class VulkanPipelineCache {
                       PipelineCreationPriorityCompare>
       creation_queue_;
   std::mutex creation_request_lock_;
+  // vulkan_serialize_pipeline_creation: vkCreateGraphicsPipelines is called by
+  // one thread at a time.
+  bool serialize_pipeline_creation_ = false;
+  std::mutex pipeline_creation_mutex_;
   std::condition_variable creation_request_cond_;
   std::unique_ptr<xe::threading::Event> creation_completion_event_ = nullptr;
   std::atomic<bool> creation_completion_set_event_{false};

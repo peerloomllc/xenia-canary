@@ -66,6 +66,14 @@ DEFINE_int32(
     "0 to disable multithreaded pipeline creation.",
     "Vulkan");
 
+DEFINE_int32(
+    vulkan_serialize_pipeline_creation, -1,
+    "Create graphics pipelines one at a time instead of in parallel. Works "
+    "around the NVIDIA driver crashing (segmentation fault in "
+    "libnvidia-glcore) when several threads create pipelines at once. -1 to "
+    "enable on NVIDIA only, 0 to disable, 1 to enable.",
+    "Vulkan");
+
 DEFINE_string(
     vulkan_geometry_passthrough_pixel_shaders, "576D5839C5B79A77",
     "Pixel shaders (ucode hashes in hex, comma-separated) whose triangle draws "
@@ -254,6 +262,11 @@ bool VulkanPipelineCache::Initialize() {
     XELOGW("VulkanPipelineCache: Failed to create pipeline cache");
     vk_pipeline_cache_ = VK_NULL_HANDLE;
   }
+
+  serialize_pipeline_creation_ =
+      cvars::vulkan_serialize_pipeline_creation < 0
+          ? vulkan_device->properties().vendorID == 0x10DE
+          : cvars::vulkan_serialize_pipeline_creation != 0;
 
   uint32_t logical_processor_count = xe::threading::logical_processor_count();
   if (!logical_processor_count) {
@@ -3345,8 +3358,16 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   VkPipeline pipeline;
+  std::unique_lock<std::mutex> creation_lock(pipeline_creation_mutex_,
+                                             std::defer_lock);
+  if (serialize_pipeline_creation_) {
+    creation_lock.lock();
+  }
   VkResult result = dfn.vkCreateGraphicsPipelines(
       device, vk_pipeline_cache_, 1, &pipeline_create_info, nullptr, &pipeline);
+  if (creation_lock.owns_lock()) {
+    creation_lock.unlock();
+  }
   if (result != VK_SUCCESS && creating_round_7e3_alpha) {
     XELOGE(
         "Failed to create the alpha rounding pipeline for VS {:016X} "
