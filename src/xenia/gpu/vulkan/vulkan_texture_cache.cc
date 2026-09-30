@@ -657,6 +657,33 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(
 VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
     const VulkanShader::SamplerBinding& binding) const {
   const auto& regs = register_file();
+  const uint32_t* fetch_words =
+      &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 +
+                   binding.fetch_constant * 6];
+  uint32_t binding_bits = 0;
+  static_assert(sizeof(binding) <= sizeof(binding_bits));
+  std::memcpy(&binding_bits, &binding, sizeof(binding));
+  int32_t anisotropic_override = cvars::anisotropic_override;
+  SamplerParametersCacheEntry& cache_entry =
+      sampler_parameters_cache_[binding.fetch_constant];
+  if (cache_entry.valid && cache_entry.binding == binding_bits &&
+      cache_entry.anisotropic_override == anisotropic_override &&
+      !std::memcmp(cache_entry.fetch, fetch_words, sizeof(cache_entry.fetch))) {
+    return cache_entry.parameters;
+  }
+  SamplerParameters parameters = ComputeSamplerParameters(binding);
+  std::memcpy(cache_entry.fetch, fetch_words, sizeof(cache_entry.fetch));
+  cache_entry.binding = binding_bits;
+  cache_entry.anisotropic_override = anisotropic_override;
+  cache_entry.parameters = parameters;
+  cache_entry.valid = true;
+  return parameters;
+}
+
+VulkanTextureCache::SamplerParameters
+VulkanTextureCache::ComputeSamplerParameters(
+    const VulkanShader::SamplerBinding& binding) const {
+  const auto& regs = register_file();
   xenos::xe_gpu_texture_fetch_t fetch =
       regs.GetTextureFetch(binding.fetch_constant);
 
