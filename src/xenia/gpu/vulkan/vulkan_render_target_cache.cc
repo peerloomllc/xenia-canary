@@ -2849,12 +2849,14 @@ void VulkanRenderTargetCache::RecordReShadeDepthResolve(
   cb.CmdVkBeginRenderPass(&rp_bi, VK_SUBPASS_CONTENTS_INLINE);
   VkViewport viewport = {0.0f, 0.0f, float(width), float(height), 0.0f, 1.0f};
   VkRect2D scissor = {{0, 0}, {width, height}};
-  cb.CmdVkSetViewport(0, 1, &viewport);
-  cb.CmdVkSetScissor(0, 1, &scissor);
-  cb.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                       src.samples != VK_SAMPLE_COUNT_1_BIT
-                           ? reshade_depth_resolve_pipeline_ms_
-                           : reshade_depth_resolve_pipeline_1x_);
+  // Through the command processor so its cached dynamic state and bound
+  // pipeline stay in step with the command buffer.
+  command_processor_.SetViewport(viewport);
+  command_processor_.SetScissor(scissor);
+  command_processor_.BindExternalGraphicsPipeline(
+      src.samples != VK_SAMPLE_COUNT_1_BIT
+          ? reshade_depth_resolve_pipeline_ms_
+          : reshade_depth_resolve_pipeline_1x_);
   cb.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                              reshade_depth_resolve_pipeline_layout_, 0, 1, &set,
                              0, nullptr);
