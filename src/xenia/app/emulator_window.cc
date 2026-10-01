@@ -8,7 +8,6 @@
  */
 
 #include "xenia/app/emulator_window.h"
-#include "third_party/qrcodegen/qrcodegen.hpp"
 
 #include "xenia/apu/apu_flags.h"
 #include "xenia/config.h"
@@ -138,18 +137,7 @@ DEFINE_string(ui_experiment_dialog, "",
               "without a keyboard.",
               "General");
 DEFINE_string(support_page_url, "https://peerloomllc.com/about/",
-              "Help > Support Development: the page the button opens.", "UI");
-DEFINE_string(support_coffee_url, "https://buymeacoffee.com/peerloomllc",
-              "Help > Support Development: card tips page for the second "
-              "button (empty hides it).",
-              "UI");
-DEFINE_string(support_btc_address, "bc1q0kksenz3j4u9ppe6f4krclvzwxk7sjy00cc9cf",
-              "Help > Support Development: Bitcoin on-chain donation address "
-              "(empty hides its QR code).",
-              "UI");
-DEFINE_string(support_lightning_address, "peerloomllc@strike.me",
-              "Help > Support Development: Lightning donation address (empty "
-              "hides its QR code).",
+              "Help > Support development: the page it opens in the browser.",
               "UI");
 DEFINE_int32(
     screenshot_burst_seconds, 0,
@@ -1344,9 +1332,9 @@ bool EmulatorWindow::Initialize() {
         MenuItem::Type::kString, "&About...",
         []() { LaunchWebBrowser("https://xenia.jp/about/"); }));
     help_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
-    help_menu->AddChild(MenuItem::Create(
-        MenuItem::Type::kString, "&Support development...",
-        std::bind(&EmulatorWindow::ToggleSupportDialog, this)));
+    help_menu->AddChild(
+        MenuItem::Create(MenuItem::Type::kString, "&Support development...",
+                         []() { LaunchWebBrowser(cvars::support_page_url); }));
   }
   main_menu->AddChild(std::move(help_menu));
 
@@ -1545,8 +1533,6 @@ bool EmulatorWindow::Initialize() {
         } else if (which.rfind("launch_index:", 0) == 0) {
           // A library launch by index, as a double-click on the row would.
           LaunchLibraryIndex(std::atoi(which.c_str() + 13));
-        } else if (which == "support") {
-          ToggleSupportDialog();
         } else if (which == "keyboard_capture") {
           ToggleKeyboardHotkeysDialog();
           capturing_action_ = int(HotkeyAction::kPauseResume);
@@ -5462,128 +5448,6 @@ void EmulatorWindow::ToggleProfilesConfigDialog() {
       profile_config_dialog_.reset();
     }
     emulator_->kernel_state()->xam_state()->is_xam_dialog_present_.store(false);
-  }
-}
-
-namespace {
-// One QR code as filled rectangles, with a quiet zone, on a white card,
-// centred in the window.
-void DrawQrCodeCentered(const std::string& text, float module_px) {
-  using qrcodegen::QrCode;
-  QrCode qr = QrCode::encodeText(text.c_str(), QrCode::Ecc::MEDIUM);
-  const int n = qr.getSize();
-  const float quiet = module_px * 4.0f;
-  const float size = n * module_px + 2.0f * quiet;
-  ImGui::SetCursorPosX(
-      std::max(0.0f, (ImGui::GetWindowSize().x - size) * 0.5f));
-  ImDrawList* draw_list = ImGui::GetWindowDrawList();
-  const ImVec2 p = ImGui::GetCursorScreenPos();
-  draw_list->AddRectFilled(p, ImVec2(p.x + size, p.y + size),
-                           IM_COL32(255, 255, 255, 255));
-  for (int y = 0; y < n; ++y) {
-    for (int x = 0; x < n; ++x) {
-      if (qr.getModule(x, y)) {
-        const float x0 = p.x + quiet + x * module_px;
-        const float y0 = p.y + quiet + y * module_px;
-        draw_list->AddRectFilled(ImVec2(x0, y0),
-                                 ImVec2(x0 + module_px, y0 + module_px),
-                                 IM_COL32(0, 0, 0, 255));
-      }
-    }
-  }
-  ImGui::Dummy(ImVec2(size, size));
-}
-
-void CenteredText(const char* text) {
-  ImGui::SetCursorPosX(std::max(
-      0.0f, (ImGui::GetWindowSize().x - ImGui::CalcTextSize(text).x) * 0.5f));
-  ImGui::TextUnformatted(text);
-}
-
-// The string under its QR code, selectable for copying; wide enough for
-// the whole text, centred.
-void CenteredField(const char* id, const std::string& text) {
-  std::string buffer = text;
-  const float width = ImGui::CalcTextSize(buffer.c_str()).x +
-                      ImGui::GetStyle().FramePadding.x * 2.0f + 10.0f;
-  ImGui::SetCursorPosX(
-      std::max(0.0f, (ImGui::GetWindowSize().x - width) * 0.5f));
-  ImGui::SetNextItemWidth(width);
-  ImGui::InputText(
-      id, buffer.data(), buffer.size() + 1,
-      ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_AutoSelectAll);
-}
-
-// Label + QR code + copyable string, as one centred block.
-void QrSection(const char* label, const char* id, const std::string& qr_text,
-               const std::string& shown_text, float module_px) {
-  CenteredText(label);
-  DrawQrCodeCentered(qr_text, module_px);
-  CenteredField(id, shown_text);
-}
-}  // namespace
-
-void EmulatorWindow::SupportDialog::OnDraw(ImGuiIO& io) {
-  ImGui::SetNextWindowPos(ImVec2(60, 60), ImGuiCond_FirstUseEver);
-  bool dialog_open = true;
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowTitleAlign, ImVec2(0.5f, 0.5f));
-  if (!ImGui::Begin(
-          "Support Development", &dialog_open,
-          ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
-    ImGui::End();
-    ImGui::PopStyleVar();
-    return;
-  }
-  CenteredText("This build is free software by PeerLoom LLC.");
-  CenteredText(
-      "If you receive value from it, please consider returning value.");
-  ImGui::Spacing();
-  if (!cvars::support_page_url.empty()) {
-    const char* button_label = "Open the support page in the browser...";
-    const float button_width = ImGui::CalcTextSize(button_label).x +
-                               ImGui::GetStyle().FramePadding.x * 2.0f;
-    ImGui::SetCursorPosX(
-        std::max(0.0f, (ImGui::GetWindowSize().x - button_width) * 0.5f));
-    if (ImGui::Button(button_label)) {
-      LaunchWebBrowser(cvars::support_page_url);
-    }
-  }
-  const float module_px = std::max(3.0f, 3.0f * io.FontGlobalScale);
-  ImGui::Spacing();
-  ImGui::Separator();
-  ImGui::Spacing();
-  if (!cvars::support_btc_address.empty()) {
-    QrSection("Bitcoin (on-chain)", "##support_btc",
-              "bitcoin:" + cvars::support_btc_address,
-              cvars::support_btc_address, module_px);
-    ImGui::Spacing();
-    ImGui::Spacing();
-  }
-  if (!cvars::support_lightning_address.empty()) {
-    QrSection("Bitcoin (lightning)", "##support_ln",
-              cvars::support_lightning_address,
-              cvars::support_lightning_address, module_px);
-    ImGui::Spacing();
-    ImGui::Spacing();
-  }
-  if (!cvars::support_coffee_url.empty()) {
-    QrSection("Buy Me a Coffee (card)", "##support_coffee",
-              cvars::support_coffee_url, cvars::support_coffee_url, module_px);
-  }
-  ImGui::End();
-  ImGui::PopStyleVar();
-  if (!dialog_open) {
-    emulator_window_.ToggleSupportDialog();
-    return;
-  }
-}
-
-void EmulatorWindow::ToggleSupportDialog() {
-  if (!support_dialog_) {
-    support_dialog_ = std::unique_ptr<SupportDialog>(
-        new SupportDialog(imgui_drawer_.get(), *this));
-  } else {
-    support_dialog_.reset();
   }
 }
 
