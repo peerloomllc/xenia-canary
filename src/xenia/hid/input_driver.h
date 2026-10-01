@@ -46,6 +46,10 @@ class InputDriver {
 
   virtual InputType GetInputType() const = 0;
 
+  // True when this slot's controller drives the emulator's own UI and must
+  // not be reported to a title (--ui_only_controllers).
+  virtual bool IsUiOnlySlot(uint32_t user_index) const { return false; }
+
  protected:
   explicit InputDriver(xe::ui::Window* window, size_t window_z_order)
       : window_(window), window_z_order_(window_z_order) {}

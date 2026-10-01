@@ -62,6 +62,10 @@ class InputSystem {
   // selection does not also reach the running title. Separate from XAM's own
   // dialog flag, which belongs to the guest's dialogs and must not be
   // cleared by ours.
+  // True when that slot's controller is kept for the emulator's own UI
+  // (--ui_only_controllers) and must not be shown to a title.
+  bool IsUiOnlySlot(uint32_t user_index) const;
+
   void set_ui_holds_pad(bool value) { ui_holds_pad_.store(value); }
   bool ui_holds_pad() const { return ui_holds_pad_.load(); }
 

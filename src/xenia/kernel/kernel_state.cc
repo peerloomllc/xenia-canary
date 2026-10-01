@@ -1502,7 +1502,16 @@ std::bitset<4> KernelState::GetConnectedUsers() const {
 
   auto lock = input_sys->lock();
 
-  return input_sys->GetConnectedSlots();
+  // A controller kept for the emulator's own menus is not a user a title has.
+  // The slot list itself is the host's view and stays honest; this is the
+  // guest's, so it drops them (--ui_only_controllers).
+  std::bitset<4> connected = input_sys->GetConnectedSlots();
+  for (uint32_t i = 0; i < connected.size(); ++i) {
+    if (connected.test(i) && input_sys->IsUiOnlySlot(i)) {
+      connected.reset(i);
+    }
+  }
+  return connected;
 }
 // todo: definitely need to do more to pretend to be in a dpc
 void KernelState::BeginDPCImpersonation(cpu::ppc::PPCContext* context,

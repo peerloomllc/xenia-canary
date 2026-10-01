@@ -83,6 +83,15 @@ void InputSystem::UpdateUsedSlot(InputDriver* driver, uint8_t slot,
   }
 }
 
+bool InputSystem::IsUiOnlySlot(uint32_t user_index) const {
+  for (const auto& driver : drivers_) {
+    if (driver->IsUiOnlySlot(user_index)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 std::vector<InputDriver*> InputSystem::FilterDrivers(uint32_t flags) {
   std::vector<InputDriver*> filtered_drivers;
   for (auto& driver : drivers_) {
@@ -103,7 +112,13 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
 
   std::vector<InputDriver*> filtered_drivers = FilterDrivers(flags);
 
+  const bool for_host_ui = (flags & X_INPUT_FLAG::X_INPUT_FLAG_HOST_UI) != 0;
   for (auto& driver : filtered_drivers) {
+    // A controller kept for the emulator's own menus answers the UI and
+    // nothing else, so a title is told that slot is empty.
+    if (!for_host_ui && driver->IsUiOnlySlot(user_index)) {
+      continue;
+    }
     X_RESULT result = driver->GetCapabilities(user_index, flags, out_caps);
     if (result == X_ERROR_SUCCESS) {
       return result;
@@ -121,7 +136,12 @@ X_RESULT InputSystem::GetState(uint32_t user_index, uint32_t flags,
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
+  const bool for_host_ui = (flags & X_INPUT_FLAG::X_INPUT_FLAG_HOST_UI) != 0;
   for (auto& driver : filtered_drivers) {
+    // As in GetCapabilities: a UI-only controller is invisible to titles.
+    if (!for_host_ui && driver->IsUiOnlySlot(user_index)) {
+      continue;
+    }
     X_RESULT result = driver->GetState(user_index, out_state);
     if (result == X_ERROR_SUCCESS) {
       UpdateUsedSlot(driver, user_index, true);
