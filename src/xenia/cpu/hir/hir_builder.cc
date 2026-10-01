@@ -1198,6 +1198,18 @@ Value* HIRBuilder::LoadClock() {
   return i->dest;
 }
 
+void HIRBuilder::ClearFpExceptions() {
+  Instr* i = AppendInstr(OPCODE_CLEAR_FP_EXCEPTIONS_info, 0);
+  i->src1.value = i->src2.value = i->src3.value = NULL;
+}
+
+Value* HIRBuilder::LoadFpExceptions() {
+  Instr* i =
+      AppendInstr(OPCODE_LOAD_FP_EXCEPTIONS_info, 0, AllocValue(INT32_TYPE));
+  i->src1.value = i->src2.value = i->src3.value = NULL;
+  return i->dest;
+}
+
 Value* HIRBuilder::AllocLocal(TypeName type) {
   Value* slot = AllocValue(type);
   locals_.push_back(slot);
@@ -1735,22 +1747,28 @@ Value* HIRBuilder::Div(Value* value1, Value* value2,
   return i->dest;
 }
 
-Value* HIRBuilder::MulAdd(Value* value1, Value* value2, Value* value3) {
+Value* HIRBuilder::MulAdd(Value* value1, Value* value2, Value* value3,
+                          bool negate_result) {
   ASSERT_TYPES_EQUAL(value1, value2);
   ASSERT_TYPES_EQUAL(value1, value3);
 
-  Instr* i = AppendInstr(OPCODE_MUL_ADD_info, 0, AllocValue(value1->type));
+  Instr* i = AppendInstr(OPCODE_MUL_ADD_info,
+                         negate_result ? ARITHMETIC_NEGATE_RESULT : 0,
+                         AllocValue(value1->type));
   i->set_src1(value1);
   i->set_src2(value2);
   i->set_src3(value3);
   return i->dest;
 }
 
-Value* HIRBuilder::MulSub(Value* value1, Value* value2, Value* value3) {
+Value* HIRBuilder::MulSub(Value* value1, Value* value2, Value* value3,
+                          bool negate_result) {
   ASSERT_TYPES_EQUAL(value1, value2);
   ASSERT_TYPES_EQUAL(value1, value3);
 
-  Instr* i = AppendInstr(OPCODE_MUL_SUB_info, 0, AllocValue(value1->type));
+  Instr* i = AppendInstr(OPCODE_MUL_SUB_info,
+                         negate_result ? ARITHMETIC_NEGATE_RESULT : 0,
+                         AllocValue(value1->type));
   i->set_src1(value1);
   i->set_src2(value2);
   i->set_src3(value3);
