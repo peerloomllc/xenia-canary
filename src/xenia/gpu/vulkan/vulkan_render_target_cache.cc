@@ -1386,11 +1386,13 @@ void VulkanRenderTargetCache::ClearCache() {
   }
   framebuffers_.clear();
 
+  // Render passes are kept: they reference no images, and pipelines queued on
+  // the creation threads hold them. Destroying them here handed the driver a
+  // destroyed render pass for every creation still queued at a cache clear (a
+  // segfault in libnvidia-glcore right after a save-state load), and a new
+  // render pass could reuse a destroyed one's handle while pipelines are
+  // still cached under it. Shutdown destroys them.
   last_update_render_pass_ = VK_NULL_HANDLE;
-  for (const auto& render_pass_pair : render_passes_) {
-    dfn.vkDestroyRenderPass(device, render_pass_pair.second, nullptr);
-  }
-  render_passes_.clear();
 
   RenderTargetCache::ClearCache();
 }

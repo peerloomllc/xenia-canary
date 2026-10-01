@@ -67,12 +67,13 @@ DEFINE_int32(
     "Vulkan");
 
 DEFINE_int32(
-    vulkan_serialize_pipeline_creation, -1,
-    "Create graphics pipelines one at a time instead of in parallel. Works "
-    "around the NVIDIA driver crashing (segmentation fault in "
-    "libnvidia-glcore) when several threads create pipelines at once. -1 to "
+    vulkan_serialize_pipeline_creation, 0,
+    "Create graphics pipelines one at a time instead of in parallel. Much "
+    "slower to fill a cold shader cache. Off by default since the NVIDIA "
+    "crash it was meant for turned out to be a destroyed render pass. -1 to "
     "enable on NVIDIA only, 0 to disable, 1 to enable.",
     "Vulkan");
+UPDATE_from_int32(vulkan_serialize_pipeline_creation, 2026, 10, 1, 15, -1);
 
 DEFINE_string(
     vulkan_geometry_passthrough_pixel_shaders, "576D5839C5B79A77",
