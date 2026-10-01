@@ -94,6 +94,12 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   void SetGuideButtonAction(std::function<void(uint8_t)> func);
 
   bool IsAnyDialogOpen() const { return !dialogs_.empty(); };
+  bool IsAnyPanelOpen() const;
+  // Called after a dialog is added or removed. Runs inside AddDialog and
+  // RemoveDialog, so possibly mid-construction or mid-draw: defer real work.
+  void SetDialogsChangedCallback(std::function<void()> func) {
+    dialogs_changed_ = std::move(func);
+  }
 
   // Dialog and notification size (cvar ui_scale). The change is applied
   // at the start of the next Draw, outside a frame.
@@ -141,6 +147,7 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   hid::InputSystem* input_system_ = nullptr;
 
   std::function<void(uint8_t)> onGuidePressFunction_;
+  std::function<void()> dialogs_changed_;
   // All currently-attached dialogs that get drawn.
   std::vector<ImGuiDialog*> dialogs_;
 

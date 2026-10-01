@@ -373,6 +373,7 @@ class EmulatorWindow {
   // Full-window dimming overlay with "PAUSED" while Emulator::is_paused().
   class PausedOverlayDialog final : public ui::ImGuiDialog {
    public:
+    bool IsOverlay() const override { return true; }
     PausedOverlayDialog(ui::ImGuiDrawer* imgui_drawer,
                         EmulatorWindow& emulator_window)
         : ui::ImGuiDialog(imgui_drawer), emulator_window_(emulator_window) {}
@@ -388,6 +389,7 @@ class EmulatorWindow {
   // the guest time scalar is not 1, "MUTED" while audio is muted.
   class StatusOverlayDialog final : public ui::ImGuiDialog {
    public:
+    bool IsOverlay() const override { return true; }
     StatusOverlayDialog(ui::ImGuiDrawer* imgui_drawer,
                         EmulatorWindow& emulator_window)
         : ui::ImGuiDialog(imgui_drawer), emulator_window_(emulator_window) {}
@@ -580,6 +582,7 @@ class EmulatorWindow {
   void UpdateDashboardFullscreen(bool dashboard_shown);
   bool DashboardShown() const;
   void ToggleDashboard();
+  void UpdateDashboardForPanels();
   void OnDashboardTitleLaunched();
   void AddPlayTime();
   LibraryTitle* LibraryEntryFor(const std::filesystem::path& path);
@@ -653,6 +656,8 @@ class EmulatorWindow {
   bool pad_ui_holds_pad_ = false;
   // Fullscreen was turned off to show the library and is owed back.
   bool dashboard_suspended_fullscreen_ = false;
+  // The dashboard was hidden so an ImGui panel opened over it can be seen.
+  bool dashboard_hidden_for_panel_ = false;
   std::chrono::steady_clock::time_point session_start_;
   bool session_running_ = false;
   std::filesystem::path session_path_;
@@ -740,6 +745,7 @@ class EmulatorWindow {
   // closes it at once.
   class SlotOverlayDialog final : public ui::ImGuiDialog {
    public:
+    bool IsOverlay() const override { return true; }
     SlotOverlayDialog(ui::ImGuiDrawer* imgui_drawer,
                       EmulatorWindow& emulator_window)
         : ui::ImGuiDialog(imgui_drawer), emulator_window_(emulator_window) {}
@@ -840,6 +846,7 @@ class EmulatorWindow {
   // operation runs (they pause the game for its duration).
   class StateOverlayDialog final : public ui::ImGuiDialog {
    public:
+    bool IsOverlay() const override { return true; }
     StateOverlayDialog(ui::ImGuiDrawer* imgui_drawer,
                        EmulatorWindow& emulator_window)
         : ui::ImGuiDialog(imgui_drawer), emulator_window_(emulator_window) {}

@@ -404,6 +404,12 @@ EmulatorWindow::EmulatorWindow(Emulator* emulator,
           std::make_unique<ui::ImGuiDrawer>(window_.get(), kZOrderImGui)),
       display_config_game_config_load_callback_(
           new DisplayConfigGameConfigLoadCallback(*emulator, *this)) {
+#if XE_PLATFORM_LINUX
+  imgui_drawer_->SetDialogsChangedCallback([this]() {
+    app_context_.CallInUIThreadDeferred(
+        [this]() { UpdateDashboardForPanels(); });
+  });
+#endif
   base_title_ = std::string(kBaseTitle) +
 #ifdef DEBUG
 #if _NO_DEBUG_HEAP == 1
@@ -9529,6 +9535,21 @@ void EmulatorWindow::ToggleDashboard() {
     return;
   }
   ShowDashboard(!gtk_main->idle_widget_shown());
+}
+
+void EmulatorWindow::UpdateDashboardForPanels() {
+  // ImGui draws under the GTK dashboard, so a panel opened from the menu with
+  // no title running was invisible. Hide the dashboard while one is open.
+  bool panel_open = imgui_drawer_->IsAnyPanelOpen();
+  if (panel_open && DashboardShown()) {
+    dashboard_hidden_for_panel_ = true;
+    ShowDashboard(false);
+  } else if (!panel_open && dashboard_hidden_for_panel_) {
+    dashboard_hidden_for_panel_ = false;
+    if (!emulator_->is_title_open()) {
+      ShowDashboard(true);
+    }
+  }
 }
 
 bool EmulatorWindow::DashboardShown() const {
