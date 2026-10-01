@@ -7516,6 +7516,8 @@ void EmulatorWindow::ToggleSettingsWindow() {
           }
         } else if (is_cas) {
           note = "FSR settings do not apply to CAS.";
+        } else if (mode == "dlaa") {
+          note = "DLAA does no sharpening, so neither slider applies.";
         } else {
           note = "Bilinear does no sharpening, so neither slider applies.";
         }
@@ -7528,7 +7530,8 @@ void EmulatorWindow::ToggleSettingsWindow() {
           "postprocess_scaling_and_sharpening",
           {{"", "Bilinear (plain stretch)"},
            {"cas", "AMD CAS sharpening (up to 2x2 scaling)"},
-           {"fsr", "AMD FSR 1.0 upscaling, CAS when not upscaling"}},
+           {"fsr", "AMD FSR 1.0 upscaling, CAS when not upscaling"},
+           {"dlaa", "NVIDIA DLAA anti-aliasing (RTX, bilinear elsewhere)"}},
           GetCvarValueForGuestOutputPaintEffect(
               GetGuestOutputPaintEffectForCvarValue(
                   cvars::postprocess_scaling_and_sharpening)),
@@ -7593,6 +7596,8 @@ void EmulatorWindow::ToggleSettingsWindow() {
           }
         } else if (is_cas) {
           note = "FSR settings do not apply to CAS.";
+        } else if (mode == "dlaa") {
+          note = "DLAA does no sharpening, so neither slider applies.";
         } else {
           note = "Bilinear does no sharpening, so neither slider applies.";
         }
