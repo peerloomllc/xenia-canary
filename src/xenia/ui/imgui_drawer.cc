@@ -102,6 +102,14 @@ void ImGuiDrawer::AddDialog(ImGuiDialog* dialog) {
     }
   }
   dialogs_.push_back(dialog);
+  if (dialogs_changed_) {
+    dialogs_changed_();
+  }
+}
+
+bool ImGuiDrawer::IsAnyPanelOpen() const {
+  return std::ranges::any_of(
+      dialogs_, [](const ImGuiDialog* dialog) { return !dialog->IsOverlay(); });
 }
 
 void ImGuiDrawer::RemoveDialog(ImGuiDialog* dialog) {
@@ -119,6 +127,9 @@ void ImGuiDrawer::RemoveDialog(ImGuiDialog* dialog) {
   }
   dialogs_.erase(it);
   DetachIfLastWindowRemoved();
+  if (dialogs_changed_) {
+    dialogs_changed_();
+  }
 }
 
 void ImGuiDrawer::AddNotification(ImGuiNotification* dialog) {
