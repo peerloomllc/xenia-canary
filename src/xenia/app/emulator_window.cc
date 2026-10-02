@@ -47,6 +47,7 @@
 
 #include "xenia/app/console_settings_dialog.h"
 #include "xenia/app/content_list_dialog.h"
+#include "xenia/app/patch_files.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
@@ -396,7 +397,8 @@ constexpr std::string_view kBaseTitle = "Xenia-canary";
 EmulatorWindow::EmulatorWindow(Emulator* emulator,
                                ui::WindowedAppContext& app_context,
                                uint32_t width, uint32_t height)
-    : emulator_(emulator),
+    : patch_categories_(emulator->storage_root() / "patch_categories.txt"),
+      emulator_(emulator),
       app_context_(app_context),
       window_listener_(*this),
       window_(ui::Window::Create(app_context, kBaseTitle, width, height)),
@@ -6775,262 +6777,6 @@ std::string ShellQuote(const std::string& text) {
   return quoted;
 }
 
-// GitHub's blob id of a local file: sha1 of "blob <size>\0" + contents. Used
-// to tell an up-to-date community patch file from an updated one.
-std::string GitBlobSha(const std::filesystem::path& path) {
-  std::error_code ec;
-  auto size = std::filesystem::file_size(path, ec);
-  if (ec) {
-    return "";
-  }
-  int code = 0;
-  std::string out =
-      RunCommandCapture(fmt::format("(printf 'blob {}\\0'; cat {}) | sha1sum",
-                                    size, ShellQuote(path.string())),
-                        &code);
-  if (code != 0 || out.size() < 40) {
-    return "";
-  }
-  return out.substr(0, 40);
-}
-
-void AppendUtf8(std::string& out, uint32_t cp) {
-  if (cp < 0x80) {
-    out += char(cp);
-  } else if (cp < 0x800) {
-    out += char(0xC0 | (cp >> 6));
-    out += char(0x80 | (cp & 0x3F));
-  } else if (cp < 0x10000) {
-    out += char(0xE0 | (cp >> 12));
-    out += char(0x80 | ((cp >> 6) & 0x3F));
-    out += char(0x80 | (cp & 0x3F));
-  } else {
-    out += char(0xF0 | (cp >> 18));
-    out += char(0x80 | ((cp >> 12) & 0x3F));
-    out += char(0x80 | ((cp >> 6) & 0x3F));
-    out += char(0x80 | (cp & 0x3F));
-  }
-}
-
-// Unescape a JSON string body (\" \\ \/ \n \t \uXXXX with surrogate pairs).
-std::string JsonUnescape(const std::string& in) {
-  std::string out;
-  for (size_t i = 0; i < in.size(); ++i) {
-    char c = in[i];
-    if (c != '\\' || i + 1 >= in.size()) {
-      out += c;
-      continue;
-    }
-    char e = in[++i];
-    switch (e) {
-      case 'n':
-        out += '\n';
-        break;
-      case 't':
-        out += '\t';
-        break;
-      case 'u': {
-        if (i + 4 >= in.size()) {
-          return out;
-        }
-        uint32_t cp =
-            uint32_t(strtoul(in.substr(i + 1, 4).c_str(), nullptr, 16));
-        i += 4;
-        if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 < in.size() &&
-            in[i + 1] == '\\' && in[i + 2] == 'u') {
-          uint32_t low =
-              uint32_t(strtoul(in.substr(i + 3, 4).c_str(), nullptr, 16));
-          if (low >= 0xDC00 && low <= 0xDFFF) {
-            cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
-            i += 6;
-          }
-        }
-        AppendUtf8(out, cp);
-        break;
-      }
-      default:
-        out += e;  // \" \\ \/ and anything else
-        break;
-    }
-  }
-  return out;
-}
-
-// Percent-encode a path component for a raw.githubusercontent.com URL.
-std::string UrlEncodeComponent(const std::string& in) {
-  static const char* hex = "0123456789ABCDEF";
-  std::string out;
-  for (unsigned char c : in) {
-    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
-      out += char(c);
-    } else {
-      out += '%';
-      out += hex[c >> 4];
-      out += hex[c & 15];
-    }
-  }
-  return out;
-}
-
-// Flip is_enabled for the [[patch]] entry named patch_name in a patch file,
-// keeping every other byte of the file (community files carry comments).
-bool SetPatchEnabledInFile(const std::filesystem::path& path,
-                           const std::string& patch_name, bool enabled) {
-  std::ifstream in(path);
-  if (!in) {
-    return false;
-  }
-  std::vector<std::string> lines;
-  std::string line;
-  while (std::getline(in, line)) {
-    lines.push_back(line);
-  }
-  in.close();
-  auto trimmed = [](const std::string& l) {
-    size_t b = l.find_first_not_of(" \t");
-    return b == std::string::npos ? std::string() : l.substr(b);
-  };
-  auto quoted_value = [](const std::string& t) {
-    size_t q1 = t.find('"');
-    size_t q2 = q1 == std::string::npos ? q1 : t.find('"', q1 + 1);
-    return q2 == std::string::npos ? std::string()
-                                   : t.substr(q1 + 1, q2 - q1 - 1);
-  };
-  bool in_patch = false;
-  bool in_target = false;
-  size_t name_line = std::string::npos;
-  bool done = false;
-  for (size_t i = 0; i < lines.size() && !done; ++i) {
-    std::string t = trimmed(lines[i]);
-    if (t.rfind("[[patch]]", 0) == 0) {
-      if (in_target && name_line != std::string::npos) {
-        break;  // the target had no is_enabled line: insert after its name
-      }
-      in_patch = true;
-      in_target = false;
-      continue;
-    }
-    if (t.rfind("[[", 0) == 0 || t.rfind("[", 0) == 0) {
-      if (in_target && name_line != std::string::npos) {
-        break;
-      }
-      in_patch = false;  // a data table such as [[patch.be32]]
-      continue;
-    }
-    if (!in_patch) {
-      continue;
-    }
-    if (!in_target && t.rfind("name", 0) == 0 &&
-        t.find('=') != std::string::npos && quoted_value(t) == patch_name) {
-      in_target = true;
-      name_line = i;
-      continue;
-    }
-    if (in_target && t.rfind("is_enabled", 0) == 0) {
-      size_t indent = lines[i].find_first_not_of(" \t");
-      std::string prefix =
-          indent == std::string::npos ? "" : lines[i].substr(0, indent);
-      size_t hash = lines[i].find('#');
-      std::string comment =
-          hash == std::string::npos ? "" : " " + lines[i].substr(hash);
-      lines[i] =
-          prefix + "is_enabled = " + (enabled ? "true" : "false") + comment;
-      done = true;
-    }
-  }
-  if (!done) {
-    if (name_line == std::string::npos) {
-      return false;
-    }
-    size_t indent = lines[name_line].find_first_not_of(" \t");
-    std::string prefix =
-        indent == std::string::npos ? "" : lines[name_line].substr(0, indent);
-    lines.insert(lines.begin() + name_line + 1,
-                 prefix + "is_enabled = " + (enabled ? "true" : "false"));
-  }
-  std::ofstream out(path, std::ios::trunc);
-  if (!out) {
-    return false;
-  }
-  for (const std::string& l : lines) {
-    out << l << '\n';
-  }
-  return bool(out);
-}
-
-// Blob ids of the community files downloaded through the tab, one
-// "<sha> <file name>" per line in the storage root, so a file whose
-// is_enabled flags were toggled still counts as up to date.
-std::filesystem::path CommunityShaFile(const std::filesystem::path& root) {
-  return root / "community_patch_shas.txt";
-}
-
-std::map<std::string, std::string> LoadCommunityShas(
-    const std::filesystem::path& root) {
-  std::map<std::string, std::string> shas;
-  std::ifstream in(CommunityShaFile(root));
-  std::string line;
-  while (std::getline(in, line)) {
-    size_t space = line.find(' ');
-    if (space == 40) {
-      shas[line.substr(41)] = line.substr(0, 40);
-    }
-  }
-  return shas;
-}
-
-void RecordCommunitySha(const std::filesystem::path& root,
-                        const std::string& name, const std::string& sha) {
-  auto shas = LoadCommunityShas(root);
-  shas[name] = sha;
-  std::ofstream out(CommunityShaFile(root), std::ios::trunc);
-  for (const auto& [n, s] : shas) {
-    out << s << ' ' << n << '\n';
-  }
-}
-
-// Blob id of the file with every "is_enabled = true" set back to false (the
-// repository ships them all off), for copies that were not downloaded here.
-std::string NormalisedBlobSha(const std::filesystem::path& path) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) {
-    return "";
-  }
-  std::string content((std::istreambuf_iterator<char>(in)),
-                      std::istreambuf_iterator<char>());
-  static const std::regex enabled_true(
-      "(^|\n)([ \t]*is_enabled[ \t]*=[ \t]*)true");
-  content = std::regex_replace(content, enabled_true, "$1$2false");
-  std::error_code ec;
-  std::filesystem::path temp =
-      std::filesystem::temp_directory_path(ec) / "xenia_patch_sha.tmp";
-  {
-    std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-    out << content;
-  }
-  std::string sha = GitBlobSha(temp);
-  std::filesystem::remove(temp, ec);
-  return sha;
-}
-
-enum class CommunityFileState { kMissing, kOutdated, kCurrent };
-CommunityFileState StateOfCommunityFile(
-    const std::filesystem::path& root, const std::string& name,
-    const std::string& tree_sha,
-    const std::map<std::string, std::string>& recorded) {
-  std::filesystem::path local = root / "patches" / name;
-  if (!std::filesystem::exists(local)) {
-    return CommunityFileState::kMissing;
-  }
-  auto it = recorded.find(name);
-  if (it != recorded.end()) {
-    return it->second == tree_sha ? CommunityFileState::kCurrent
-                                  : CommunityFileState::kOutdated;
-  }
-  return NormalisedBlobSha(local) == tree_sha ? CommunityFileState::kCurrent
-                                              : CommunityFileState::kOutdated;
-}
-
 struct IdleCall {
   std::function<void()> fn;
 };
@@ -7051,13 +6797,6 @@ void ClearChildren(GtkWidget* container) {
   }
   g_list_free(children);
 }
-
-const char* kCommunityPatchesTreeUrl =
-    "https://api.github.com/repos/xenia-canary/game-patches/git/trees/"
-    "main?recursive=1";
-const char* kCommunityPatchesRawUrl =
-    "https://raw.githubusercontent.com/xenia-canary/game-patches/main/"
-    "patches/";
 
 std::optional<ui::VirtualKey> VirtualKeyFromGdk(guint keyval) {
   if (keyval >= GDK_KEY_F1 && keyval <= GDK_KEY_F24) {
@@ -7093,69 +6832,6 @@ std::optional<ui::VirtualKey> VirtualKeyFromGdk(guint keyval) {
     default:
       return std::nullopt;
   }
-}
-
-// Guess which tab a patch entry belongs on from its name. The .patch.toml
-// format has no category field, so the community files mix graphics fixes,
-// gameplay cheats and debug toys in one list. The name decides: descriptions
-// mention cheats too often to be safe ("No clipping, collision bugs..." under
-// a 60 FPS entry, "Cheat Engine address: ..." under a camera one), and only
-// the two most unmistakable phrases are read out of one. Anything the words
-// do not recognise is a plain patch; the user can move an entry with the
-// button beside it and the choice is remembered.
-PatchCategory GuessPatchCategory(const std::string& name,
-                                 const std::string& desc) {
-  auto lower = [](const std::string& text) {
-    std::string out = text;
-    std::transform(out.begin(), out.end(), out.begin(),
-                   [](unsigned char c) { return char(::tolower(c)); });
-    return out;
-  };
-  std::string lower_name = lower(name);
-  std::string lower_desc = lower(desc);
-  auto name_has = [&lower_name](const char* needle) {
-    return lower_name.find(needle) != std::string::npos;
-  };
-  // A stability or rendering fix wins over any word below: entries like
-  // "Skip infinite loop on race end" are fixes that read as something else.
-  if (name_has("fix") || name_has("loop") || name_has("crash") ||
-      name_has("hash check")) {
-    return PatchCategory::kFix;
-  }
-  // The game's own toys, checked first: "Enable Debug Menu" is an extra even
-  // though such menus are where the cheats usually live.
-  static const char* kExtraWords[] = {
-      "debug menu",         "debug settings", "developer menu",
-      "developer settings", "dev menu",       "test menu",
-      "level select",       "free cam",       "freecam",
-      "free camera",        "helicam",        "fly around",
-      "wireframe",          "skip intro",     "skip logo",
-      "skip video",         "skip movie",     "camera bounding box",
-  };
-  for (const char* word : kExtraWords) {
-    if (name_has(word)) {
-      return PatchCategory::kExtra;
-    }
-  }
-  static const char* kCheatWords[] = {
-      "infinite",     "unlimited",     "god mode",   "godmode",
-      "invincib",     "no clip",       "noclip",     "one hit kill",
-      "one-hit kill", "instant kill",  "unlock all", "all items",
-      "all weapons",  "all character", "all cars",   "bottomless",
-      "max money",    "max health",    "max ammo",   "max level",
-      "max stats",    "never die",     "always win", "no reload",
-      "cheat",
-  };
-  for (const char* word : kCheatWords) {
-    if (name_has(word)) {
-      return PatchCategory::kCheat;
-    }
-  }
-  if (lower_desc.find("god mode") != std::string::npos ||
-      lower_desc.find("invincib") != std::string::npos) {
-    return PatchCategory::kCheat;
-  }
-  return PatchCategory::kFix;
 }
 
 }  // namespace
@@ -9292,201 +8968,7 @@ std::map<uint32_t, std::string> EmulatorWindow::PatchTitles() {
   return titles;
 }
 
-namespace {
-
-const char* PatchCategoryTabName(PatchCategory category) {
-  switch (category) {
-    case PatchCategory::kCheat:
-      return "Cheats";
-    case PatchCategory::kExtra:
-      return "Extras";
-    default:
-      return "Patches";
-  }
-}
-
-const char* PatchCategoryIntro(PatchCategory category) {
-  switch (category) {
-    case PatchCategory::kCheat:
-      return "Cheats give an advantage in the game: infinite ammo or health, "
-             "god mode, everything unlocked. Most games have none.";
-    case PatchCategory::kExtra:
-      return "Extras are the game's own toys: debug menus, a free camera, "
-             "wireframe drawing, skipped intro videos.";
-    default:
-      return "Patches change how the game runs: frame rate, resolution, "
-             "filtering, broken effects.";
-  }
-}
-
-const char* PatchCategoryKeyword(PatchCategory category) {
-  switch (category) {
-    case PatchCategory::kCheat:
-      return "cheat";
-    case PatchCategory::kExtra:
-      return "extra";
-    default:
-      return "fix";
-  }
-}
-
-std::string PatchCategoryKey(const std::filesystem::path& file,
-                             const std::string& name) {
-  return file.filename().string() + "|" + name;
-}
-
-}  // namespace
-
-// The user's own placements, one per line: <category> <file> <patch>, tab
-// separated. Names never contain a tab; the file is rewritten whole.
-void EmulatorWindow::LoadPatchCategories() {
-  if (patch_categories_loaded_) {
-    return;
-  }
-  patch_categories_loaded_ = true;
-  std::ifstream in(emulator_->storage_root() / "patch_categories.txt");
-  if (!in) {
-    return;
-  }
-  std::string line;
-  while (std::getline(in, line)) {
-    size_t first = line.find('\t');
-    if (first == std::string::npos) {
-      continue;
-    }
-    size_t second = line.find('\t', first + 1);
-    if (second == std::string::npos) {
-      continue;
-    }
-    std::string keyword = line.substr(0, first);
-    std::string file = line.substr(first + 1, second - first - 1);
-    std::string name = line.substr(second + 1);
-    PatchCategory category = PatchCategory::kFix;
-    if (keyword == "cheat") {
-      category = PatchCategory::kCheat;
-    } else if (keyword == "extra") {
-      category = PatchCategory::kExtra;
-    }
-    patch_categories_[file + "|" + name] = category;
-  }
-}
-
-void EmulatorWindow::SavePatchCategories() {
-  std::filesystem::path path =
-      emulator_->storage_root() / "patch_categories.txt";
-  std::ofstream out(path, std::ios::trunc);
-  if (!out) {
-    XELOGE("Patches: cannot write {}", path.string());
-    return;
-  }
-  out << "# Where each patch entry appears in the Preferences window.\n";
-  out << "# <category>\\t<patch file>\\t<patch name>\n";
-  for (const auto& [key, category] : patch_categories_) {
-    size_t bar = key.find('|');
-    if (bar == std::string::npos) {
-      continue;
-    }
-    out << PatchCategoryKeyword(category) << '\t' << key.substr(0, bar) << '\t'
-        << key.substr(bar + 1) << '\n';
-  }
-}
-
-PatchCategory EmulatorWindow::PatchCategoryOf(const std::filesystem::path& file,
-                                              const std::string& name,
-                                              const std::string& desc) {
-  LoadPatchCategories();
-  auto it = patch_categories_.find(PatchCategoryKey(file, name));
-  if (it != patch_categories_.end()) {
-    return it->second;
-  }
-  return GuessPatchCategory(name, desc);
-}
-
-void EmulatorWindow::SetPatchCategory(const std::filesystem::path& file,
-                                      const std::string& name,
-                                      PatchCategory category) {
-  LoadPatchCategories();
-  patch_categories_[PatchCategoryKey(file, name)] = category;
-  SavePatchCategories();
-}
-
-// The guest addresses a patch entry writes, as [first, last) pairs.
-static std::vector<std::pair<uint32_t, uint32_t>> PatchWriteRanges(
-    const xe::patcher::PatchInfoEntry& patch) {
-  std::vector<std::pair<uint32_t, uint32_t>> ranges;
-  for (const auto& data : patch.patch_data) {
-    uint32_t size = uint32_t(std::max<size_t>(1, data.data.alloc_size));
-    ranges.emplace_back(data.address, data.address + size);
-  }
-  return ranges;
-}
-
-static bool PatchRangesOverlap(
-    const std::vector<std::pair<uint32_t, uint32_t>>& a,
-    const std::vector<std::pair<uint32_t, uint32_t>>& b) {
-  for (const auto& x : a) {
-    for (const auto& y : b) {
-      if (x.first < y.second && y.first < x.second) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-// Two enabled patches that write the same address fight, and whichever the
-// file loads last wins with nothing on screen to say so. Switching one on
-// switches those off and says which.
-std::vector<std::string> EmulatorWindow::DisableConflictingPatches(
-    const std::filesystem::path& file, const std::string& name) {
-  std::vector<std::string> turned_off;
-  auto* patcher = emulator_->patcher();
-  if (!patcher) {
-    return turned_off;
-  }
-  const xe::patcher::PatchInfoEntry* self = nullptr;
-  uint32_t title = 0;
-  for (const auto& f : patcher->patch_db()->GetAllPatches()) {
-    if (f.file_path != file) {
-      continue;
-    }
-    for (const auto& patch : f.patch_info) {
-      if (patch.patch_name == name) {
-        self = &patch;
-        title = f.title_id;
-      }
-    }
-  }
-  if (!self) {
-    return turned_off;
-  }
-  auto mine = PatchWriteRanges(*self);
-  for (const auto& f : patcher->patch_db()->GetAllPatches()) {
-    if (f.title_id != title) {
-      continue;
-    }
-    for (const auto& patch : f.patch_info) {
-      if (!patch.is_enabled ||
-          (f.file_path == file && patch.patch_name == name)) {
-        continue;
-      }
-      if (!PatchRangesOverlap(mine, PatchWriteRanges(patch))) {
-        continue;
-      }
-      if (SetPatchEnabledInFile(f.file_path, patch.patch_name, false)) {
-        turned_off.push_back(patch.patch_name);
-        XELOGI(
-            "Patches: switched off '{}' in {}, it writes the same "
-            "address as '{}'",
-            patch.patch_name, f.file_path.filename().string(), name);
-      }
-    }
-  }
-  if (!turned_off.empty()) {
-    patcher->patch_db()->Reload(true);
-  }
-  return turned_off;
-}
+namespace {}  // namespace
 
 void EmulatorWindow::BuildPatchesTab(void* notebook_ptr) {
   for (int index = 0; index < kPatchCategoryCount; ++index) {
@@ -9704,8 +9186,8 @@ void EmulatorWindow::RefreshPatchesTab() {
         ++file_count;
         std::vector<const xe::patcher::PatchInfoEntry*> entries;
         for (const auto& patch : file.patch_info) {
-          if (PatchCategoryOf(file.file_path, patch.patch_name,
-                              patch.patch_desc) == category) {
+          if (patch_categories_.Of(file.file_path, patch.patch_name,
+                                   patch.patch_desc) == category) {
             entries.push_back(&patch);
           }
         }
@@ -9789,8 +9271,9 @@ void EmulatorWindow::RefreshPatchesTab() {
                   patcher->patch_db()->Reload(true);
                 }
                 std::vector<std::string> dropped;
-                if (ok && on) {
-                  dropped = DisableConflictingPatches(path, name);
+                if (ok && on && emulator_->patcher()) {
+                  dropped = DisableConflictingPatches(
+                      *emulator_->patcher()->patch_db(), path, name);
                 }
                 std::string message =
                     ok ? (emulator_->is_title_open()
@@ -9833,7 +9316,7 @@ void EmulatorWindow::RefreshPatchesTab() {
                     .c_str());
             AttachSettingsCallback(
                 move, "clicked", [this, path, name, target](GtkWidget*) {
-                  SetPatchCategory(path, name, target);
+                  patch_categories_.Set(path, name, target);
                   // The click's widget is inside the list this rebuilds, so
                   // do it once the signal has returned.
                   PostToUIThread([this]() { RefreshPatchesTab(); });
@@ -9972,59 +9455,9 @@ void EmulatorWindow::LookupCommunityPatches() {
   gtk_label_set_text(GTK_LABEL(community_status_), "Looking up...");
   std::thread([this]() {
     xe::threading::set_name("Patch lookup");
-    int code = 0;
-    std::string json = RunCommandCapture(
-        fmt::format("curl -sSfL --max-time 60 -H 'User-Agent: xenia-canary' "
-                    "-H 'Accept: application/vnd.github+json' {} 2>&1",
-                    ShellQuote(kCommunityPatchesTreeUrl)),
-        &code);
     std::vector<CommunityPatchFile> files;
     std::string error;
-    if (code != 0) {
-      error = fmt::format("curl failed ({}): {}", code, json.substr(0, 200));
-    } else {
-      size_t pos = 0;
-      const std::string key = "\"path\":\"";
-      while ((pos = json.find(key, pos)) != std::string::npos) {
-        pos += key.size();
-        std::string raw;
-        size_t end = pos;
-        while (end < json.size() && json[end] != '"') {
-          if (json[end] == '\\' && end + 1 < json.size()) {
-            raw += json[end];
-            raw += json[end + 1];
-            end += 2;
-            continue;
-          }
-          raw += json[end++];
-        }
-        std::string path = JsonUnescape(raw);
-        size_t sha_pos = json.find("\"sha\":\"", end);
-        std::string sha =
-            sha_pos == std::string::npos ? "" : json.substr(sha_pos + 7, 40);
-        pos = end;
-        const std::string prefix = "patches/";
-        const std::string suffix = ".patch.toml";
-        if (path.rfind(prefix, 0) != 0 || path.size() < suffix.size() ||
-            path.compare(path.size() - suffix.size(), suffix.size(), suffix) !=
-                0) {
-          continue;
-        }
-        std::string name = path.substr(prefix.size());
-        if (name.size() < 8) {
-          continue;
-        }
-        CommunityPatchFile file;
-        file.name = name;
-        file.sha = sha;
-        file.title_id =
-            uint32_t(strtoul(name.substr(0, 8).c_str(), nullptr, 16));
-        files.push_back(std::move(file));
-      }
-      if (files.empty()) {
-        error = "No patch files in the reply: " + json.substr(0, 200);
-      }
-    }
+    FetchCommunityPatchList(&files, &error);
     PostToUIThread([this, files, error]() {
       community_lookup_running_ = false;
       if (!error.empty()) {
@@ -10035,10 +9468,6 @@ void EmulatorWindow::LookupCommunityPatches() {
         return;
       }
       community_patch_files_ = files;
-      std::sort(community_patch_files_.begin(), community_patch_files_.end(),
-                [](const CommunityPatchFile& a, const CommunityPatchFile& b) {
-                  return a.name < b.name;
-                });
       community_looked_up_ = true;
       XELOGI("Patches: community list has {} files", files.size());
       RefreshCommunityPatchList();
@@ -10458,59 +9887,41 @@ void EmulatorWindow::DownloadCommunityPatch(const std::string& name) {
   std::filesystem::create_directories(folder, ec);
   std::filesystem::path target = folder / name;
   std::filesystem::path temp = folder / (name + ".download");
-  std::string url = kCommunityPatchesRawUrl + UrlEncodeComponent(name);
   ++community_downloads_running_;
   RefreshCommunityPatchList();
-  std::thread([this, name, url, target, temp]() {
+  std::thread([this, name, target, temp]() {
     xe::threading::set_name("Patch download");
-    int code = 0;
-    std::string out = RunCommandCapture(
-        fmt::format("curl -sSfL --max-time 60 -H 'User-Agent: xenia-canary' "
-                    "-o {} {} 2>&1",
-                    ShellQuote(temp.string()), ShellQuote(url)),
-        &code);
-    PostToUIThread([this, name, target, temp, code, out]() {
+    std::string error;
+    bool ok = app::DownloadCommunityPatch(name, temp, &error);
+    PostToUIThread([this, name, target, temp, ok, error]() {
       --community_downloads_running_;
       std::error_code ec;
-      if (code != 0) {
-        XELOGE("Patches: download of {} failed ({}): {}", name, code, out);
+      if (!ok) {
+        XELOGE("Patches: download of {} failed: {}", name, error);
         std::filesystem::remove(temp, ec);
         if (community_status_) {
           gtk_label_set_text(
               GTK_LABEL(community_status_),
-              fmt::format("Download of {} failed: {}", name, out).c_str());
+              fmt::format("Download of {} failed: {}", name, error).c_str());
         }
         return;
       }
-      // Keep what was enabled in the old copy.
-      std::vector<std::string> enabled;
-      auto* patcher = emulator_->patcher();
-      if (patcher && std::filesystem::exists(target)) {
-        auto old = patcher->patch_db()->ReadPatchFile(target);
-        for (const auto& patch : old.patch_info) {
-          if (patch.is_enabled) {
-            enabled.push_back(patch.patch_name);
-          }
-        }
-      }
-      std::filesystem::rename(temp, target, ec);
-      if (ec) {
-        XELOGE("Patches: cannot move {} into place: {}", name, ec.message());
-        return;
-      }
-      for (const std::string& patch_name : enabled) {
-        SetPatchEnabledInFile(target, patch_name, true);
-      }
+      std::string sha;
       for (const CommunityPatchFile& file : community_patch_files_) {
         if (file.name == name) {
-          RecordCommunitySha(emulator_->storage_root(), name, file.sha);
+          sha = file.sha;
           break;
         }
       }
+      auto* patcher = emulator_->patcher();
+      int kept =
+          InstallCommunityPatch(patcher ? patcher->patch_db() : nullptr, temp,
+                                target, emulator_->storage_root(), name, sha);
+      if (kept < 0) {
+        return;
+      }
       XELOGI("Patches: downloaded {}{}", name,
-             enabled.empty() ? ""
-                             : fmt::format(" ({} previously enabled kept)",
-                                           enabled.size()));
+             kept ? fmt::format(" ({} previously enabled kept)", kept) : "");
       if (patcher) {
         patcher->patch_db()->Reload(true);
       }
