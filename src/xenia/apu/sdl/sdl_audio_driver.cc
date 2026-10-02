@@ -11,6 +11,11 @@
 
 #include "xenia/base/clock.h"
 
+// SDL_cpuinfo.h defines __SSE__ with no value under MSVC, and SoundTouch's
+// STTypes.h tests it in an #if, which MSVC rejects (C1017).
+#if defined(_MSC_VER) && !defined(__clang__)
+#undef __SSE__
+#endif
 #include "third_party/soundtouch/include/SoundTouch.h"
 #include "xenia/apu/audio_system.h"
 

@@ -256,6 +256,13 @@ if(MSVC)
   target_compile_options(reshade-fx PRIVATE /Zc:char8_t-)
 endif()
 
+# The nested configures below generate headers into the submodules; a
+# cross-compile has to hand them the same toolchain.
+set(_xe_subconfigure_args)
+if(CMAKE_TOOLCHAIN_FILE)
+  list(APPEND _xe_subconfigure_args "-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}")
+endif()
+
 # snappy
 # ==============================================================================
 # Generate snappy-stubs-public.h if missing
@@ -267,6 +274,7 @@ if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/snappy/snappy-stubs-public.h")
   endif()
   execute_process(
     COMMAND ${CMAKE_COMMAND}
+      ${_xe_subconfigure_args}
       -DSNAPPY_BUILD_TESTS=OFF
       -DSNAPPY_BUILD_BENCHMARKS=OFF
       ${_snappy_avx_flag}
@@ -349,6 +357,7 @@ endforeach()
 if(_zlibng_needs_configure)
   execute_process(
     COMMAND ${CMAKE_COMMAND}
+      ${_xe_subconfigure_args}
       -DZLIB_ENABLE_TESTS=OFF
       -DWITH_GTEST=OFF
       ${CMAKE_CURRENT_SOURCE_DIR}/zlib-ng
@@ -395,7 +404,8 @@ else()
     X86_AVX512VNNI
     WITH_GZFILEOP
   )
-  if(NOT MSVC)
+  # clang-cl defines MSVC but, like GCC/Clang, needs the per-file ISA flags.
+  if(NOT MSVC OR CMAKE_C_COMPILER_ID STREQUAL "Clang")
     # GCC/Clang have native __builtin_ctz/__builtin_ctzll (MSVC gets these
     # from fallback_builtins.h). Defining these enables optimized compare256
     # and longest_match codepaths.

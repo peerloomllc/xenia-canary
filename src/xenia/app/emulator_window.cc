@@ -510,11 +510,15 @@ void EmulatorWindow::OnEmulatorInitialized() {
     // Under gamescope the library is invisible in fullscreen, and this runs
     // after it has been shown. Owe the fullscreen instead and take it when a
     // title has the screen, rather than entering and leaving it in a flash.
+#if XE_PLATFORM_LINUX
     if (DashboardShown() && RunningUnderGamescope()) {
       dashboard_suspended_fullscreen_ = true;
     } else {
       SetFullscreen(true);
     }
+#else
+    SetFullscreen(true);
+#endif
   }
 
   if (IsUseNexusForGameBarEnabled()) {
@@ -1346,7 +1350,9 @@ bool EmulatorWindow::Initialize() {
 
   // Kept so the gamepad can open the menu bar: the window's own accessor for
   // it is protected, and this is the last point where we own the pointer.
+#if XE_PLATFORM_LINUX
   main_menu_for_pad_ = main_menu.get();
+#endif
   window_->SetMainMenu(std::move(main_menu));
 
   if (cvars::screenshot_burst_seconds > 0) {
@@ -1536,9 +1542,11 @@ bool EmulatorWindow::Initialize() {
 #endif
         } else if (which.rfind("open:", 0) == 0) {
           RunTitle(which.substr(5));
+#if XE_PLATFORM_LINUX
         } else if (which.rfind("launch_index:", 0) == 0) {
           // A library launch by index, as a double-click on the row would.
           LaunchLibraryIndex(std::atoi(which.c_str() + 13));
+#endif
         } else if (which == "keyboard_capture") {
           ToggleKeyboardHotkeysDialog();
           capturing_action_ = int(HotkeyAction::kPauseResume);
@@ -5400,7 +5408,9 @@ void EmulatorWindow::GpuClearCaches() {
 void EmulatorWindow::SetFullscreen(bool fullscreen_) {
   // The user asking for a fullscreen state of their own settles it, so stop
   // owing the one UpdateDashboardFullscreen turned off.
+#if XE_PLATFORM_LINUX
   dashboard_suspended_fullscreen_ = false;
+#endif
   if (window_->IsFullscreen() == fullscreen_) {
     return;
   }
