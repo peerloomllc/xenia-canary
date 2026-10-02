@@ -290,7 +290,7 @@ class EmulatorWindow {
   std::unique_ptr<ReShadeOverlayDialog> reshade_overlay_dialog_;
   // Display > Dialog size: cvar ui_scale, applied to the ImGui drawer.
   void SetUIScale(float scale);
-#if XE_PLATFORM_LINUX
+#if XE_UI_GTK
   // Display > Settings window...: a GTK window (Graphics, Folders, Hotkeys
   // tabs) over the same config variables as the ImGui dialogs; a real
   // window that can sit next to or outside the game.
@@ -618,7 +618,7 @@ class EmulatorWindow {
   void ResetGame();
   void CloseGame();
   // Starts a new emulator process with this one's arguments and `path` as
-  // the title (none if empty), then closes this window. Linux only.
+  // the title (none if empty), then closes this window. Linux and Windows.
   bool RelaunchProcess(const std::filesystem::path& path);
   std::filesystem::path last_launched_path_;
   void PickFmvReplacementDir();  // folder picker; call from the UI loop

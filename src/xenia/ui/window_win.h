@@ -112,6 +112,10 @@ class Win32Window : public Window {
   // thread, but the timer can be active only with a valid window anyway.
   HWND hwnd_ = nullptr;
 
+  // GLib idle source id of a paint request waiting for the GLib main loop
+  // (XE_UI_GTK builds with GTK running), or 0.
+  unsigned int paint_idle_source_ = 0;
+
   uint32_t batched_size_update_depth_ = 0;
   bool batched_size_update_contained_wm_size_ = false;
   bool batched_size_update_contained_wm_paint_ = false;

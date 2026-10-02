@@ -14,6 +14,11 @@
 
 #include <regex>
 #include <thread>
+#if XE_PLATFORM_WIN32
+#include "xenia/base/platform_win.h"
+
+#include <shellapi.h>
+#endif
 #if XE_PLATFORM_LINUX
 #include <unistd.h>
 #include <cerrno>
@@ -1220,7 +1225,7 @@ bool EmulatorWindow::Initialize() {
   // adjusted while watching the picture.
   auto settings_menu = MenuItem::Create(MenuItem::Type::kPopup, "&Settings");
   {
-#if XE_PLATFORM_LINUX
+#if XE_UI_GTK
     settings_menu->AddChild(MenuItem::Create(
         MenuItem::Type::kString, "&Preferences...", "",
         std::bind(&EmulatorWindow::ToggleSettingsWindow, this)));
@@ -1261,7 +1266,7 @@ bool EmulatorWindow::Initialize() {
           std::bind(&EmulatorWindow::SetUIScale, this, scale)));
     }
     panels->AddChild(std::move(size_menu));
-#if XE_PLATFORM_LINUX
+#if XE_UI_GTK
     settings_menu->AddChild(std::move(panels));
 #endif
   }
@@ -1530,7 +1535,7 @@ bool EmulatorWindow::Initialize() {
         } else if (which == "gpu") {
           ToggleGpuOptionsDialog();
         } else if (which == "settings") {
-#if XE_PLATFORM_LINUX
+#if XE_UI_GTK
           ToggleSettingsWindow();
 #endif
         } else if (which == "large") {
@@ -4875,10 +4880,73 @@ void EmulatorWindow::CloseGame() {
   RelaunchProcess("");
 }
 
+namespace {
+// The command line of a relaunch: this process's arguments with the title
+// path replaced (or removed), a numbered log file so the old log is kept,
+// and none of this session's experiment timers. args[0] is the executable.
+std::vector<std::string> RelaunchArguments(const std::vector<std::string>& args,
+                                           const std::filesystem::path& path) {
+  std::vector<std::string> new_args;
+  new_args.push_back(args[0]);
+  for (size_t i = 1; i < args.size(); ++i) {
+    const std::string& a = args[i];
+    if (a.rfind("--", 0) != 0) {
+      continue;  // the old title path (or any positional argument)
+    }
+    if (a.rfind("--log_file=", 0) == 0) {
+      std::filesystem::path log = xe::to_path(a.substr(11));
+      std::string stem = xe::path_to_utf8(log.stem());
+      int n = 2;
+      size_t p = stem.rfind("-relaunch");
+      if (p != std::string::npos) {
+        n = std::atoi(stem.c_str() + p + 9) + 1;
+        stem.resize(p);
+      }
+      log = log.parent_path() /
+            xe::to_path(stem + "-relaunch" + std::to_string(n) +
+                        xe::path_to_utf8(log.extension()));
+      new_args.push_back("--log_file=" + xe::path_to_utf8(log));
+      continue;
+    }
+    if (a.rfind("--ui_experiment", 0) == 0 ||
+        a.rfind("--savestate_experiment", 0) == 0) {
+      continue;  // timers of this session, not the next one
+    }
+    new_args.push_back(a);
+  }
+  if (!path.empty()) {
+    new_args.push_back(xe::path_to_utf8(std::filesystem::absolute(path)));
+  }
+  return new_args;
+}
+
+#if XE_PLATFORM_WIN32
+// One argument quoted for CommandLineToArgvW: backslashes are literal except
+// in front of a quote, where they are doubled.
+std::wstring QuoteWin32Argument(const std::wstring& arg) {
+  if (!arg.empty() && arg.find_first_of(L" \t\n\v\"") == std::wstring::npos) {
+    return arg;
+  }
+  std::wstring out = L"\"";
+  size_t backslashes = 0;
+  for (wchar_t c : arg) {
+    if (c == L'\\') {
+      ++backslashes;
+      continue;
+    }
+    out.append(c == L'"' ? backslashes * 2 + 1 : backslashes, L'\\');
+    backslashes = 0;
+    out += c;
+  }
+  out.append(backslashes * 2, L'\\');
+  out += L'"';
+  return out;
+}
+#endif
+}  // namespace
+
 bool EmulatorWindow::RelaunchProcess(const std::filesystem::path& path) {
 #if XE_PLATFORM_LINUX
-  // The same command line as this process, with the title path replaced
-  // (or removed) and a numbered log file so the old log is kept.
   std::vector<std::string> args;
   {
     std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
@@ -4898,36 +4966,7 @@ bool EmulatorWindow::RelaunchProcess(const std::filesystem::path& path) {
     XELOGE("Relaunch: cannot read /proc/self/cmdline");
     return false;
   }
-  std::vector<std::string> new_args;
-  new_args.push_back(args[0]);
-  for (size_t i = 1; i < args.size(); ++i) {
-    const std::string& a = args[i];
-    if (a.rfind("--", 0) != 0) {
-      continue;  // the old title path (or any positional argument)
-    }
-    if (a.rfind("--log_file=", 0) == 0) {
-      std::filesystem::path log = a.substr(11);
-      std::string stem = log.stem().string();
-      int n = 2;
-      size_t p = stem.rfind("-relaunch");
-      if (p != std::string::npos) {
-        n = std::atoi(stem.c_str() + p + 9) + 1;
-        stem.resize(p);
-      }
-      log = log.parent_path() /
-            (stem + "-relaunch" + std::to_string(n) + log.extension().string());
-      new_args.push_back("--log_file=" + log.string());
-      continue;
-    }
-    if (a.rfind("--ui_experiment", 0) == 0 ||
-        a.rfind("--savestate_experiment", 0) == 0) {
-      continue;  // timers of this session, not the next one
-    }
-    new_args.push_back(a);
-  }
-  if (!path.empty()) {
-    new_args.push_back(std::filesystem::absolute(path).string());
-  }
+  std::vector<std::string> new_args = RelaunchArguments(args, path);
   std::vector<char*> argv;
   for (auto& a : new_args) {
     argv.push_back(a.data());
@@ -4952,15 +4991,57 @@ bool EmulatorWindow::RelaunchProcess(const std::filesystem::path& path) {
     _exit(127);
   }
   XELOGI("Relaunch: new process {}, closing this one", child);
+#elif XE_PLATFORM_WIN32
+  std::vector<std::string> args;
+  {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) {
+      XELOGE("Relaunch: cannot read the command line");
+      return false;
+    }
+    for (int i = 0; i < argc; ++i) {
+      args.push_back(xe::to_utf8(reinterpret_cast<const char16_t*>(argv[i])));
+    }
+    LocalFree(argv);
+  }
+  wchar_t exe[MAX_PATH];
+  DWORD exe_length = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+  if (args.empty() || !exe_length || exe_length == MAX_PATH) {
+    XELOGE("Relaunch: cannot find this executable");
+    return false;
+  }
+  std::vector<std::string> new_args = RelaunchArguments(args, path);
+  std::wstring command_line = QuoteWin32Argument(exe);
+  for (size_t i = 1; i < new_args.size(); ++i) {
+    std::u16string arg = xe::to_utf16(new_args[i]);
+    command_line +=
+        L" " + QuoteWin32Argument(std::wstring(arg.begin(), arg.end()));
+  }
+  XELOGI("Relaunch: {}",
+         xe::to_utf8(std::u16string(command_line.begin(), command_line.end())));
+  xe::FlushLog();
+  STARTUPINFOW startup_info = {};
+  startup_info.cb = sizeof(startup_info);
+  PROCESS_INFORMATION process_info = {};
+  if (!CreateProcessW(exe, command_line.data(), nullptr, nullptr, FALSE, 0,
+                      nullptr, nullptr, &startup_info, &process_info)) {
+    XELOGE("Relaunch: CreateProcess failed ({})", GetLastError());
+    return false;
+  }
+  CloseHandle(process_info.hThread);
+  CloseHandle(process_info.hProcess);
+  XELOGI("Relaunch: new process {}, closing this one",
+         process_info.dwProcessId);
+#else
+  XELOGE("Relaunch: not implemented on this platform");
+  return false;
+#endif
   SaveResumeState();
   AddPlayTime();
   SaveLibrary();
   window_->RequestClose();
   return true;
-#else
-  XELOGE("Relaunch: not implemented on this platform");
-  return false;
-#endif
 }
 
 void EmulatorWindow::InstallContent() {
@@ -6415,15 +6496,22 @@ void EmulatorWindow::AddPlayTime() {
 }  // namespace app
 }  // namespace xe
 
-#if XE_PLATFORM_LINUX
-// Display > Settings window...: GTK, on the UI thread.
+#if XE_UI_GTK
+// The Preferences window (and, on Linux, the game library dashboard,
+// gamepad navigation and the AppImage updater): GTK, on the UI thread.
 
 #include <gtk/gtk.h>
 
 #include "xenia/kernel/util/xex2_info.h"
 #include "xenia/kernel/xam/profile_manager.h"
 #include "xenia/kernel/xam/ui/gamercard_ui.h"
+#if XE_PLATFORM_LINUX
 #include "xenia/ui/window_gtk.h"
+#elif XE_PLATFORM_WIN32
+#include <gdk/gdkwin32.h>
+
+#include "xenia/ui/window_win.h"
+#endif
 #include "xenia/vfs/devices/disc_image_device.h"
 #include "xenia/vfs/devices/disc_zarchive_device.h"
 #include "xenia/vfs/file.h"
@@ -6509,8 +6597,30 @@ GtkWidget* LeftLabel(const char* text) {
 // happens to rest on a combo box is not discoverable, and hovering a control
 // to read about it invites changing it by accident.
 GtkWidget* HelpIcon(const char* name) {
+#if XE_PLATFORM_WIN32
+  // Adwaita's symbolic icons are SVG, and the SVG loader (librsvg) would add
+  // 32 MB to the Windows build for this one icon: a "?" in a circle instead.
+  static GtkCssProvider* css = []() {
+    GtkCssProvider* provider = gtk_css_provider_new();
+    gtk_css_provider_load_from_data(
+        provider,
+        "label.xe-help { border: 1px solid; border-radius: 50%; "
+        "min-width: 13px; min-height: 13px; padding: 0; "
+        "font-size: 8pt; font-weight: bold; }",
+        -1, nullptr);
+    gtk_style_context_add_provider_for_screen(
+        gdk_screen_get_default(), GTK_STYLE_PROVIDER(provider),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    return provider;
+  }();
+  (void)css;
+  GtkWidget* icon = gtk_label_new("?");
+  gtk_style_context_add_class(gtk_widget_get_style_context(icon), "xe-help");
+  gtk_widget_set_halign(icon, GTK_ALIGN_START);
+#else
   GtkWidget* icon =
       gtk_image_new_from_icon_name("help-about-symbolic", GTK_ICON_SIZE_MENU);
+#endif
   gtk_widget_set_valign(icon, GTK_ALIGN_CENTER);
   gtk_widget_set_opacity(icon, 0.55);
   SetTooltipFromCvar(icon, name);
@@ -6742,6 +6852,7 @@ void SetGpuOptionDeferred(const char* name, const T& value) {
 
 // ---- Patches tab helpers ----
 
+#if XE_PLATFORM_LINUX
 // Run a shell command and return its stdout; exit code in *exit_code.
 std::string RunCommandCapture(const std::string& command, int* exit_code) {
   std::string output;
@@ -6776,6 +6887,8 @@ std::string ShellQuote(const std::string& text) {
   quoted += "'";
   return quoted;
 }
+
+#endif  // XE_PLATFORM_LINUX
 
 struct IdleCall {
   std::function<void()> fn;
@@ -6908,10 +7021,22 @@ void EmulatorWindow::ToggleSettingsWindow() {
   GtkWidget* win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
   gtk_window_set_title(GTK_WINDOW(win), "Xenia preferences");
   gtk_window_set_default_size(GTK_WINDOW(win), 700, 560);
+#if XE_PLATFORM_LINUX
   if (auto* gtk_main = dynamic_cast<ui::GTKWindow*>(window_.get())) {
     gtk_window_set_transient_for(GTK_WINDOW(win),
                                  GTK_WINDOW(gtk_main->window()));
   }
+#elif XE_PLATFORM_WIN32
+  // The main window is not GTK here. Owned by it, the window stays above it
+  // and is minimised with it, as a transient GTK window is on Linux.
+  if (auto* main = dynamic_cast<ui::Win32Window*>(window_.get())) {
+    gtk_widget_realize(win);
+    HWND hwnd = static_cast<HWND>(
+        gdk_win32_window_get_handle(gtk_widget_get_window(win)));
+    SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT,
+                      reinterpret_cast<LONG_PTR>(main->hwnd()));
+  }
+#endif
   settings_refresh_labels_.clear();
   settings_refresh_hooks_.clear();
   settings_changed_notifier = [this]() { RefreshSettingsWindow(); };
@@ -7470,6 +7595,8 @@ void EmulatorWindow::ToggleSettingsWindow() {
 
     // The displays this machine has, by the name the system gives them, so a
     // machine with two identical monitors can still be told which is which.
+#if XE_PLATFORM_LINUX
+    // Only the GTK main window places itself on a chosen display.
     std::vector<std::pair<std::string, std::string>> displays = {
         {"-1", "Automatic (wherever the system puts the window)"}};
     if (GdkDisplay* gdk_display = gdk_display_get_default()) {
@@ -7495,6 +7622,7 @@ void EmulatorWindow::ToggleSettingsWindow() {
                SetGpuOption<int32_t>("display_index",
                                      int32_t(std::atoi(v.c_str())));
              });
+#endif
     AddCheck(grid, row, "Start in fullscreen", "fullscreen", cvars::fullscreen);
 
     grid = NewSection(box, "While a game runs", true);
@@ -7806,6 +7934,7 @@ void EmulatorWindow::ToggleSettingsWindow() {
   XELOGI("Settings window opened");
 }
 
+#if XE_PLATFORM_LINUX
 // ---- Game library dashboard ----
 
 namespace {
@@ -8936,6 +9065,8 @@ bool EmulatorWindow::DashboardShown() const {
   return gtk_main && gtk_main->idle_widget_shown();
 }
 
+#endif  // XE_PLATFORM_LINUX
+
 // ---- Preferences: Profiles tab ----
 
 // ---- Patches tab ----
@@ -9475,6 +9606,7 @@ void EmulatorWindow::LookupCommunityPatches() {
   }).detach();
 }
 
+#if XE_PLATFORM_LINUX
 // Updating an AppImage from the couch.
 //
 // A Steam Deck has no comfortable way to fetch a new build: the installer
@@ -9880,6 +10012,8 @@ void EmulatorWindow::InstallUpdate() {
     });
   }).detach();
 }
+
+#endif  // XE_PLATFORM_LINUX
 
 void EmulatorWindow::DownloadCommunityPatch(const std::string& name) {
   std::filesystem::path folder = emulator_->storage_root() / "patches";
@@ -10378,4 +10512,4 @@ void EmulatorWindow::BuildConsoleTab(void* notebook_ptr) {
 
 }  // namespace app
 }  // namespace xe
-#endif  // XE_PLATFORM_LINUX
+#endif  // XE_UI_GTK
