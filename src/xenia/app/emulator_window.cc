@@ -1220,7 +1220,7 @@ bool EmulatorWindow::Initialize() {
   // adjusted while watching the picture.
   auto settings_menu = MenuItem::Create(MenuItem::Type::kPopup, "&Settings");
   {
-#if XE_PLATFORM_LINUX
+#if XE_UI_GTK
     settings_menu->AddChild(MenuItem::Create(
         MenuItem::Type::kString, "&Preferences...", "",
         std::bind(&EmulatorWindow::ToggleSettingsWindow, this)));
@@ -1261,7 +1261,7 @@ bool EmulatorWindow::Initialize() {
           std::bind(&EmulatorWindow::SetUIScale, this, scale)));
     }
     panels->AddChild(std::move(size_menu));
-#if XE_PLATFORM_LINUX
+#if XE_UI_GTK
     settings_menu->AddChild(std::move(panels));
 #endif
   }
@@ -1530,7 +1530,7 @@ bool EmulatorWindow::Initialize() {
         } else if (which == "gpu") {
           ToggleGpuOptionsDialog();
         } else if (which == "settings") {
-#if XE_PLATFORM_LINUX
+#if XE_UI_GTK
           ToggleSettingsWindow();
 #endif
         } else if (which == "large") {
@@ -6415,15 +6415,22 @@ void EmulatorWindow::AddPlayTime() {
 }  // namespace app
 }  // namespace xe
 
-#if XE_PLATFORM_LINUX
-// Display > Settings window...: GTK, on the UI thread.
+#if XE_UI_GTK
+// The Preferences window (and, on Linux, the game library dashboard,
+// gamepad navigation and the AppImage updater): GTK, on the UI thread.
 
 #include <gtk/gtk.h>
 
 #include "xenia/kernel/util/xex2_info.h"
 #include "xenia/kernel/xam/profile_manager.h"
 #include "xenia/kernel/xam/ui/gamercard_ui.h"
+#if XE_PLATFORM_LINUX
 #include "xenia/ui/window_gtk.h"
+#elif XE_PLATFORM_WIN32
+#include <gdk/gdkwin32.h>
+
+#include "xenia/ui/window_win.h"
+#endif
 #include "xenia/vfs/devices/disc_image_device.h"
 #include "xenia/vfs/devices/disc_zarchive_device.h"
 #include "xenia/vfs/file.h"
@@ -6509,8 +6516,30 @@ GtkWidget* LeftLabel(const char* text) {
 // happens to rest on a combo box is not discoverable, and hovering a control
 // to read about it invites changing it by accident.
 GtkWidget* HelpIcon(const char* name) {
+#if XE_PLATFORM_WIN32
+  // Adwaita's symbolic icons are SVG, and the SVG loader (librsvg) would add
+  // 32 MB to the Windows build for this one icon: a "?" in a circle instead.
+  static GtkCssProvider* css = []() {
+    GtkCssProvider* provider = gtk_css_provider_new();
+    gtk_css_provider_load_from_data(
+        provider,
+        "label.xe-help { border: 1px solid; border-radius: 50%; "
+        "min-width: 13px; min-height: 13px; padding: 0; "
+        "font-size: 8pt; font-weight: bold; }",
+        -1, nullptr);
+    gtk_style_context_add_provider_for_screen(
+        gdk_screen_get_default(), GTK_STYLE_PROVIDER(provider),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    return provider;
+  }();
+  (void)css;
+  GtkWidget* icon = gtk_label_new("?");
+  gtk_style_context_add_class(gtk_widget_get_style_context(icon), "xe-help");
+  gtk_widget_set_halign(icon, GTK_ALIGN_START);
+#else
   GtkWidget* icon =
       gtk_image_new_from_icon_name("help-about-symbolic", GTK_ICON_SIZE_MENU);
+#endif
   gtk_widget_set_valign(icon, GTK_ALIGN_CENTER);
   gtk_widget_set_opacity(icon, 0.55);
   SetTooltipFromCvar(icon, name);
@@ -6742,6 +6771,7 @@ void SetGpuOptionDeferred(const char* name, const T& value) {
 
 // ---- Patches tab helpers ----
 
+#if XE_PLATFORM_LINUX
 // Run a shell command and return its stdout; exit code in *exit_code.
 std::string RunCommandCapture(const std::string& command, int* exit_code) {
   std::string output;
@@ -6776,6 +6806,8 @@ std::string ShellQuote(const std::string& text) {
   quoted += "'";
   return quoted;
 }
+
+#endif  // XE_PLATFORM_LINUX
 
 struct IdleCall {
   std::function<void()> fn;
@@ -6908,10 +6940,22 @@ void EmulatorWindow::ToggleSettingsWindow() {
   GtkWidget* win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
   gtk_window_set_title(GTK_WINDOW(win), "Xenia preferences");
   gtk_window_set_default_size(GTK_WINDOW(win), 700, 560);
+#if XE_PLATFORM_LINUX
   if (auto* gtk_main = dynamic_cast<ui::GTKWindow*>(window_.get())) {
     gtk_window_set_transient_for(GTK_WINDOW(win),
                                  GTK_WINDOW(gtk_main->window()));
   }
+#elif XE_PLATFORM_WIN32
+  // The main window is not GTK here. Owned by it, the window stays above it
+  // and is minimised with it, as a transient GTK window is on Linux.
+  if (auto* main = dynamic_cast<ui::Win32Window*>(window_.get())) {
+    gtk_widget_realize(win);
+    HWND hwnd = static_cast<HWND>(
+        gdk_win32_window_get_handle(gtk_widget_get_window(win)));
+    SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT,
+                      reinterpret_cast<LONG_PTR>(main->hwnd()));
+  }
+#endif
   settings_refresh_labels_.clear();
   settings_refresh_hooks_.clear();
   settings_changed_notifier = [this]() { RefreshSettingsWindow(); };
@@ -7470,6 +7514,8 @@ void EmulatorWindow::ToggleSettingsWindow() {
 
     // The displays this machine has, by the name the system gives them, so a
     // machine with two identical monitors can still be told which is which.
+#if XE_PLATFORM_LINUX
+    // Only the GTK main window places itself on a chosen display.
     std::vector<std::pair<std::string, std::string>> displays = {
         {"-1", "Automatic (wherever the system puts the window)"}};
     if (GdkDisplay* gdk_display = gdk_display_get_default()) {
@@ -7495,6 +7541,7 @@ void EmulatorWindow::ToggleSettingsWindow() {
                SetGpuOption<int32_t>("display_index",
                                      int32_t(std::atoi(v.c_str())));
              });
+#endif
     AddCheck(grid, row, "Start in fullscreen", "fullscreen", cvars::fullscreen);
 
     grid = NewSection(box, "While a game runs", true);
@@ -7806,6 +7853,7 @@ void EmulatorWindow::ToggleSettingsWindow() {
   XELOGI("Settings window opened");
 }
 
+#if XE_PLATFORM_LINUX
 // ---- Game library dashboard ----
 
 namespace {
@@ -8936,6 +8984,8 @@ bool EmulatorWindow::DashboardShown() const {
   return gtk_main && gtk_main->idle_widget_shown();
 }
 
+#endif  // XE_PLATFORM_LINUX
+
 // ---- Preferences: Profiles tab ----
 
 // ---- Patches tab ----
@@ -9475,6 +9525,7 @@ void EmulatorWindow::LookupCommunityPatches() {
   }).detach();
 }
 
+#if XE_PLATFORM_LINUX
 // Updating an AppImage from the couch.
 //
 // A Steam Deck has no comfortable way to fetch a new build: the installer
@@ -9880,6 +9931,8 @@ void EmulatorWindow::InstallUpdate() {
     });
   }).detach();
 }
+
+#endif  // XE_PLATFORM_LINUX
 
 void EmulatorWindow::DownloadCommunityPatch(const std::string& name) {
   std::filesystem::path folder = emulator_->storage_root() / "patches";
@@ -10378,4 +10431,4 @@ void EmulatorWindow::BuildConsoleTab(void* notebook_ptr) {
 
 }  // namespace app
 }  // namespace xe
-#endif  // XE_PLATFORM_LINUX
+#endif  // XE_UI_GTK
