@@ -54,8 +54,6 @@ jobs:
 
   build-windows:
     name: Windows (x86-64)
-    needs: [lint, commit-message]
-    if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/Windows_x86.yml
   build-linux:
     name: Linux (x86-64)
