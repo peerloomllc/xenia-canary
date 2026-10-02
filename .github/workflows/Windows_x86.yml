@@ -63,7 +63,29 @@ jobs:
           $SUBMODULES=(Select-String -CaseSensitive '(?<=path = )(?!third_party\/xbyak_aarch64).+' .gitmodules).Matches.Value
           git submodule update --init --depth=1 -j $env:NUMBER_OF_PROCESSORS $SUBMODULES
 
+      - name: Cache GTK3
+        id: cache-gtk3
+        uses: actions/cache@v6
+        with:
+          path: C:\gtk3
+          key: gtk3-gvsbuild-2026.8.0
+
+      # The Settings window and game library are GTK, as on Linux.
+      - name: Download GTK3 (gvsbuild)
+        if: steps.cache-gtk3.outputs.cache-hit != 'true'
+        run: |-
+          Invoke-WebRequest -Uri "https://github.com/wingtk/gvsbuild/releases/download/2026.8.0/GTK3_Gvsbuild_2026.8.0_x64.zip" -OutFile gtk3.zip
+          $hash = (Get-FileHash gtk3.zip -Algorithm SHA256).Hash
+          if ($hash -ne "9BE43D9029749062D2637070C856E73F8A1327A72259D08326B38155C139ECDC") {
+            echo "::error:: GTK3 zip hash $hash does not match."
+            exit 1
+          }
+          7z x gtk3.zip -oC:\gtk3 "bin\*.dll" "lib\*" "include\*" "share\icons\*" "share\glib-2.0\*" "share\doc\*" "-xr!gtk-4.0" -y -bso0
+          Remove-Item gtk3.zip
+
       - name: Build Xenia
+        env:
+          XE_GTK3_ROOT: C:\gtk3
         run: python xenia-build.py build --config=Release --target=xenia-app
 
       - name: Prepare artifacts
@@ -74,7 +96,7 @@ jobs:
             exit 1
           }
           $path="xenia_canary_windows.7z"
-          7z a $path .\build\bin\Windows\Release\xenia_canary.exe LICENSE -mx9 -bb3
+          7z a $path .\build\bin\Windows\Release\xenia_canary.exe .\build\bin\Windows\Release\*.dll .\build\bin\Windows\Release\share LICENSE -mx9 -bb1
           if ((Get-Item "$path").Length -le 100000) {
             echo "::error:: Archive is too small."
             exit 1
