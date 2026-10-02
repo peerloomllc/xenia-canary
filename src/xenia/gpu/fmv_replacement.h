@@ -12,9 +12,9 @@
 
 #include <array>
 #include <atomic>
-#include <deque>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -59,8 +59,7 @@ class FmvReplacement {
   void RescanFolder();
 
   // From the disc file system, on the reading thread.
-  void OnDiscRead(std::string_view file_name, uint64_t offset,
-                  uint64_t length);
+  void OnDiscRead(std::string_view file_name, uint64_t offset, uint64_t length);
 
   // True while a movie has been read but not finished: the swap should
   // capture a thumbnail of the guest's own picture.
@@ -103,8 +102,8 @@ class FmvReplacement {
   // The movie playing, guarded by mutex_.
   const Movie* playing_ = nullptr;
   uint64_t generation_ = 0;
-  uint32_t start_guest_ms_ = 0;   // When the guest's own movie started.
-  uint32_t arm_guest_ms_ = 0;     // When the movie was read from the disc.
+  uint32_t start_guest_ms_ = 0;  // When the guest's own movie started.
+  uint32_t arm_guest_ms_ = 0;    // When the movie was read from the disc.
   uint32_t last_video_guest_ms_ = 0;
   bool started_ = false;
   uint32_t last_swap_guest_ms_ = 0;

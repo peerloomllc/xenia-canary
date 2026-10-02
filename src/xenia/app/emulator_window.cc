@@ -2710,8 +2710,7 @@ void EmulatorWindow::SetFmvReplacementDir(const std::filesystem::path& dir) {
   dynamic_cast<cvar::ConfigVar<std::filesystem::path>*>(it->second)
       ->OverrideConfigValue(dir);
   config::SaveConfig();
-  XELOGI("Upscaled cutscenes folder: {}",
-         dir.empty() ? "(off)" : dir.string());
+  XELOGI("Upscaled cutscenes folder: {}", dir.empty() ? "(off)" : dir.string());
   gpu::FmvReplacement::Get().RescanFolder();
 }
 

@@ -297,10 +297,10 @@ X_STATUS Emulator::Setup(
   display_window_ = display_window;
   imgui_drawer_ = imgui_drawer;
 
-  vfs::SetDiscReadObserver([](const std::string& name, uint64_t offset,
-                              uint64_t length) {
-    gpu::FmvReplacement::Get().OnDiscRead(name, offset, length);
-  });
+  vfs::SetDiscReadObserver(
+      [](const std::string& name, uint64_t offset, uint64_t length) {
+        gpu::FmvReplacement::Get().OnDiscRead(name, offset, length);
+      });
 
   // Initialize clock.
   // 360 uses a 50MHz clock.

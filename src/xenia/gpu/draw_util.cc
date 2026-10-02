@@ -460,10 +460,10 @@ void GetHostViewportInfo(GetViewportInfoArgs* XE_RESTRICT args,
       float axis_max_unscaled_float = float(xy_max_unscaled[i]);
       int32_t axis_1_int = int32_t(std::floor(xe::clamp_float(
           offset_axis + scale_axis_abs, 0.0f, axis_max_unscaled_float)));
-      int32_t axis_0_int = int32_t(std::floor(xe::clamp_float(
-          offset_axis - scale_axis_abs,
-          float(axis_1_int) - axis_max_unscaled_float,
-          axis_max_unscaled_float)));
+      int32_t axis_0_int = int32_t(std::floor(
+          xe::clamp_float(offset_axis - scale_axis_abs,
+                          float(axis_1_int) - axis_max_unscaled_float,
+                          axis_max_unscaled_float)));
       uint32_t axis_extent_int =
           axis_1_int > 0 ? uint32_t(axis_1_int - axis_0_int) : 0;
       viewport_info_out.xy_offset[i] =
