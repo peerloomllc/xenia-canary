@@ -52,6 +52,11 @@ jobs:
   # exactly what happened here. Windows_x86.yml is still in the tree, so
   # re-adding this is four lines.
 
+  build-windows:
+    name: Windows (x86-64)
+    needs: [lint, commit-message]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/Windows_x86.yml
   build-linux:
     name: Linux (x86-64)
     needs: [lint, commit-message]
