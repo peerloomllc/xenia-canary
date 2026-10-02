@@ -17,6 +17,7 @@
 #include <optional>
 #include <string>
 
+#include "xenia/app/game_library.h"
 #include "xenia/app/profile_dialogs.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/command_processor.h"
@@ -547,30 +548,30 @@ class EmulatorWindow {
     EmulatorWindow& emulator_window_;
   };
   void ToggleGameLibraryDialog();
-#if XE_PLATFORM_LINUX
-  // Game library dashboard: a native list over the game view while no
-  // title runs (File > Game Library toggles it). Backed by library.toml
-  // in the storage root: one entry per file under games_dir with what the
-  // XEX header says (title id, discs, media id, region), the name once
-  // the title was launched, time played, last played and Tim's rating.
-  struct LibraryTitle {
-    std::filesystem::path path;
-    std::string type;  // ISO, XEX, ZAR
-    uint32_t title_id = 0;
-    std::string title_name;
-    uint8_t disc_number = 0;
-    uint8_t disc_count = 0;
-    uint32_t media_id = 0;
-    uint32_t region = 0;
-    uint64_t size = 0;
-    int64_t seconds_played = 0;
-    int64_t last_played = 0;
-    int rating = 0;  // 0 none, 1-5 stars
-  };
+  // Game library (library.toml, see game_library.h) and the play time it
+  // records. On every platform; the dashboard that shows it is GTK only.
+  using LibraryTitle = GameLibrary::Title;
   void LoadLibrary();
   void SaveLibrary();
   void ScanLibrary();
-  static bool ReadTitleInfo(LibraryTitle& title);
+  // Credits a successful launch to its library entry (adding one for a file
+  // outside games_dir) and starts timing the session.
+  void RecordLibraryLaunch();
+  void AddPlayTime();
+  // The library entry a launch should be credited to. A playlist launch
+  // maps to the disc file currently mounted (or the first disc), so the
+  // .m3u itself never becomes a library entry.
+  LibraryTitle* LibraryEntryForLaunch(const std::filesystem::path& path);
+  // The entry for the disc mounted right now, falling back to the launch
+  // entry. What a finished session should be credited to.
+  LibraryTitle* LibraryEntryMounted(const std::filesystem::path& path);
+  GameLibrary library_;
+  std::chrono::steady_clock::time_point session_start_;
+  bool session_running_ = false;
+  std::filesystem::path session_path_;
+#if XE_PLATFORM_LINUX
+  // Game library dashboard: a native list over the game view while no
+  // title runs (File > Game Library toggles it).
   void BuildDashboard();
   void RefreshDashboard();
   void ShowDashboard(bool show);
@@ -583,29 +584,11 @@ class EmulatorWindow {
   bool DashboardShown() const;
   void ToggleDashboard();
   void UpdateDashboardForPanels();
-  void OnDashboardTitleLaunched();
-  void AddPlayTime();
-  LibraryTitle* LibraryEntryFor(const std::filesystem::path& path);
-  // The library entry a launch should be credited to. A playlist launch
-  // maps to the disc file currently mounted (or the first disc), so the
-  // .m3u itself never becomes a library entry.
-  LibraryTitle* LibraryEntryForLaunch(const std::filesystem::path& path);
-  // The entry for the disc mounted right now, falling back to the launch
-  // entry. What a finished session should be credited to.
-  LibraryTitle* LibraryEntryMounted(const std::filesystem::path& path);
-  // Indices of every library entry that belongs to the same multi-disc
-  // title as entry `index` (same title id and folder), including itself,
-  // in disc order. A single-disc title yields just itself.
-  std::vector<size_t> LibraryDiscGroup(size_t index) const;
-  // The playlist a library launch of a multi-disc title goes through,
-  // written under the storage root; empty for a single-disc title.
-  std::filesystem::path WriteLibraryPlaylist(size_t index);
 
  public:
   bool DashboardRowVisible(void* model, void* iter);  // GTK filter callback
 
  private:
-  std::vector<LibraryTitle> library_titles_;
   void* dashboard_widget_ = nullptr;  // GtkWidget*
   void* dashboard_store_ = nullptr;   // GtkListStore*
   void* dashboard_filter_ = nullptr;  // GtkTreeModelFilter*
@@ -658,9 +641,6 @@ class EmulatorWindow {
   bool dashboard_suspended_fullscreen_ = false;
   // The dashboard was hidden so an ImGui panel opened over it can be seen.
   bool dashboard_hidden_for_panel_ = false;
-  std::chrono::steady_clock::time_point session_start_;
-  bool session_running_ = false;
-  std::filesystem::path session_path_;
 #endif
   // File > Reset Game / Close Game. RunTitle closes a running title first.
   void ResetGame();
