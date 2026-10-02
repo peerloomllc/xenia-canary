@@ -18,6 +18,7 @@
 #include <string>
 
 #include "xenia/app/game_library.h"
+#include "xenia/app/patch_files.h"
 #include "xenia/app/profile_dialogs.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/command_processor.h"
@@ -43,17 +44,6 @@ struct RecentTitleEntry {
   std::filesystem::path path_to_file;
   std::time_t last_run_time;
 };
-
-// Which tab of the Preferences window a .patch.toml entry appears on. The
-// file format has no category field, so this is guessed from the entry's
-// name and description unless the user has moved it (patch_categories.txt
-// in the storage root).
-enum class PatchCategory {
-  kFix = 0,    // fixes, graphics and speed
-  kCheat = 1,  // gameplay advantages
-  kExtra = 2,  // debug menus, free camera, skipped intros
-};
-constexpr int kPatchCategoryCount = 3;
 
 class EmulatorWindow {
  public:
@@ -328,22 +318,7 @@ class EmulatorWindow {
   void LookupCommunityPatches();
   void DownloadCommunityPatch(const std::string& name);
   std::map<uint32_t, std::string> PatchTitles();
-  // The tab an entry belongs on: the user's choice if there is one,
-  // otherwise guessed from its name and description.
-  PatchCategory PatchCategoryOf(const std::filesystem::path& file,
-                                const std::string& name,
-                                const std::string& desc);
-  void SetPatchCategory(const std::filesystem::path& file,
-                        const std::string& name, PatchCategory category);
-  void LoadPatchCategories();
-  // Switches off any enabled patch for this title that writes the same
-  // guest address as the one just enabled; returns their names.
-  std::vector<std::string> DisableConflictingPatches(
-      const std::filesystem::path& file, const std::string& name);
-  void SavePatchCategories();
   std::string patches_notice_;  // survives the rebuild after a conflict
-  std::map<std::string, PatchCategory> patch_categories_;  // "file|patch"
-  bool patch_categories_loaded_ = false;
   void* patches_status_[kPatchCategoryCount] = {};  // GtkLabel*
   void* patches_combo_[kPatchCategoryCount] = {};   // GtkComboBoxText*
   void* patches_box_[kPatchCategoryCount] = {};     // GtkBox*: the entries
@@ -355,11 +330,6 @@ class EmulatorWindow {
   std::vector<uint32_t> patches_combo_title_ids_;
   uint32_t patches_selected_title_ = 0;
   bool patches_refreshing_ = false;
-  struct CommunityPatchFile {
-    std::string name;  // file name in the repository's patches/ folder
-    std::string sha;   // git blob id
-    uint32_t title_id;
-  };
   std::vector<CommunityPatchFile> community_patch_files_;
   bool community_looked_up_ = false;
   bool community_lookup_running_ = false;
@@ -566,6 +536,8 @@ class EmulatorWindow {
   // entry. What a finished session should be credited to.
   LibraryTitle* LibraryEntryMounted(const std::filesystem::path& path);
   GameLibrary library_;
+  // Which Preferences tab each patch entry is on (patch_files.h).
+  PatchCategories patch_categories_;
   std::chrono::steady_clock::time_point session_start_;
   bool session_running_ = false;
   std::filesystem::path session_path_;
