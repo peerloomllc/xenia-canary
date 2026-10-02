@@ -618,7 +618,7 @@ class EmulatorWindow {
   void ResetGame();
   void CloseGame();
   // Starts a new emulator process with this one's arguments and `path` as
-  // the title (none if empty), then closes this window. Linux only.
+  // the title (none if empty), then closes this window. Linux and Windows.
   bool RelaunchProcess(const std::filesystem::path& path);
   std::filesystem::path last_launched_path_;
   void PickFmvReplacementDir();  // folder picker; call from the UI loop

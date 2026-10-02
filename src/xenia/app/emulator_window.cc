@@ -14,6 +14,11 @@
 
 #include <regex>
 #include <thread>
+#if XE_PLATFORM_WIN32
+#include "xenia/base/platform_win.h"
+
+#include <shellapi.h>
+#endif
 #if XE_PLATFORM_LINUX
 #include <unistd.h>
 #include <cerrno>
@@ -4875,10 +4880,73 @@ void EmulatorWindow::CloseGame() {
   RelaunchProcess("");
 }
 
+namespace {
+// The command line of a relaunch: this process's arguments with the title
+// path replaced (or removed), a numbered log file so the old log is kept,
+// and none of this session's experiment timers. args[0] is the executable.
+std::vector<std::string> RelaunchArguments(const std::vector<std::string>& args,
+                                           const std::filesystem::path& path) {
+  std::vector<std::string> new_args;
+  new_args.push_back(args[0]);
+  for (size_t i = 1; i < args.size(); ++i) {
+    const std::string& a = args[i];
+    if (a.rfind("--", 0) != 0) {
+      continue;  // the old title path (or any positional argument)
+    }
+    if (a.rfind("--log_file=", 0) == 0) {
+      std::filesystem::path log = xe::to_path(a.substr(11));
+      std::string stem = xe::path_to_utf8(log.stem());
+      int n = 2;
+      size_t p = stem.rfind("-relaunch");
+      if (p != std::string::npos) {
+        n = std::atoi(stem.c_str() + p + 9) + 1;
+        stem.resize(p);
+      }
+      log = log.parent_path() /
+            xe::to_path(stem + "-relaunch" + std::to_string(n) +
+                        xe::path_to_utf8(log.extension()));
+      new_args.push_back("--log_file=" + xe::path_to_utf8(log));
+      continue;
+    }
+    if (a.rfind("--ui_experiment", 0) == 0 ||
+        a.rfind("--savestate_experiment", 0) == 0) {
+      continue;  // timers of this session, not the next one
+    }
+    new_args.push_back(a);
+  }
+  if (!path.empty()) {
+    new_args.push_back(xe::path_to_utf8(std::filesystem::absolute(path)));
+  }
+  return new_args;
+}
+
+#if XE_PLATFORM_WIN32
+// One argument quoted for CommandLineToArgvW: backslashes are literal except
+// in front of a quote, where they are doubled.
+std::wstring QuoteWin32Argument(const std::wstring& arg) {
+  if (!arg.empty() && arg.find_first_of(L" \t\n\v\"") == std::wstring::npos) {
+    return arg;
+  }
+  std::wstring out = L"\"";
+  size_t backslashes = 0;
+  for (wchar_t c : arg) {
+    if (c == L'\\') {
+      ++backslashes;
+      continue;
+    }
+    out.append(c == L'"' ? backslashes * 2 + 1 : backslashes, L'\\');
+    backslashes = 0;
+    out += c;
+  }
+  out.append(backslashes * 2, L'\\');
+  out += L'"';
+  return out;
+}
+#endif
+}  // namespace
+
 bool EmulatorWindow::RelaunchProcess(const std::filesystem::path& path) {
 #if XE_PLATFORM_LINUX
-  // The same command line as this process, with the title path replaced
-  // (or removed) and a numbered log file so the old log is kept.
   std::vector<std::string> args;
   {
     std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
@@ -4898,36 +4966,7 @@ bool EmulatorWindow::RelaunchProcess(const std::filesystem::path& path) {
     XELOGE("Relaunch: cannot read /proc/self/cmdline");
     return false;
   }
-  std::vector<std::string> new_args;
-  new_args.push_back(args[0]);
-  for (size_t i = 1; i < args.size(); ++i) {
-    const std::string& a = args[i];
-    if (a.rfind("--", 0) != 0) {
-      continue;  // the old title path (or any positional argument)
-    }
-    if (a.rfind("--log_file=", 0) == 0) {
-      std::filesystem::path log = a.substr(11);
-      std::string stem = log.stem().string();
-      int n = 2;
-      size_t p = stem.rfind("-relaunch");
-      if (p != std::string::npos) {
-        n = std::atoi(stem.c_str() + p + 9) + 1;
-        stem.resize(p);
-      }
-      log = log.parent_path() /
-            (stem + "-relaunch" + std::to_string(n) + log.extension().string());
-      new_args.push_back("--log_file=" + log.string());
-      continue;
-    }
-    if (a.rfind("--ui_experiment", 0) == 0 ||
-        a.rfind("--savestate_experiment", 0) == 0) {
-      continue;  // timers of this session, not the next one
-    }
-    new_args.push_back(a);
-  }
-  if (!path.empty()) {
-    new_args.push_back(std::filesystem::absolute(path).string());
-  }
+  std::vector<std::string> new_args = RelaunchArguments(args, path);
   std::vector<char*> argv;
   for (auto& a : new_args) {
     argv.push_back(a.data());
@@ -4952,15 +4991,57 @@ bool EmulatorWindow::RelaunchProcess(const std::filesystem::path& path) {
     _exit(127);
   }
   XELOGI("Relaunch: new process {}, closing this one", child);
+#elif XE_PLATFORM_WIN32
+  std::vector<std::string> args;
+  {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) {
+      XELOGE("Relaunch: cannot read the command line");
+      return false;
+    }
+    for (int i = 0; i < argc; ++i) {
+      args.push_back(xe::to_utf8(reinterpret_cast<const char16_t*>(argv[i])));
+    }
+    LocalFree(argv);
+  }
+  wchar_t exe[MAX_PATH];
+  DWORD exe_length = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+  if (args.empty() || !exe_length || exe_length == MAX_PATH) {
+    XELOGE("Relaunch: cannot find this executable");
+    return false;
+  }
+  std::vector<std::string> new_args = RelaunchArguments(args, path);
+  std::wstring command_line = QuoteWin32Argument(exe);
+  for (size_t i = 1; i < new_args.size(); ++i) {
+    std::u16string arg = xe::to_utf16(new_args[i]);
+    command_line +=
+        L" " + QuoteWin32Argument(std::wstring(arg.begin(), arg.end()));
+  }
+  XELOGI("Relaunch: {}",
+         xe::to_utf8(std::u16string(command_line.begin(), command_line.end())));
+  xe::FlushLog();
+  STARTUPINFOW startup_info = {};
+  startup_info.cb = sizeof(startup_info);
+  PROCESS_INFORMATION process_info = {};
+  if (!CreateProcessW(exe, command_line.data(), nullptr, nullptr, FALSE, 0,
+                      nullptr, nullptr, &startup_info, &process_info)) {
+    XELOGE("Relaunch: CreateProcess failed ({})", GetLastError());
+    return false;
+  }
+  CloseHandle(process_info.hThread);
+  CloseHandle(process_info.hProcess);
+  XELOGI("Relaunch: new process {}, closing this one",
+         process_info.dwProcessId);
+#else
+  XELOGE("Relaunch: not implemented on this platform");
+  return false;
+#endif
   SaveResumeState();
   AddPlayTime();
   SaveLibrary();
   window_->RequestClose();
   return true;
-#else
-  XELOGE("Relaunch: not implemented on this platform");
-  return false;
-#endif
 }
 
 void EmulatorWindow::InstallContent() {
