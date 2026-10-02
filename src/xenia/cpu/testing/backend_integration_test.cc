@@ -375,6 +375,85 @@ TEST_CASE("VEC_PRESERVATION_ACROSS_HOST_CALL", "[backend]") {
   memory->SystemHeapFree(stack_address);
 }
 
+#if XE_ARCH_AMD64 && !XE_PLATFORM_WIN32
+// System V makes every XMM register volatile, so a host function may
+// overwrite xmm6-xmm15, which the JIT allocates and keeps values in across
+// host calls. This one does so on purpose.
+static void ClobberXmmBuiltin(ppc::PPCContext* ctx, void* arg0, void* arg1) {
+  __asm__ volatile(
+      "vpcmpeqd %%xmm6, %%xmm6, %%xmm6\n\t"
+      "vpcmpeqd %%xmm7, %%xmm7, %%xmm7\n\t"
+      "vpcmpeqd %%xmm8, %%xmm8, %%xmm8\n\t"
+      "vpcmpeqd %%xmm9, %%xmm9, %%xmm9\n\t"
+      "vpcmpeqd %%xmm10, %%xmm10, %%xmm10\n\t"
+      "vpcmpeqd %%xmm11, %%xmm11, %%xmm11\n\t"
+      "vpcmpeqd %%xmm12, %%xmm12, %%xmm12\n\t"
+      "vpcmpeqd %%xmm13, %%xmm13, %%xmm13\n\t"
+      "vpcmpeqd %%xmm14, %%xmm14, %%xmm14\n\t"
+      "vpcmpeqd %%xmm15, %%xmm15, %%xmm15\n\t" ::
+          : "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12",
+            "xmm13", "xmm14", "xmm15");
+}
+
+TEST_CASE("VEC_PRESERVATION_ACROSS_CLOBBERING_HOST_CALL", "[backend]") {
+  auto memory = std::make_unique<Memory>();
+  memory->Initialize();
+
+  std::unique_ptr<xe::cpu::backend::Backend> backend(
+      new xe::cpu::backend::x64::X64Backend());
+  auto processor = std::make_unique<Processor>(memory.get(), nullptr);
+  processor->Setup(std::move(backend));
+
+  auto* builtin_fn = processor->DefineBuiltin(
+      "ClobberXmmBuiltin", ClobberXmmBuiltin, nullptr, nullptr);
+
+  // Twelve live values fill all the JIT's XMM registers (xmm4-xmm15).
+  constexpr int kCount = 12;
+  auto module = std::make_unique<TestModule>(
+      processor.get(), "Test",
+      [](uint32_t address) { return address == 0x80000000; },
+      [builtin_fn](HIRBuilder& b) {
+        Value* vecs[kCount];
+        for (int i = 0; i < kCount; ++i) {
+          vecs[i] = LoadVR(b, 10 + i);
+        }
+        b.CallExtern(builtin_fn);
+        for (int i = 0; i < kCount; ++i) {
+          StoreVR(b, 40 + i, vecs[i]);
+        }
+        b.Return();
+        return true;
+      },
+      /*skip_cf_simplification=*/true);
+  processor->AddModule(std::move(module));
+  processor->backend()->CommitExecutableRange(0x80000000, 0x80010000);
+
+  auto fn = processor->ResolveFunction(0x80000000);
+  REQUIRE(fn != nullptr);
+
+  uint32_t stack_size = 64 * 1024;
+  uint32_t stack_address = memory->SystemHeapAlloc(stack_size);
+  auto thread_state = std::make_unique<ThreadState>(processor.get(), 0x100,
+                                                    stack_address + stack_size);
+  auto ctx = thread_state->context();
+  ctx->lr = 0xBCBCBCBC;
+  for (int i = 0; i < kCount; ++i) {
+    uint32_t base = 0x10000000u * uint32_t(i + 1);
+    ctx->v[10 + i] = vec128i(base + 1, base + 2, base + 3, base + 4);
+  }
+
+  fn->Call(thread_state.get(), uint32_t(ctx->lr));
+
+  for (int i = 0; i < kCount; ++i) {
+    uint32_t base = 0x10000000u * uint32_t(i + 1);
+    INFO("vector " << i);
+    REQUIRE(ctx->v[40 + i] == vec128i(base + 1, base + 2, base + 3, base + 4));
+  }
+
+  memory->SystemHeapFree(stack_address);
+}
+#endif  // XE_ARCH_AMD64 && !XE_PLATFORM_WIN32
+
 // =============================================================================
 // Basic guest code execution — context load/store round-trip
 // =============================================================================
