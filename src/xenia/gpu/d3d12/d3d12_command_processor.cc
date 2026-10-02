@@ -40,6 +40,7 @@ DEFINE_bool(d3d12_submit_on_primary_buffer_end, true,
             "D3D12");
 
 DECLARE_bool(clear_memory_page_state);
+DECLARE_bool(log_wait_reg_mem);
 DECLARE_bool(readback_resolve_half_pixel_offset);
 
 namespace xe {
