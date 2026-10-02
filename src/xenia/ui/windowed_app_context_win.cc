@@ -13,6 +13,12 @@
 
 #include "xenia/base/platform_win.h"
 
+#if XE_UI_GTK
+#include <gtk/gtk.h>
+
+#include "xenia/base/logging.h"
+#endif
+
 namespace xe {
 namespace ui {
 
@@ -91,6 +97,12 @@ bool Win32WindowedAppContext::Initialize() {
     return false;
   }
 
+#if XE_UI_GTK
+  // Without GTK's DLLs the executable would not have started; this fails
+  // only if GDK cannot open its display. The host UI then has no GTK windows.
+  gtk_available_ = gtk_init_check(nullptr, nullptr);
+#endif
+
   return true;
 }
 
@@ -106,10 +118,33 @@ void Win32WindowedAppContext::PlatformQuitFromUIThread() {
   // built-in modal window, which is unaware of HasQuitFromUIThread, don't let
   // it delay quitting indefinitely.
   PostQuitMessage(EXIT_SUCCESS);
+#if XE_UI_GTK
+  // GDK's event source takes WM_QUIT off the queue with every other message
+  // and drops it, so the GLib loop has to be told directly.
+  if (gtk_main_loop_) {
+    g_main_loop_quit(static_cast<GMainLoop*>(gtk_main_loop_));
+  }
+#endif
 }
 
 int Win32WindowedAppContext::RunMainMessageLoop() {
   int result = EXIT_SUCCESS;
+#if XE_UI_GTK
+  if (gtk_available_) {
+    XELOGI("GTK {}.{}.{}: running the GLib main loop", gtk_get_major_version(),
+           gtk_get_minor_version(), gtk_get_micro_version());
+    GMainLoop* loop = g_main_loop_new(nullptr, FALSE);
+    gtk_main_loop_ = loop;
+    if (!HasQuitFromUIThread()) {
+      g_main_loop_run(loop);
+    }
+    gtk_main_loop_ = nullptr;
+    g_main_loop_unref(loop);
+    // Quitting may also have started outside PlatformQuitFromUIThread.
+    QuitFromUIThread();
+    return result;
+  }
+#endif
   MSG message;
   // The HasQuitFromUIThread check is not absolutely required, but for
   // additional safety in case WM_QUIT is not received for any reason.

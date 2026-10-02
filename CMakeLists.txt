@@ -84,6 +84,9 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 # Include helpers
 include(cmake/XeniaHelpers.cmake)
+if(WIN32)
+  include(cmake/XeniaGtkWindows.cmake)
+endif()
 
 # Global include directories (these apply to all targets via directory scope)
 include_directories(
@@ -254,6 +257,8 @@ else()
     include_directories(${GTK3_INCLUDE_DIRS})
     link_directories(${GTK3_LIBRARY_DIRS})
     add_compile_options(${GTK3_CFLAGS_OTHER})
+    set(XE_UI_GTK ON)
+    add_compile_definitions(XE_UI_GTK=1)
 
     # Global Linux libraries
     #

@@ -34,6 +34,9 @@ if(WIN32)
     ${CMAKE_CURRENT_SOURCE_DIR}/main_resources.rc
     ${PROJECT_SOURCE_DIR}/src/xenia/base/app_win32.manifest
   )
+  if(XE_UI_GTK)
+    xe_copy_gtk3_runtime(xenia-app)
+  endif()
   if(XE_TARGET_X86_64)
     # main_init_win.cc needs SSE2 only (not AVX)
     set_source_files_properties(

@@ -68,6 +68,11 @@ class Win32WindowedAppContext final : public WindowedAppContext {
 
   int RunMainMessageLoop();
 
+  // GTK3 (XE_UI_GTK builds): initialised with the context, and when it is,
+  // the main loop is GLib's, which dispatches the Win32 messages of every
+  // window on the thread (GDK's event source) as well as GTK's own work.
+  bool gtk_available() const { return gtk_available_; }
+
   // Per-monitor DPI awareness version 2 is expected to be enabled via the
   // manifest, as that's the recommended way, which also doesn't require calling
   // SetProcessDpiAwareness before doing anything that may depend on DPI
@@ -105,6 +110,10 @@ class Win32WindowedAppContext final : public WindowedAppContext {
 
   static bool pending_functions_window_class_registered_;
   HWND pending_functions_hwnd_ = nullptr;
+
+  bool gtk_available_ = false;
+  // GMainLoop* while RunMainMessageLoop runs it.
+  void* gtk_main_loop_ = nullptr;
 };
 
 }  // namespace ui
