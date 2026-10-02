@@ -90,15 +90,17 @@ class StackLayout {
    */
   // System V: xmm6-xmm15 are volatile too, so the guest-to-host thunk saves
   // them in xmm[6]-xmm[15] (the JIT allocates xmm4-xmm15 and keeps values in
-  // them across calls to host helpers).
+  // them across calls to host helpers). Chosen outside the macro: MSVC does
+  // not accept a directive inside a macro argument.
+#if XE_PLATFORM_WIN32
+  static constexpr size_t kThunkXmmCount = 10;
+#else
+  static constexpr size_t kThunkXmmCount = 16;
+#endif
   XEPACKEDSTRUCT(Thunk, {
     uint64_t arg_temp[3];
     uint64_t r[9];
-#if XE_PLATFORM_WIN32
-    vec128_t xmm[10];
-#else
-    vec128_t xmm[16];
-#endif
+    vec128_t xmm[kThunkXmmCount];
   });
   static_assert(sizeof(Thunk) % 16 == 0,
                 "sizeof(Thunk) must be a multiple of 16!");
