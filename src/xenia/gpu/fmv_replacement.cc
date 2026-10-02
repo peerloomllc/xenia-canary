@@ -134,12 +134,12 @@ FmvReplacement::Thumb ThumbFromYuv(const AVFrame* frame) {
   const uint32_t w = uint32_t(frame->width), h = uint32_t(frame->height);
   for (uint32_t ty = 0; ty < FmvReplacement::kThumbHeight; ++ty) {
     const uint32_t y0 = ty * h / FmvReplacement::kThumbHeight;
-    const uint32_t y1 = std::max((ty + 1) * h / FmvReplacement::kThumbHeight,
-                                 y0 + 1);
+    const uint32_t y1 =
+        std::max((ty + 1) * h / FmvReplacement::kThumbHeight, y0 + 1);
     for (uint32_t tx = 0; tx < FmvReplacement::kThumbWidth; ++tx) {
       const uint32_t x0 = tx * w / FmvReplacement::kThumbWidth;
-      const uint32_t x1 = std::max((tx + 1) * w / FmvReplacement::kThumbWidth,
-                                   x0 + 1);
+      const uint32_t x1 =
+          std::max((tx + 1) * w / FmvReplacement::kThumbWidth, x0 + 1);
       uint32_t sum = 0, count = 0;
       for (uint32_t y = y0; y < y1; y += 2) {
         const uint8_t* row = frame->data[0] + y * frame->linesize[0];
@@ -281,11 +281,9 @@ void FmvReplacement::Rescan() {
     movie.path = entry.path().string();
     movies_.push_back(std::move(movie));
   }
-  std::sort(movies_.begin(), movies_.end(),
-            [](const Movie& a, const Movie& b) {
-              return a.archive != b.archive ? a.archive < b.archive
-                                            : a.offset < b.offset;
-            });
+  std::sort(movies_.begin(), movies_.end(), [](const Movie& a, const Movie& b) {
+    return a.archive != b.archive ? a.archive < b.archive : a.offset < b.offset;
+  });
   have_movies_ = !movies_.empty();
   XELOGI("FMV replacement: {} movie(s) in {}", movies_.size(), dir.string());
 }
@@ -493,7 +491,8 @@ std::shared_ptr<const FmvReplacement::Frame> FmvReplacement::GetFrame(
     last_swap_guest_ms_ = now;
     last_guest_draws_ = guest_draws;
     const bool draws_like_movie =
-        guest_draws <= uint32_t(std::max(cvars::fmv_replacement_max_draws, 0)) &&
+        guest_draws <=
+            uint32_t(std::max(cvars::fmv_replacement_max_draws, 0)) &&
         swap_interval_ms_ >= float(cvars::fmv_replacement_min_frame_ms);
     // The guest's own picture matching a frame of this movie is what says it
     // is playing; the draw count is only for hosts where it cannot be read.
@@ -507,9 +506,10 @@ std::shared_ptr<const FmvReplacement::Frame> FmvReplacement::GetFrame(
         started_ = true;
         start_guest_ms_ = now;
         last_video_guest_ms_ = now;
-        XELOGI("FMV replacement: {} on screen at uptime {}, {} ms after the "
-               "read (by draw count)",
-               playing_->path, now, now - arm_guest_ms_);
+        XELOGI(
+            "FMV replacement: {} on screen at uptime {}, {} ms after the "
+            "read (by draw count)",
+            playing_->path, now, now - arm_guest_ms_);
       } else if (now - arm_guest_ms_ >
                  uint32_t(std::max(cvars::fmv_replacement_arm_seconds, 1)) *
                      1000u) {
@@ -521,7 +521,8 @@ std::shared_ptr<const FmvReplacement::Frame> FmvReplacement::GetFrame(
       }
       matched_recently_ = false;
       const uint32_t elapsed = uint32_t(std::max<int64_t>(
-          int64_t(now - start_guest_ms_) - cvars::fmv_replacement_offset_ms, 0));
+          int64_t(now - start_guest_ms_) - cvars::fmv_replacement_offset_ms,
+          0));
       if (now - last_video_guest_ms_ > kVideoGapMs) {
         ended = "the guest stopped playing it";
       } else if (decoder_finished_ &&
@@ -599,13 +600,13 @@ void FmvReplacement::DecodeThread(std::string path, uint64_t generation) {
         av_find_best_stream(format, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
     const AVCodec* decoder =
         stream_index >= 0
-            ? avcodec_find_decoder(format->streams[stream_index]->codecpar
-                                       ->codec_id)
+            ? avcodec_find_decoder(
+                  format->streams[stream_index]->codecpar->codec_id)
             : nullptr;
     if (decoder) {
       codec = avcodec_alloc_context3(decoder);
-      avcodec_parameters_to_context(
-          codec, format->streams[stream_index]->codecpar);
+      avcodec_parameters_to_context(codec,
+                                    format->streams[stream_index]->codecpar);
       codec->thread_count = 8;
       codec->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
     }
@@ -689,9 +690,10 @@ void FmvReplacement::DecodeThread(std::string path, uint64_t generation) {
       // Until the guest reaches the movie, hold at the first frame: the file
       // is read seconds before it plays.
       const int64_t raw_ms =
-          started_ ? int64_t(Clock::QueryGuestUptimeMillis() - start_guest_ms_) -
-                         cvars::fmv_replacement_offset_ms
-                   : 0;
+          started_
+              ? int64_t(Clock::QueryGuestUptimeMillis() - start_guest_ms_) -
+                    cvars::fmv_replacement_offset_ms
+              : 0;
       const uint32_t target_ms = uint32_t(std::max<int64_t>(raw_ms, 0));
       lock.unlock();
       bool progressed = false;
@@ -707,11 +709,10 @@ void FmvReplacement::DecodeThread(std::string path, uint64_t generation) {
           break;
         }
         const int64_t pts = frame->best_effort_timestamp;
-        Decoded decoded{frame,
-                        pts == AV_NOPTS_VALUE
-                            ? 0
-                            : int32_t(pts * time_base * 1000.0),
-                        Thumb{}, false};
+        Decoded decoded{
+            frame,
+            pts == AV_NOPTS_VALUE ? 0 : int32_t(pts * time_base * 1000.0),
+            Thumb{}, false};
         if (frame->format == AV_PIX_FMT_YUV420P) {
           decoded.thumb = ThumbFromYuv(frame);
           decoded.has_thumb = true;
@@ -723,8 +724,7 @@ void FmvReplacement::DecodeThread(std::string path, uint64_t generation) {
       bool shown_thumb = false;
       Thumb shown{};
       int32_t shown_ms = 0;
-      while (!pending.empty() &&
-             pending.front().pts_ms <= int32_t(target_ms)) {
+      while (!pending.empty() && pending.front().pts_ms <= int32_t(target_ms)) {
         if (current) {
           give_frame(current);
         }
@@ -742,8 +742,7 @@ void FmvReplacement::DecodeThread(std::string path, uint64_t generation) {
       // Only convert once caught up, so a late start skips frames cheaply.
       if (dirty && current && pending.empty() && !eof) {
         // Still behind: decode more before converting.
-      } else if (dirty && current &&
-                 current->format != AV_PIX_FMT_YUV420P) {
+      } else if (dirty && current && current->format != AV_PIX_FMT_YUV420P) {
         // Anything else (an RGB VP9 profile 1 file, say) would silently show
         // nothing; say so and stop.
         XELOGE(

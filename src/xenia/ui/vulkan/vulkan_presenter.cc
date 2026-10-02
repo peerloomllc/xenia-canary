@@ -3565,9 +3565,10 @@ bool VulkanPresenter::ParseReShadePresetFile(
             std::filesystem::path(cvars::reshade_shader_dir) /
             std::filesystem::path(path).filename();
         if (std::filesystem::exists(moved, ec)) {
-          XELOGI("VulkanPresenter: ReShade preset effect '{}' not found, "
-                 "using '{}'",
-                 path, moved.string());
+          XELOGI(
+              "VulkanPresenter: ReShade preset effect '{}' not found, "
+              "using '{}'",
+              path, moved.string());
           path = moved.string();
         }
       }

@@ -391,8 +391,8 @@ static void ClobberXmmBuiltin(ppc::PPCContext* ctx, void* arg0, void* arg1) {
       "vpcmpeqd %%xmm13, %%xmm13, %%xmm13\n\t"
       "vpcmpeqd %%xmm14, %%xmm14, %%xmm14\n\t"
       "vpcmpeqd %%xmm15, %%xmm15, %%xmm15\n\t" ::
-          : "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12",
-            "xmm13", "xmm14", "xmm15");
+          : "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13",
+            "xmm14", "xmm15");
 }
 
 TEST_CASE("VEC_PRESERVATION_ACROSS_CLOBBERING_HOST_CALL", "[backend]") {

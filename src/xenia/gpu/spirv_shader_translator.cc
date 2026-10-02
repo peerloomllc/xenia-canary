@@ -384,8 +384,8 @@ void SpirvShaderTranslator::StartTranslation() {
     spv::Id type_push_constants =
         builder_->makeStructType(id_vector_temp_, "XePushConstants");
     builder_->addMemberName(type_push_constants, 0, "vertex_base_index");
-    builder_->addMemberDecoration(type_push_constants, 0,
-                                  spv::DecorationOffset, 0);
+    builder_->addMemberDecoration(type_push_constants, 0, spv::DecorationOffset,
+                                  0);
     builder_->addDecoration(type_push_constants, spv::DecorationBlock);
     push_constants_ = builder_->createVariable(
         spv::NoPrecision, spv::StorageClassPushConstant, type_push_constants,

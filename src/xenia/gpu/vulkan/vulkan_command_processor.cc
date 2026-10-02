@@ -1840,18 +1840,15 @@ void VulkanCommandProcessor::CaptureFmvThumbnail(VkImage guest_image,
                                     &layout);
     fmv_thumb_row_pitch_ = layout.rowPitch;
     // Host access to a linear image wants GENERAL, and it stays there.
-    PushImageMemoryBarrier(fmv_thumb_image_,
-                           ui::vulkan::util::InitializeSubresourceRange(),
-                           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-                           VK_ACCESS_TRANSFER_WRITE_BIT,
-                           VK_IMAGE_LAYOUT_UNDEFINED,
-                           VK_IMAGE_LAYOUT_GENERAL);
+    PushImageMemoryBarrier(
+        fmv_thumb_image_, ui::vulkan::util::InitializeSubresourceRange(),
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+        VK_IMAGE_LAYOUT_GENERAL);
   }
 
   // Hand over the frame captured earlier, once the GPU has finished with it.
-  if (fmv_thumb_pending_ &&
-      GetCompletedSubmission() >= fmv_thumb_submission_) {
+  if (fmv_thumb_pending_ && GetCompletedSubmission() >= fmv_thumb_submission_) {
     fmv_thumb_pending_ = false;
     VkMappedMemoryRange range = {};
     range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
@@ -1859,7 +1856,8 @@ void VulkanCommandProcessor::CaptureFmvThumbnail(VkImage guest_image,
     range.size = VK_WHOLE_SIZE;
     dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
     std::vector<uint8_t> rgba(size_t(kWidth) * kHeight * 4);
-    const uint8_t* mapped = reinterpret_cast<const uint8_t*>(fmv_thumb_mapping_);
+    const uint8_t* mapped =
+        reinterpret_cast<const uint8_t*>(fmv_thumb_mapping_);
     for (uint32_t y = 0; y < kHeight; ++y) {
       std::memcpy(rgba.data() + size_t(y) * kWidth * 4,
                   mapped + y * fmv_thumb_row_pitch_, size_t(kWidth) * 4);
@@ -1889,20 +1887,19 @@ void VulkanCommandProcessor::CaptureFmvThumbnail(VkImage guest_image,
       guest_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, fmv_thumb_image_,
       VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
       fmv_linear_blit_ ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
-  PushImageMemoryBarrier(
-      guest_image, ui::vulkan::util::InitializeSubresourceRange(),
-      VK_PIPELINE_STAGE_TRANSFER_BIT,
-      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-      VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
-      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-  PushImageMemoryBarrier(fmv_thumb_image_,
+  PushImageMemoryBarrier(guest_image,
                          ui::vulkan::util::InitializeSubresourceRange(),
                          VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_HOST_BIT,
-                         VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT,
-                         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  PushImageMemoryBarrier(
+      fmv_thumb_image_, ui::vulkan::util::InitializeSubresourceRange(),
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+      VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT,
+      VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
   SubmitBarriers(true);
   fmv_thumb_pending_ = true;
   fmv_thumb_submission_ = GetCurrentSubmission();
@@ -2024,12 +2021,13 @@ VkImageView VulkanCommandProcessor::UploadFmvFrame(
     }
     // Smooth scaling needs the format to support a linear blit filter.
     VkFormatProperties format_properties;
-    vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
-        vulkan_device->physical_device(), VK_FORMAT_R8G8B8A8_UNORM,
-        &format_properties);
-    fmv_linear_blit_ =
-        (format_properties.optimalTilingFeatures &
-         VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
+    vulkan_device->vulkan_instance()
+        ->functions()
+        .vkGetPhysicalDeviceFormatProperties(vulkan_device->physical_device(),
+                                             VK_FORMAT_R8G8B8A8_UNORM,
+                                             &format_properties);
+    fmv_linear_blit_ = (format_properties.optimalTilingFeatures &
+                        VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
     if (!fmv_linear_blit_) {
       XELOGW("FMV replacement: no linear blit filter, scaling will be blocky");
     }
@@ -2046,9 +2044,9 @@ VkImageView VulkanCommandProcessor::UploadFmvFrame(
 
   const VkDeviceSize size = VkDeviceSize(frame.width) * frame.height * 4;
   std::memcpy(fmv_upload_mapping_, frame.rgba.data(), size_t(size));
-  ui::vulkan::util::FlushMappedMemoryRange(
-      vulkan_device, fmv_upload_memory_, fmv_upload_memory_type_, 0,
-      fmv_upload_memory_size_, size);
+  ui::vulkan::util::FlushMappedMemoryRange(vulkan_device, fmv_upload_memory_,
+                                           fmv_upload_memory_type_, 0,
+                                           fmv_upload_memory_size_, size);
   const VkPipelineStageFlags shader_stages =
       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
@@ -2082,14 +2080,12 @@ VkImageView VulkanCommandProcessor::UploadFmvFrame(
       &copy);
   fmv_image_written_ = true;
 
-  PushImageMemoryBarrier(fmv_image_,
-                         ui::vulkan::util::InitializeSubresourceRange(),
-                         VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_ACCESS_TRANSFER_WRITE_BIT,
-                         VK_ACCESS_TRANSFER_READ_BIT,
-                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+  PushImageMemoryBarrier(
+      fmv_image_, ui::vulkan::util::InitializeSubresourceRange(),
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
   SubmitBarriers(true);
 
   VkImageBlit blit = {};
@@ -8333,9 +8329,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   // draw thousands of small objects, each changing only a constant, would
   // otherwise allocate and write a new set per draw.
   descriptor_write_image_info_.clear();
-  descriptor_write_image_info_.reserve(texture_count_vertex +
-                                       sampler_count_vertex +
-                                       texture_count_pixel + sampler_count_pixel);
+  descriptor_write_image_info_.reserve(
+      texture_count_vertex + sampler_count_vertex + texture_count_pixel +
+      sampler_count_pixel);
   size_t vertex_texture_image_info_offset = descriptor_write_image_info_.size();
   for (const VulkanShader::TextureBinding& texture_binding : textures_vertex) {
     VkDescriptorImageInfo& descriptor_image_info =
@@ -8345,7 +8341,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         texture_cache_->GetActiveBindingOrNullImageView(
             texture_binding.fetch_constant, texture_binding.dimension,
             bool(texture_binding.is_signed));
-    descriptor_image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    descriptor_image_info.imageLayout =
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   }
   size_t vertex_sampler_image_info_offset = descriptor_write_image_info_.size();
   if (sampler_count_vertex) {
@@ -8387,8 +8384,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   size_t image_info_end = descriptor_write_image_info_.size();
   uint64_t current_submission = GetCurrentSubmission();
   for (uint32_t j = 0; j < 2; ++j) {
-    uint32_t set_index = j ? SpirvShaderTranslator::kDescriptorSetTexturesPixel
-                           : SpirvShaderTranslator::kDescriptorSetTexturesVertex;
+    uint32_t set_index =
+        j ? SpirvShaderTranslator::kDescriptorSetTexturesPixel
+          : SpirvShaderTranslator::kDescriptorSetTexturesVertex;
     size_t info_begin =
         j ? pixel_texture_image_info_offset : vertex_texture_image_info_offset;
     size_t info_end = j ? image_info_end : pixel_texture_image_info_offset;
@@ -8407,8 +8405,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         (info_end == info_begin ||
          !std::memcmp(written.data(),
                       descriptor_write_image_info_.data() + info_begin,
-                      sizeof(VkDescriptorImageInfo) *
-                          (info_end - info_begin)));
+                      sizeof(VkDescriptorImageInfo) * (info_end - info_begin)));
     if (!same) {
       current_graphics_descriptor_set_values_up_to_date_ &=
           ~(UINT32_C(1) << set_index);
