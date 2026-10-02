@@ -385,7 +385,7 @@ X_RESULT WinKeyInputDriver::GetState(uint32_t user_index,
   out_state->gamepad.thumb_ry = thumb_ry;
 
   if (IsPassthroughEnabled()) {
-    memset(out_state, 0, sizeof(out_state));
+    memset(out_state, 0, sizeof(*out_state));
   }
 
   return X_ERROR_SUCCESS;
