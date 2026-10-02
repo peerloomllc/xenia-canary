@@ -443,11 +443,11 @@ std::unique_ptr<EmulatorWindow> EmulatorWindow::Create(
 EmulatorWindow::~EmulatorWindow() {
 #if XE_PLATFORM_LINUX
   SaveResumeState();
+#endif
   AddPlayTime();
-  if (!library_titles_.empty()) {
+  if (!library_.titles.empty()) {
     SaveLibrary();
   }
-#endif
   // Notify the ImGui drawer that the immediate drawer is being destroyed.
   ShutdownGraphicsSystemPresenterPainting();
 }
@@ -536,15 +536,15 @@ void EmulatorWindow::OnEmulatorInitialized() {
 }
 
 void EmulatorWindow::EmulatorWindowListener::OnClosing(ui::UIEvent& e) {
-#if XE_PLATFORM_LINUX
   // The process exits without destructors ("Cheap-skate exit"): write the
   // resume state and book the session's play time now.
+#if XE_PLATFORM_LINUX
   emulator_window_.SaveResumeState();
+#endif
   emulator_window_.AddPlayTime();
-  if (!emulator_window_.library_titles_.empty()) {
+  if (!emulator_window_.library_.titles.empty()) {
     emulator_window_.SaveLibrary();
   }
-#endif
   emulator_window_.app_context_.QuitFromUIThread();
 }
 
@@ -1564,9 +1564,9 @@ bool EmulatorWindow::Initialize() {
     XELOGE("Failed to open the platform window");
     return false;
   }
-#if XE_PLATFORM_LINUX
   LoadLibrary();
   ScanLibrary();
+#if XE_PLATFORM_LINUX
   BuildDashboard();
   ShowDashboard(!emulator_->is_title_open());
 #endif
@@ -6149,9 +6149,10 @@ xe::X_STATUS EmulatorWindow::RunTitle(
     AddRecentlyLaunchedTitle(path_to_file, emulator_->title_name());
     last_launched_path_ = path_to_file;
     ScheduleResumeFromState();
+    RecordLibraryLaunch();
 #if XE_PLATFORM_LINUX
     SaveTitleIcon();
-    OnDashboardTitleLaunched();
+    ShowDashboard(false);
 #endif
 
     auto xam =
@@ -6297,6 +6298,116 @@ void EmulatorWindow::ClearDialogs() {
   status_overlay_.reset();
   UpdateStatusOverlay(nullptr);
   emulator_->kernel_state()->xam_state()->is_xam_dialog_present_.store(false);
+}
+
+// ---- Game library (library.toml) ----
+
+void EmulatorWindow::LoadLibrary() {
+  library_.Load(emulator_->storage_root() / GameLibrary::kFilename);
+}
+
+void EmulatorWindow::SaveLibrary() {
+  library_.Save(emulator_->storage_root() / GameLibrary::kFilename);
+}
+
+void EmulatorWindow::ScanLibrary() {
+  std::vector<GameLibrary::Recent> recent;
+  for (const auto& entry : recently_launched_titles_) {
+    recent.push_back(
+        {entry.path_to_file, entry.title_name, entry.last_run_time});
+  }
+  if (library_.Scan(xe::to_path(cvars::games_dir), recent)) {
+    SaveLibrary();
+  }
+}
+
+EmulatorWindow::LibraryTitle* EmulatorWindow::LibraryEntryForLaunch(
+    const std::filesystem::path& path) {
+  std::string ext = xe::utf8::lower_ascii(xe::path_to_utf8(path.extension()));
+  if (ext != ".m3u") {
+    return library_.EntryFor(path);
+  }
+  const auto& playlist = emulator_->disc_playlist();
+  if (playlist.empty()) {
+    return nullptr;
+  }
+  std::filesystem::path disc =
+      emulator_->PlaylistDisc(emulator_->disc_number());
+  if (disc.empty()) {
+    disc = playlist.front();
+  }
+  return library_.EntryFor(disc);
+}
+
+EmulatorWindow::LibraryTitle* EmulatorWindow::LibraryEntryMounted(
+    const std::filesystem::path& path) {
+  // The disc that is mounted now, which is not the one the title was launched
+  // with once it has swapped. A title opened directly rather than through a
+  // playlist still swaps (the next disc is looked for beside the current one),
+  // and the session belongs to the disc it ended on.
+  const std::filesystem::path& mounted = emulator_->disc_image_path();
+  if (!mounted.empty()) {
+    if (LibraryTitle* entry = library_.EntryFor(mounted)) {
+      return entry;
+    }
+  }
+  return LibraryEntryForLaunch(path);
+}
+
+void EmulatorWindow::RecordLibraryLaunch() {
+  AddPlayTime();
+  session_running_ = true;
+  session_start_ = std::chrono::steady_clock::now();
+  session_path_ = last_launched_path_;
+  LibraryTitle* title = LibraryEntryForLaunch(last_launched_path_);
+  if (!title) {
+    LibraryTitle fresh;
+    fresh.path = last_launched_path_;
+    if (xe::utf8::lower_ascii(
+            xe::path_to_utf8(last_launched_path_.extension())) == ".m3u") {
+      // The playlist is not a library entry; its first disc is.
+      const auto& playlist = emulator_->disc_playlist();
+      if (playlist.empty()) {
+        return;
+      }
+      fresh.path = playlist.front();
+    }
+    fresh.type = GameLibrary::TypeOf(fresh.path);
+    std::error_code ec;
+    fresh.size = std::filesystem::file_size(fresh.path, ec);
+    GameLibrary::ReadTitleInfo(fresh);
+    library_.titles.push_back(std::move(fresh));
+    title = &library_.titles.back();
+  }
+  if (emulator_->is_title_open()) {
+    title->title_id = emulator_->title_id();
+    if (!emulator_->title_name().empty()) {
+      title->title_name = emulator_->title_name();
+    }
+  }
+  title->last_played = int64_t(time(nullptr));
+  SaveLibrary();
+}
+
+void EmulatorWindow::AddPlayTime() {
+  if (!session_running_) {
+    return;
+  }
+  session_running_ = false;
+  int64_t seconds = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now() - session_start_)
+                        .count();
+  if (LibraryTitle* title = LibraryEntryMounted(session_path_)) {
+    title->seconds_played += seconds;
+    // For a multi-disc title this is the entry for the disc that is mounted
+    // now, which is the one the session ended on. Stamping it here is what
+    // makes the next launch from the library start on that disc rather than
+    // going back to disc 1.
+    title->last_played = int64_t(time(nullptr));
+    XELOGI("Library: {} played {} s this session, {} s in total (disc {})",
+           title->title_name, seconds, title->seconds_played,
+           title->disc_number);
+  }
 }
 
 }  // namespace app
@@ -8022,7 +8133,6 @@ void EmulatorWindow::ToggleSettingsWindow() {
 // ---- Game library dashboard ----
 
 namespace {
-constexpr std::string_view kLibraryFilename = "library.toml";
 
 enum DashboardColumn {
   kColType = 0,
@@ -8034,7 +8144,7 @@ enum DashboardColumn {
   kColRegion,
   kColDiscs,
   kColRating,
-  kColIndex,         // int: index into library_titles_
+  kColIndex,         // int: index into library_.titles
   kColSeconds,       // int64 sort key
   kColLastPlayedTs,  // int64 sort key
   kColSizeBytes,     // int64 sort key
@@ -8043,430 +8153,13 @@ enum DashboardColumn {
   kColCount
 };
 
-std::string RegionText(uint32_t region) {
-  if (region == 0) {
-    return "";
-  }
-  if (region == 0xFFFFFFFFu) {
-    return "All";
-  }
-  std::vector<std::string> parts;
-  if (region & 0x000000FF) {
-    parts.push_back("NTSC-U");
-  }
-  if (region & 0x0000FF00) {
-    parts.push_back("NTSC-J");
-  }
-  if (region & 0x00FF0000) {
-    parts.push_back("PAL");
-  }
-  if (region & 0xFF000000) {
-    parts.push_back("Other");
-  }
-  std::string out;
-  for (auto& part : parts) {
-    out += (out.empty() ? "" : ", ") + part;
-  }
-  return out;
-}
-
-std::string TimePlayedText(int64_t seconds) {
-  if (seconds <= 0) {
-    return "";
-  }
-  if (seconds < 3600) {
-    int64_t minutes = std::max<int64_t>(1, seconds / 60);
-    return fmt::format("{} minute{}", minutes, minutes == 1 ? "" : "s");
-  }
-  int64_t hours = seconds / 3600;
-  return fmt::format("{} hour{}", hours, hours == 1 ? "" : "s");
-}
-
-std::string DateText(int64_t ts) {
-  if (ts <= 0) {
-    return "";
-  }
-  std::time_t t = std::time_t(ts);
-  char buf[32];
-  std::strftime(buf, sizeof(buf), "%m/%d/%Y", std::localtime(&t));
-  return buf;
-}
-
-std::string RatingText(int rating) {
-  std::string out;
-  for (int i = 1; i <= 5; ++i) {
-    out += i <= rating ? "\xE2\x98\x85" : "\xE2\x98\x86";  // filled/empty star
-  }
-  return rating ? out : "";
-}
-
 std::string LowerAscii(std::string s) {
   for (auto& c : s) {
     c = char(std::tolower((unsigned char)c));
   }
   return s;
 }
-}  // namespace
 
-EmulatorWindow::LibraryTitle* EmulatorWindow::LibraryEntryFor(
-    const std::filesystem::path& path) {
-  std::error_code ec;
-  for (auto& title : library_titles_) {
-    if (title.path == path ||
-        std::filesystem::equivalent(title.path, path, ec)) {
-      return &title;
-    }
-  }
-  return nullptr;
-}
-
-EmulatorWindow::LibraryTitle* EmulatorWindow::LibraryEntryForLaunch(
-    const std::filesystem::path& path) {
-  std::string ext = xe::utf8::lower_ascii(path.extension().string());
-  if (ext != ".m3u") {
-    return LibraryEntryFor(path);
-  }
-  const auto& playlist = emulator_->disc_playlist();
-  if (playlist.empty()) {
-    return nullptr;
-  }
-  std::filesystem::path disc =
-      emulator_->PlaylistDisc(emulator_->disc_number());
-  if (disc.empty()) {
-    disc = playlist.front();
-  }
-  return LibraryEntryFor(disc);
-}
-
-EmulatorWindow::LibraryTitle* EmulatorWindow::LibraryEntryMounted(
-    const std::filesystem::path& path) {
-  // The disc that is mounted now, which is not the one the title was launched
-  // with once it has swapped. A title opened directly rather than through a
-  // playlist still swaps (the next disc is looked for beside the current one),
-  // and the session belongs to the disc it ended on.
-  const std::filesystem::path& mounted = emulator_->disc_image_path();
-  if (!mounted.empty()) {
-    if (LibraryTitle* entry = LibraryEntryFor(mounted)) {
-      return entry;
-    }
-  }
-  return LibraryEntryForLaunch(path);
-}
-
-std::vector<size_t> EmulatorWindow::LibraryDiscGroup(size_t index) const {
-  std::vector<size_t> group;
-  if (index >= library_titles_.size()) {
-    return group;
-  }
-  const LibraryTitle& t = library_titles_[index];
-  if (t.disc_count > 1 && t.title_id) {
-    for (size_t i = 0; i < library_titles_.size(); ++i) {
-      const LibraryTitle& o = library_titles_[i];
-      if (o.title_id == t.title_id && o.disc_count > 1 &&
-          o.path.parent_path() == t.path.parent_path()) {
-        group.push_back(i);
-      }
-    }
-    std::sort(group.begin(), group.end(), [this](size_t a, size_t b) {
-      return library_titles_[a].disc_number < library_titles_[b].disc_number;
-    });
-  } else {
-    group.push_back(index);
-  }
-  return group;
-}
-
-std::filesystem::path EmulatorWindow::WriteLibraryPlaylist(size_t index) {
-  std::vector<size_t> group = LibraryDiscGroup(index);
-  if (group.size() < 2) {
-    return {};
-  }
-  std::filesystem::path dir = emulator_->storage_root() / "playlists";
-  std::error_code ec;
-  std::filesystem::create_directories(dir, ec);
-  std::filesystem::path playlist =
-      dir / fmt::format("{:08X}.m3u", library_titles_[index].title_id);
-  std::ofstream out(playlist, std::ios::trunc);
-  if (!out) {
-    XELOGE("Library: cannot write the playlist {}", playlist.string());
-    return {};
-  }
-  // The title boots the first entry, and swaps look entries up by disc
-  // number, so put the disc that was played most recently first: launching a
-  // multi-disc title from the library otherwise always started at disc 1,
-  // whichever disc the last session ended on (and the save state slots shown
-  // are the booted disc's).
-  size_t first = group.front();
-  int64_t newest = 0;
-  for (size_t i : group) {
-    if (library_titles_[i].last_played > newest) {
-      newest = library_titles_[i].last_played;
-      first = i;
-    }
-  }
-  out << "# Written by the game library; the discs of this title in order,\n";
-  out << "# starting with the one played most recently.\n";
-  out << xe::path_to_utf8(library_titles_[first].path) << '\n';
-  for (size_t i : group) {
-    if (i != first) {
-      out << xe::path_to_utf8(library_titles_[i].path) << '\n';
-    }
-  }
-  if (first != group.front()) {
-    XELOGI("Library: starting {} at disc {}, played most recently",
-           library_titles_[first].title_name.empty()
-               ? library_titles_[first].path.filename().string()
-               : library_titles_[first].title_name,
-           library_titles_[first].disc_number);
-  }
-  return playlist;
-}
-
-void EmulatorWindow::LoadLibrary() {
-  library_titles_.clear();
-  std::ifstream file(emulator()->storage_root() / kLibraryFilename);
-  if (!file.is_open()) {
-    return;
-  }
-  toml::parse_result parsed;
-  try {
-    parsed = toml::parse(file);
-  } catch (toml::parse_error& e) {
-    XELOGE("Cannot parse library.toml: {}", e.what());
-    return;
-  }
-  auto* titles = parsed["titles"].as_array();
-  if (!titles) {
-    return;
-  }
-  for (auto& node : *titles) {
-    auto* t = node.as_table();
-    if (!t) {
-      continue;
-    }
-    LibraryTitle title;
-    title.path = t->get_as<std::string>("path")
-                     ? t->get_as<std::string>("path")->get()
-                     : "";
-    if (title.path.empty()) {
-      continue;
-    }
-    auto str = [&](const char* key) {
-      auto* v = t->get_as<std::string>(key);
-      return v ? v->get() : std::string();
-    };
-    auto num = [&](const char* key) -> int64_t {
-      auto* v = t->get_as<int64_t>(key);
-      return v ? v->get() : 0;
-    };
-    title.type = str("type");
-    title.title_id =
-        uint32_t(std::strtoul(str("title_id").c_str(), nullptr, 16));
-    title.title_name = str("title_name");
-    title.disc_number = uint8_t(num("disc_number"));
-    title.disc_count = uint8_t(num("disc_count"));
-    title.media_id =
-        uint32_t(std::strtoul(str("media_id").c_str(), nullptr, 16));
-    title.region = uint32_t(std::strtoul(str("region").c_str(), nullptr, 16));
-    title.size = uint64_t(num("size"));
-    title.seconds_played = num("seconds_played");
-    title.last_played = num("last_played");
-    title.rating = int(std::clamp<int64_t>(num("rating"), 0, 5));
-    library_titles_.push_back(std::move(title));
-  }
-  XELOGI("Library: {} title(s) loaded", library_titles_.size());
-}
-
-void EmulatorWindow::SaveLibrary() {
-  toml::array titles;
-  for (const auto& title : library_titles_) {
-    toml::table t;
-    t.insert("path", xe::path_to_utf8(title.path));
-    t.insert("type", title.type);
-    t.insert("title_id", fmt::format("{:08X}", title.title_id));
-    t.insert("title_name", title.title_name);
-    t.insert("disc_number", int64_t(title.disc_number));
-    t.insert("disc_count", int64_t(title.disc_count));
-    t.insert("media_id", fmt::format("{:08X}", title.media_id));
-    t.insert("region", fmt::format("{:08X}", title.region));
-    t.insert("size", int64_t(title.size));
-    t.insert("seconds_played", title.seconds_played);
-    t.insert("last_played", title.last_played);
-    t.insert("rating", int64_t(title.rating));
-    titles.push_back(std::move(t));
-  }
-  toml::table root;
-  root.insert("titles", std::move(titles));
-  std::ofstream file(emulator()->storage_root() / kLibraryFilename,
-                     std::ofstream::trunc);
-  file << root;
-}
-
-// Title id, discs, media id and region from the XEX2 header of the file
-// (ISO/ZAR: default.xex at the disc root), without launching. The name
-// lives in the compressed part of the XEX and is filled in at first launch.
-bool EmulatorWindow::ReadTitleInfo(LibraryTitle& title) {
-  std::vector<uint8_t> header;
-  std::unique_ptr<vfs::Device> device;
-  if (title.type == "XEX") {
-    auto* f = xe::filesystem::OpenFile(title.path, "rb");
-    if (!f) {
-      return false;
-    }
-    header.resize(64 * 1024);
-    size_t n = fread(header.data(), 1, header.size(), f);
-    fclose(f);
-    header.resize(n);
-  } else {
-    if (title.type == "ISO") {
-      device = std::make_unique<vfs::DiscImageDevice>("\\Device\\LibraryScan",
-                                                      title.path);
-    } else {
-      device = std::make_unique<vfs::DiscZarchiveDevice>(
-          "\\Device\\LibraryScan", title.path);
-    }
-    if (!device->Initialize()) {
-      return false;
-    }
-    auto* entry = device->ResolvePath("default.xex");
-    if (!entry) {
-      return false;
-    }
-    vfs::File* file = nullptr;
-    if (entry->Open(vfs::FileAccess::kFileReadData, &file) !=
-            X_STATUS_SUCCESS ||
-        !file) {
-      return false;
-    }
-    header.resize(std::min<size_t>(entry->size(), 64 * 1024));
-    size_t n = 0;
-    file->ReadSync(std::span<uint8_t>(header.data(), header.size()), 0, &n);
-    file->Destroy();
-    header.resize(n);
-  }
-  if (header.size() < sizeof(xex2_header) ||
-      xe::load_and_swap<uint32_t>(header.data()) != 0x58455832) {  // 'XEX2'
-    return false;
-  }
-  auto* xex = reinterpret_cast<const xex2_header*>(header.data());
-  uint32_t count = xex->header_count;
-  for (uint32_t i = 0; i < count; ++i) {
-    size_t at = offsetof(xex2_header, headers) + i * sizeof(xex2_opt_header);
-    if (at + sizeof(xex2_opt_header) > header.size()) {
-      break;
-    }
-    auto* opt = reinterpret_cast<const xex2_opt_header*>(header.data() + at);
-    if (opt->key == XEX_HEADER_EXECUTION_INFO) {
-      uint32_t offset = opt->offset;
-      if (offset + sizeof(xex2_opt_execution_info) <= header.size()) {
-        auto* info = reinterpret_cast<const xex2_opt_execution_info*>(
-            header.data() + offset);
-        title.title_id = info->title_id;
-        title.media_id = info->media_id;
-        title.disc_number = info->disc_number;
-        title.disc_count = info->disc_count;
-      }
-    }
-  }
-  uint32_t security = xex->security_offset;
-  if (security + 0x180 <= header.size()) {
-    title.region =
-        xe::load_and_swap<uint32_t>(header.data() + security + 0x178);
-  }
-  return title.title_id != 0;
-}
-
-// What to call a title the emulator has never run. A disc in its own folder
-// takes the folder's name, which is how a multi-disc set is usually kept;
-// anything else takes its file name. Empty when there is nothing useful.
-static std::string NameFromPath(const std::filesystem::path& path) {
-  std::error_code ec;
-  const std::filesystem::path root = cvars::games_dir;
-  if (!root.empty()) {
-    std::filesystem::path rel =
-        std::filesystem::relative(path.parent_path(), root, ec);
-    if (!ec && !rel.empty() && rel != "." &&
-        rel.string().find("..") == std::string::npos) {
-      std::string folder = rel.filename().string();
-      if (!folder.empty()) {
-        return folder;
-      }
-    }
-  }
-  return path.stem().string();
-}
-
-void EmulatorWindow::ScanLibrary() {
-  std::filesystem::path root = cvars::games_dir;
-  std::error_code ec;
-  if (root.empty()) {
-    XELOGW("Library: no games folder is set, nothing to scan");
-    return;
-  }
-  if (!std::filesystem::is_directory(root, ec)) {
-    XELOGW("Library: the games folder {} is not a readable directory",
-           root.string());
-    return;
-  }
-  size_t added = 0, unreadable = 0;
-  auto it = std::filesystem::recursive_directory_iterator(
-      root, std::filesystem::directory_options::skip_permission_denied, ec);
-  for (; !ec && it != std::filesystem::recursive_directory_iterator();
-       it.increment(ec)) {
-    if (it.depth() >= 3) {
-      it.disable_recursion_pending();
-    }
-    const auto& entry = *it;
-    if (!entry.is_regular_file(ec)) {
-      continue;
-    }
-    std::string ext = xe::utf8::lower_ascii(entry.path().extension().string());
-    std::string type = ext == ".iso"   ? "ISO"
-                       : ext == ".xex" ? "XEX"
-                       : ext == ".zar" ? "ZAR"
-                                       : "";
-    if (type.empty()) {
-      continue;
-    }
-    LibraryTitle* existing = LibraryEntryFor(entry.path());
-    if (existing) {
-      existing->size = entry.file_size(ec);
-      if (!existing->title_id) {
-        ReadTitleInfo(*existing);
-      }
-      continue;
-    }
-    LibraryTitle title;
-    title.path = entry.path();
-    title.type = type;
-    title.size = entry.file_size(ec);
-    if (!ReadTitleInfo(title)) {
-      ++unreadable;
-    }
-    for (const auto& recent : recently_launched_titles_) {
-      if (recent.path_to_file == entry.path()) {
-        title.title_name = recent.title_name;
-        title.last_played = recent.last_run_time;
-      }
-    }
-    library_titles_.push_back(std::move(title));
-    ++added;
-  }
-  // Drop entries whose file is gone, and playlists an older build recorded
-  // as titles.
-  std::erase_if(library_titles_, [&](const LibraryTitle& t) {
-    return !std::filesystem::exists(t.path, ec) ||
-           xe::utf8::lower_ascii(t.path.extension().string()) == ".m3u";
-  });
-  XELOGI(
-      "Library: {} scanned, {} new, {} without a readable XEX header, {} total",
-      root.string(), added, unreadable, library_titles_.size());
-  if (added) {
-    SaveLibrary();
-  }
-}
-
-namespace {
 // Alternating row backgrounds (near black / grey), set per cell so it does
 // not depend on the theme honouring the tree view's rules hint.
 void DashboardRowBackground(GtkTreeViewColumn*, GtkCellRenderer* renderer,
@@ -8783,7 +8476,7 @@ void EmulatorWindow::BuildDashboard() {
                      }
                      gint index = -1;
                      gtk_tree_model_get(model, &iter, kColIndex, &index, -1);
-                     if (index >= 0 && index < int(w->library_titles_.size())) {
+                     if (index >= 0 && index < int(w->library_.titles.size())) {
                        // Through LaunchLibraryIndex, like the grid view and the
                        // Launch menu item: launching the file itself skips the
                        // playlist, so a multi-disc title started here knew
@@ -8815,7 +8508,7 @@ void EmulatorWindow::BuildDashboard() {
           gtk_tree_model_get(model, &iter, kColIndex, &index, -1);
         }
         gtk_tree_path_free(path);
-        if (index < 0 || index >= int(w->library_titles_.size())) {
+        if (index < 0 || index >= int(w->library_.titles.size())) {
           return TRUE;
         }
         w->dashboard_menu_index_ = index;
@@ -8829,12 +8522,12 @@ void EmulatorWindow::BuildDashboard() {
                 int rating = GPOINTER_TO_INT(
                     g_object_get_data(G_OBJECT(item), "rating"));
                 int i = w->dashboard_menu_index_;
-                if (i < 0 || i >= int(w->library_titles_.size())) {
+                if (i < 0 || i >= int(w->library_.titles.size())) {
                   return;
                 }
                 if (rating == -1) {
                   std::thread(LaunchFileExplorer,
-                              w->library_titles_[i].path.parent_path())
+                              w->library_.titles[i].path.parent_path())
                       .detach();
                   return;
                 }
@@ -8842,7 +8535,7 @@ void EmulatorWindow::BuildDashboard() {
                   w->LaunchLibraryIndex(i);
                   return;
                 }
-                w->library_titles_[i].rating = rating;
+                w->library_.titles[i].rating = rating;
                 w->SaveLibrary();
                 w->RefreshDashboard();
               }),
@@ -8880,11 +8573,11 @@ void EmulatorWindow::RefreshDashboard() {
   gtk_list_store_clear(store);
   uint64_t total_seconds = 0;
   size_t rows = 0;
-  for (size_t i = 0; i < library_titles_.size(); ++i) {
-    const auto& t = library_titles_[i];
+  for (size_t i = 0; i < library_.titles.size(); ++i) {
+    const auto& t = library_.titles[i];
     // A multi-disc title is one row, on its lowest disc; the other discs
     // fold into it.
-    std::vector<size_t> group = LibraryDiscGroup(i);
+    std::vector<size_t> group = library_.DiscGroup(i);
     if (group.front() != i) {
       continue;
     }
@@ -8893,15 +8586,15 @@ void EmulatorWindow::RefreshDashboard() {
     int64_t last_played = 0;
     uint64_t size = 0;
     for (size_t g : group) {
-      seconds_played += library_titles_[g].seconds_played;
-      last_played = std::max(last_played, library_titles_[g].last_played);
-      size += library_titles_[g].size;
+      seconds_played += library_.titles[g].seconds_played;
+      last_played = std::max(last_played, library_.titles[g].last_played);
+      size += library_.titles[g].size;
     }
     total_seconds += seconds_played;
     std::string name = t.title_name;
     if (name.empty() && t.title_id) {
       // Another disc of the same title may have been played.
-      for (const auto& other : library_titles_) {
+      for (const auto& other : library_.titles) {
         if (other.title_id == t.title_id && !other.title_name.empty()) {
           name = other.title_name;
           break;
@@ -8912,7 +8605,7 @@ void EmulatorWindow::RefreshDashboard() {
       // Every unplayed row used to read "(not played yet)", so a shelf of
       // them was a column of identical labels. The folder a disc sits in
       // names a multi-disc set, and a loose file names itself.
-      name = NameFromPath(t.path);
+      name = NameFromPath(t.path, xe::to_path(cvars::games_dir));
       if (name.empty()) {
         name = t.title_id ? "(not played yet)" : "(unreadable)";
       }
@@ -9039,8 +8732,8 @@ void EmulatorWindow::RefreshDashboardGrid() {
     gint index = -1;
     gchar* title = nullptr;
     gtk_tree_model_get(model, &iter, kColIndex, &index, kColTitle, &title, -1);
-    if (index >= 0 && index < int(library_titles_.size())) {
-      const auto& t = library_titles_[index];
+    if (index >= 0 && index < int(library_.titles.size())) {
+      const auto& t = library_.titles[index];
       std::string label = title && *title ? title : t.path.stem().string();
       GtkTreeIter row;
       gtk_list_store_append(grid_store, &row);
@@ -9052,11 +8745,12 @@ void EmulatorWindow::RefreshDashboardGrid() {
 }
 
 void EmulatorWindow::LaunchLibraryIndex(int index) {
-  if (index < 0 || index >= int(library_titles_.size())) {
+  if (index < 0 || index >= int(library_.titles.size())) {
     return;
   }
-  auto path = library_titles_[index].path;
-  std::filesystem::path playlist = WriteLibraryPlaylist(size_t(index));
+  auto path = library_.titles[index].path;
+  std::filesystem::path playlist = library_.WritePlaylist(
+      size_t(index), emulator_->storage_root() / "playlists");
   if (!playlist.empty()) {
     path = playlist;
   }
@@ -9566,69 +9260,6 @@ bool EmulatorWindow::DashboardShown() const {
   return gtk_main && gtk_main->idle_widget_shown();
 }
 
-void EmulatorWindow::OnDashboardTitleLaunched() {
-  AddPlayTime();
-  session_running_ = true;
-  session_start_ = std::chrono::steady_clock::now();
-  session_path_ = last_launched_path_;
-  LibraryTitle* title = LibraryEntryForLaunch(last_launched_path_);
-  if (!title) {
-    LibraryTitle fresh;
-    fresh.path = last_launched_path_;
-    std::string ext =
-        xe::utf8::lower_ascii(last_launched_path_.extension().string());
-    if (ext == ".m3u") {
-      // The playlist is not a library entry; its first disc is.
-      const auto& playlist = emulator_->disc_playlist();
-      if (playlist.empty()) {
-        ShowDashboard(false);
-        return;
-      }
-      fresh.path = playlist.front();
-      ext = xe::utf8::lower_ascii(fresh.path.extension().string());
-    }
-    fresh.type = ext == ".iso"   ? "ISO"
-                 : ext == ".xex" ? "XEX"
-                 : ext == ".zar" ? "ZAR"
-                                 : "";
-    std::error_code ec;
-    fresh.size = std::filesystem::file_size(fresh.path, ec);
-    ReadTitleInfo(fresh);
-    library_titles_.push_back(std::move(fresh));
-    title = &library_titles_.back();
-  }
-  if (emulator_->is_title_open()) {
-    title->title_id = emulator_->title_id();
-    if (!emulator_->title_name().empty()) {
-      title->title_name = emulator_->title_name();
-    }
-  }
-  title->last_played = int64_t(time(nullptr));
-  SaveLibrary();
-  ShowDashboard(false);
-}
-
-void EmulatorWindow::AddPlayTime() {
-  if (!session_running_) {
-    return;
-  }
-  session_running_ = false;
-  int64_t seconds = std::chrono::duration_cast<std::chrono::seconds>(
-                        std::chrono::steady_clock::now() - session_start_)
-                        .count();
-  if (LibraryTitle* title = LibraryEntryMounted(session_path_)) {
-    title->seconds_played += seconds;
-    // For a multi-disc title this is the entry for the disc that is mounted
-    // now, which is the one the session ended on. Stamping it here is what
-    // makes the next launch from the library start on that disc rather than
-    // going back to disc 1.
-    title->last_played = int64_t(time(nullptr));
-    XELOGI("Library: {} played {} s this session, {} s in total (disc {})",
-           title->title_name, seconds, title->seconds_played,
-           title->disc_number);
-  }
-}
-
 // ---- Preferences: Profiles tab ----
 
 // ---- Patches tab ----
@@ -9649,7 +9280,7 @@ std::map<uint32_t, std::string> EmulatorWindow::PatchTitles() {
   if (emulator_->is_title_open()) {
     add(emulator_->title_id(), emulator_->title_name());
   }
-  for (const LibraryTitle& title : library_titles_) {
+  for (const LibraryTitle& title : library_.titles) {
     add(title.title_id, title.title_name.empty() ? title.path.stem().string()
                                                  : title.title_name);
   }
