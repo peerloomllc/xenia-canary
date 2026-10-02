@@ -100,6 +100,13 @@ bool Win32WindowedAppContext::Initialize() {
 #if XE_UI_GTK
   // Without GTK's DLLs the executable would not have started; this fails
   // only if GDK cannot open its display. The host UI then has no GTK windows.
+  // Under Wine (Proton) Pango's Windows font path draws text with letters
+  // missing; its fontconfig path reads the same fonts correctly.
+  HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+  if (ntdll && GetProcAddress(ntdll, "wine_get_version") &&
+      !getenv("PANGOCAIRO_BACKEND")) {
+    _putenv_s("PANGOCAIRO_BACKEND", "fc");
+  }
   gtk_available_ = gtk_init_check(nullptr, nullptr);
 #endif
 
