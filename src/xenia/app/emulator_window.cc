@@ -411,7 +411,7 @@ EmulatorWindow::EmulatorWindow(Emulator* emulator,
           std::make_unique<ui::ImGuiDrawer>(window_.get(), kZOrderImGui)),
       display_config_game_config_load_callback_(
           new DisplayConfigGameConfigLoadCallback(*emulator, *this)) {
-#if XE_PLATFORM_LINUX
+#if XE_UI_GTK
   imgui_drawer_->SetDialogsChangedCallback([this]() {
     app_context_.CallInUIThreadDeferred(
         [this]() { UpdateDashboardForPanels(); });
@@ -455,6 +455,10 @@ EmulatorWindow::~EmulatorWindow() {
   if (!library_.titles.empty()) {
     SaveLibrary();
   }
+#if XE_UI_GTK && XE_PLATFORM_WIN32
+  // Before window_, which owns its window.
+  dashboard_overlay_.reset();
+#endif
   // Notify the ImGui drawer that the immediate drawer is being destroyed.
   ShutdownGraphicsSystemPresenterPainting();
 }
@@ -1128,7 +1132,7 @@ bool EmulatorWindow::Initialize() {
         MenuItem::Create(MenuItem::Type::kString, "&Open...", "Ctrl+O",
                          std::bind(&EmulatorWindow::FileOpen, this)));
     file_menu->AddChild(std::move(recent_menu));
-#if XE_PLATFORM_LINUX
+#if XE_UI_GTK
     file_menu->AddChild(
         MenuItem::Create(MenuItem::Type::kString, "Game &Library", "",
                          std::bind(&EmulatorWindow::ToggleDashboard, this)));
@@ -1544,12 +1548,12 @@ bool EmulatorWindow::Initialize() {
         } else if (which == "reset") {
           ResetGame();
         } else if (which == "dashboard") {
-#if XE_PLATFORM_LINUX
+#if XE_UI_GTK
           ToggleDashboard();
 #endif
         } else if (which.rfind("open:", 0) == 0) {
           RunTitle(which.substr(5));
-#if XE_PLATFORM_LINUX
+#if XE_UI_GTK
         } else if (which.rfind("launch_index:", 0) == 0) {
           // A library launch by index, as a double-click on the row would.
           LaunchLibraryIndex(std::atoi(which.c_str() + 13));
@@ -1573,7 +1577,7 @@ bool EmulatorWindow::Initialize() {
   }
   LoadLibrary();
   ScanLibrary();
-#if XE_PLATFORM_LINUX
+#if XE_UI_GTK
   BuildDashboard();
   ShowDashboard(!emulator_->is_title_open());
 #endif
@@ -6233,7 +6237,7 @@ xe::X_STATUS EmulatorWindow::RunTitle(
     last_launched_path_ = path_to_file;
     ScheduleResumeFromState();
     RecordLibraryLaunch();
-#if XE_PLATFORM_LINUX
+#if XE_UI_GTK
     SaveTitleIcon();
     ShowDashboard(false);
 #endif
@@ -6510,6 +6514,7 @@ void EmulatorWindow::AddPlayTime() {
 #elif XE_PLATFORM_WIN32
 #include <gdk/gdkwin32.h>
 
+#include "xenia/app/gtk_overlay_win.h"
 #include "xenia/ui/window_win.h"
 #endif
 #include "xenia/vfs/devices/disc_image_device.h"
@@ -6961,7 +6966,12 @@ void ApplyComboListStyle() {
   applied = true;
   GtkCssProvider* provider = gtk_css_provider_new();
   gtk_css_provider_load_from_data(
-      provider, "combobox { -GtkComboBox-appears-as-list: 1; }", -1, nullptr);
+      provider,
+      "combobox { -GtkComboBox-appears-as-list: 1; }\n"
+      // The library's rows are drawn dark whatever the theme
+      // (DashboardRowBackground); the space below them goes with them.
+      "treeview.view.xe-library { background-color: #101010; }",
+      -1, nullptr);
   gtk_style_context_add_provider_for_screen(
       gdk_screen_get_default(), GTK_STYLE_PROVIDER(provider),
       GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -7934,7 +7944,7 @@ void EmulatorWindow::ToggleSettingsWindow() {
   XELOGI("Settings window opened");
 }
 
-#if XE_PLATFORM_LINUX
+// The dashboard; on Windows a borderless GTK window over the game area.
 // ---- Game library dashboard ----
 
 namespace {
@@ -8029,10 +8039,14 @@ bool EmulatorWindow::DashboardRowVisible(void* model_ptr, void* iter_ptr) {
 }
 
 void EmulatorWindow::BuildDashboard() {
-  auto* gtk_main = dynamic_cast<ui::GTKWindow*>(window_.get());
-  if (!gtk_main || dashboard_widget_) {
+  if (dashboard_widget_) {
     return;
   }
+#if XE_PLATFORM_LINUX
+  if (!dynamic_cast<ui::GTKWindow*>(window_.get())) {
+    return;
+  }
+#endif
   ApplyComboListStyle();
   GtkWidget* box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
 
@@ -8210,6 +8224,7 @@ void EmulatorWindow::BuildDashboard() {
   gtk_box_pack_start(GTK_BOX(box), status, FALSE, FALSE, 0);
 
   dashboard_list_ = view;
+  gtk_style_context_add_class(gtk_widget_get_style_context(view), "xe-library");
   dashboard_widget_ = box;
   dashboard_store_ = store;
   dashboard_filter_ = filter;
@@ -8366,8 +8381,47 @@ void EmulatorWindow::BuildDashboard() {
       }),
       this);
 
-  gtk_main->SetIdleWidget(box);
+  AttachDashboardWidget(box);
   RefreshDashboard();
+}
+
+// Where the dashboard lives: the GTK main window's overlay on Linux; on
+// Windows, where the main window is Win32, a borderless GTK window kept
+// over its client area.
+void EmulatorWindow::AttachDashboardWidget(void* widget) {
+#if XE_PLATFORM_LINUX
+  if (auto* gtk_main = dynamic_cast<ui::GTKWindow*>(window_.get())) {
+    gtk_main->SetIdleWidget(static_cast<GtkWidget*>(widget));
+  }
+#elif XE_PLATFORM_WIN32
+  if (auto* main = dynamic_cast<ui::Win32Window*>(window_.get())) {
+    dashboard_overlay_ = std::make_unique<GtkOverlayWin>(
+        main->hwnd(), static_cast<GtkWidget*>(widget));
+  }
+#endif
+}
+
+void EmulatorWindow::ShowDashboardWidget(bool show) {
+#if XE_PLATFORM_LINUX
+  if (auto* gtk_main = dynamic_cast<ui::GTKWindow*>(window_.get())) {
+    gtk_main->ShowIdleWidget(show);
+  }
+#elif XE_PLATFORM_WIN32
+  if (dashboard_overlay_) {
+    dashboard_overlay_->Show(show);
+  }
+#endif
+}
+
+bool EmulatorWindow::DashboardShown() const {
+#if XE_PLATFORM_LINUX
+  auto* gtk_main = dynamic_cast<ui::GTKWindow*>(window_.get());
+  return gtk_main && gtk_main->idle_widget_shown();
+#elif XE_PLATFORM_WIN32
+  return dashboard_overlay_ && dashboard_overlay_->shown();
+#else
+  return false;
+#endif
 }
 
 void EmulatorWindow::RefreshDashboard() {
@@ -8565,14 +8619,13 @@ void EmulatorWindow::LaunchLibraryIndex(int index) {
 }
 
 void EmulatorWindow::ShowDashboard(bool show) {
-  auto* gtk_main = dynamic_cast<ui::GTKWindow*>(window_.get());
-  if (!gtk_main || !dashboard_widget_) {
+  if (!dashboard_widget_) {
     return;
   }
   if (show) {
     RefreshDashboard();
   }
-  gtk_main->ShowIdleWidget(show);
+  ShowDashboardWidget(show);
   if (show) {
     // Put focus on the games themselves. Without this it starts on whatever
     // the window last focused, so an arrow key or a d-pad press changed a
@@ -8618,6 +8671,7 @@ void EmulatorWindow::ShowDashboard(bool show) {
   UpdateDashboardFullscreen(show);
 }
 
+#if XE_PLATFORM_LINUX
 // Gamepad navigation of the host UI.
 //
 // The menu bar and the game library are GTK, and GTK already navigates
@@ -9010,10 +9064,16 @@ void EmulatorWindow::StartGamepadUi() {
       this);
 }
 
+#endif  // XE_PLATFORM_LINUX
+
 void EmulatorWindow::UpdateDashboardFullscreen(bool dashboard_shown) {
   // Everywhere else the overlay draws over the presented frame correctly, so
   // leave fullscreen alone: only gamescope hides it.
+#if XE_PLATFORM_LINUX
   static const bool under_gamescope = RunningUnderGamescope();
+#else
+  const bool under_gamescope = false;
+#endif
   if (!under_gamescope || !window_) {
     return;
   }
@@ -9037,13 +9097,7 @@ void EmulatorWindow::UpdateDashboardFullscreen(bool dashboard_shown) {
   }
 }
 
-void EmulatorWindow::ToggleDashboard() {
-  auto* gtk_main = dynamic_cast<ui::GTKWindow*>(window_.get());
-  if (!gtk_main) {
-    return;
-  }
-  ShowDashboard(!gtk_main->idle_widget_shown());
-}
+void EmulatorWindow::ToggleDashboard() { ShowDashboard(!DashboardShown()); }
 
 void EmulatorWindow::UpdateDashboardForPanels() {
   // ImGui draws under the GTK dashboard, so a panel opened from the menu with
@@ -9059,13 +9113,6 @@ void EmulatorWindow::UpdateDashboardForPanels() {
     }
   }
 }
-
-bool EmulatorWindow::DashboardShown() const {
-  auto* gtk_main = dynamic_cast<ui::GTKWindow*>(window_.get());
-  return gtk_main && gtk_main->idle_widget_shown();
-}
-
-#endif  // XE_PLATFORM_LINUX
 
 // ---- Preferences: Profiles tab ----
 
