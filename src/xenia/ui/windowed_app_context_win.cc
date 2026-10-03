@@ -108,6 +108,20 @@ bool Win32WindowedAppContext::Initialize() {
     _putenv_s("PANGOCAIRO_BACKEND", "fc");
   }
   gtk_available_ = gtk_init_check(nullptr, nullptr);
+  if (gtk_available_) {
+    // Dark or light as Windows' own app mode setting says, as a native
+    // window would be.
+    DWORD light = 1;
+    DWORD size = sizeof(light);
+    RegGetValueW(HKEY_CURRENT_USER,
+                 L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\"
+                 L"Personalize",
+                 L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &light,
+                 &size);
+    g_object_set(gtk_settings_get_default(),
+                 "gtk-application-prefer-dark-theme", light ? FALSE : TRUE,
+                 nullptr);
+  }
 #endif
 
   return true;

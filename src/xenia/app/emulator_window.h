@@ -37,6 +37,7 @@ namespace xe {
 namespace app {
 
 class ConsoleSettingsDialog;
+class GtkOverlayWin;
 class ContentListDialog;
 
 struct RecentTitleEntry {
@@ -541,7 +542,7 @@ class EmulatorWindow {
   std::chrono::steady_clock::time_point session_start_;
   bool session_running_ = false;
   std::filesystem::path session_path_;
-#if XE_PLATFORM_LINUX
+#if XE_UI_GTK
   // Game library dashboard: a native list over the game view while no
   // title runs (File > Game Library toggles it).
   void BuildDashboard();
@@ -553,6 +554,13 @@ class EmulatorWindow {
   // black but for the ImGui overlay. Leave fullscreen while the library is
   // up and take it back when a title has the screen.
   void UpdateDashboardFullscreen(bool dashboard_shown);
+  // The dashboard widget's host (GtkWidget*): the GTK main window's overlay
+  // on Linux, a GtkOverlayWin over the Win32 main window on Windows.
+  void AttachDashboardWidget(void* widget);
+  void ShowDashboardWidget(bool show);
+#if XE_PLATFORM_WIN32
+  std::unique_ptr<GtkOverlayWin> dashboard_overlay_;
+#endif
   bool DashboardShown() const;
   void ToggleDashboard();
   void UpdateDashboardForPanels();
