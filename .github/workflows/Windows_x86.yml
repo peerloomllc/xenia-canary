@@ -103,6 +103,16 @@ jobs:
           }
           echo "path=$path" >> $env:GITHUB_OUTPUT
 
+      # Symbols, so a crash offset from a user's machine can be turned into
+      # a function and line.
+      - name: Upload symbols
+        uses: actions/upload-artifact@v7
+        with:
+          name: xenia_canary_windows_pdb
+          path: build/bin/Windows/Release/xenia_canary.pdb
+          if-no-files-found: warn
+          retention-days: 30
+
       - name: Upload Xenia Canary artifact
         if: ${{ steps.prepare_artifacts.outcome == 'success' }}
         uses: actions/upload-artifact@v7

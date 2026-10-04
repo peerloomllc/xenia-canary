@@ -1452,6 +1452,7 @@ bool KernelState::Restore(ByteStream* stream) {
   uint32_t num_threads = stream->Read<uint32_t>();
   XELOGI("Loading {} threads...", num_threads);
   for (uint32_t i = 0; i < num_threads; i++) {
+    XELOGI("RESTOREDBG thread {} of {}", i + 1, num_threads);
     auto thread = XObject::Restore(this, XObject::Type::Thread, stream);
     if (!thread) {
       // Can't continue the restore or we risk misalignment.

@@ -1278,12 +1278,16 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state,
     }
   }
 
+  XELOGI("RESTOREDBG {:08X} life={} name_len={}", thread->handle(), life,
+         thread->thread_name_.size());
   // Register now that we know our thread ID.
   kernel_state->RegisterThread(thread);
+  XELOGI("RESTOREDBG {:08X} registered", thread->handle());
 
   thread->thread_state_ =
       new cpu::ThreadState(kernel_state->processor(), thread->thread_id_,
                            thread->stack_base_, thread->pcr_address_);
+  XELOGI("RESTOREDBG {:08X} thread state made", thread->handle());
 
   if (state.is_running) {
     auto context = thread->thread_state_->context();
@@ -1368,9 +1372,11 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state,
     });
     assert_not_null(thread->thread_);
 
+    XELOGI("RESTOREDBG {:08X} host thread created", thread->handle());
     // Notify processor we were recreated.
     thread->emulator()->processor()->OnThreadCreated(
         thread->handle(), thread->thread_state(), thread);
+    XELOGI("RESTOREDBG {:08X} processor told", thread->handle());
   } else if (life == 1) {
     // Created suspended by the guest, never started. Recreate it the way
     // Create() does, suspended; the guest's NtResumeThread starts it (its
@@ -1421,6 +1427,7 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state,
         thread->handle(), kernel_state->emulator()->save_state_version());
   }
 
+  XELOGI("RESTOREDBG {:08X} done", thread->handle());
   return object_ref<XThread>(thread);
 }
 
