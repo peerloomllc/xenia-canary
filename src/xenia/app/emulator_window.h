@@ -607,6 +607,7 @@ class EmulatorWindow {
   // GtkWidget* / GtkWidget*, as void* like the rest of the GTK members here,
   // so this header stays free of gtk.h.
   void* ActiveUiToplevel() const;
+  void* MainUiToplevel() const;
   static bool HasNotebook(void* widget);
   void SetPadHoldsUi(bool holds);
 

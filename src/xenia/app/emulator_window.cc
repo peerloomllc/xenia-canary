@@ -1446,10 +1446,13 @@ bool EmulatorWindow::Initialize() {
   // SDL ignore lists refuse, and a title runs with no controller at all while
   // nothing on screen explains why (notes/84). Check once, a few seconds in,
   // and name the thing doing the filtering if one is set.
-#if XE_PLATFORM_LINUX
+#if XE_UI_GTK
   // The menus and the library it drives are GTK, as is the dashboard built
-  // above, so this goes with them rather than into the shared path.
+  // above, so this goes with them rather than into the shared path. On
+  // Windows the menus are Win32 and the pad drives the GTK windows only.
   StartGamepadUi();
+#endif
+#if XE_PLATFORM_LINUX
   CheckForUpdates();
 #endif
 
@@ -6970,7 +6973,7 @@ void ApplyComboListStyle() {
       "combobox { -GtkComboBox-appears-as-list: 1; }\n"
       // The library's rows are drawn dark whatever the theme
       // (DashboardRowBackground); the space below them goes with them.
-      "treeview.view.xe-library { background-color: #101010; }",
+      "treeview.view.xe-library:not(:selected) { background-color: #101010; }",
       -1, nullptr);
   gtk_style_context_add_provider_for_screen(
       gdk_screen_get_default(), GTK_STYLE_PROVIDER(provider),
@@ -8671,7 +8674,6 @@ void EmulatorWindow::ShowDashboard(bool show) {
   UpdateDashboardFullscreen(show);
 }
 
-#if XE_PLATFORM_LINUX
 // Gamepad navigation of the host UI.
 //
 // The menu bar and the game library are GTK, and GTK already navigates
@@ -8679,6 +8681,21 @@ void EmulatorWindow::ShowDashboard(bool show) {
 // including through submenus and a scrolling list. So the pad is translated
 // into those key events rather than each widget being driven by hand, which
 // keeps one path for the keyboard, the mouse and the controller.
+void* EmulatorWindow::MainUiToplevel() const {
+  // The GTK window the library is in: the main window on Linux, the window
+  // over the game area on Windows (none while it is hidden).
+#if XE_PLATFORM_LINUX
+  auto* gtk_window = dynamic_cast<ui::GTKWindow*>(window_.get());
+  return gtk_window ? gtk_window->window() : nullptr;
+#elif XE_PLATFORM_WIN32
+  return dashboard_overlay_ && dashboard_overlay_->shown()
+             ? dashboard_overlay_->window()
+             : nullptr;
+#else
+  return nullptr;
+#endif
+}
+
 void* EmulatorWindow::ActiveUiToplevel() const {
   // Whichever of our windows the user is looking at, which is not always the
   // main one: Preferences, the content list and the pickers are each their
@@ -8701,8 +8718,7 @@ void* EmulatorWindow::ActiveUiToplevel() const {
       return grab_toplevel;
     }
   }
-  auto* gtk_window = dynamic_cast<ui::GTKWindow*>(window_.get());
-  GtkWidget* main_window = gtk_window ? gtk_window->window() : nullptr;
+  GtkWidget* main_window = static_cast<GtkWidget*>(MainUiToplevel());
   GtkWidget* modal = nullptr;
   GtkWidget* other = nullptr;
   GList* toplevels = gtk_window_list_toplevels();
@@ -8809,6 +8825,7 @@ void EmulatorWindow::SetPadHoldsUi(bool holds) {
 }
 
 void EmulatorWindow::OpenMenuBarFromPad() {
+#if XE_PLATFORM_LINUX
   auto* menu = dynamic_cast<ui::GTKMenuItem*>(main_menu_for_pad_);
   GtkWidget* menubar = menu ? menu->handle() : nullptr;
   if (!menubar || !GTK_IS_MENU_SHELL(menubar)) {
@@ -8828,17 +8845,19 @@ void EmulatorWindow::OpenMenuBarFromPad() {
   pad_ui_menu_open_ = true;
   SetPadHoldsUi(true);
   XELOGI("Gamepad UI: menus opened");
+#endif  // XE_PLATFORM_LINUX: the Win32 menus are not GTK
 }
 
 void EmulatorWindow::CloseMenuBarFromPad() {
+#if XE_PLATFORM_LINUX
   auto* menu = dynamic_cast<ui::GTKMenuItem*>(main_menu_for_pad_);
   GtkWidget* menubar = menu ? menu->handle() : nullptr;
   if (menubar && GTK_IS_MENU_SHELL(menubar)) {
     gtk_menu_shell_deactivate(GTK_MENU_SHELL(menubar));
   }
+#endif
   pad_ui_menu_open_ = false;
-  auto* gtk_window = dynamic_cast<ui::GTKWindow*>(window_.get());
-  SetPadHoldsUi(gtk_window && gtk_window->idle_widget_shown());
+  SetPadHoldsUi(DashboardShown());
   XELOGI("Gamepad UI: menus closed");
 }
 
@@ -8906,14 +8925,13 @@ void EmulatorWindow::PollGamepadUi() {
       static_cast<uint16_t>(buttons & ~pad_ui_prev_buttons_);
   pad_ui_prev_buttons_ = buttons;
 
-  auto* gtk_window_for_pad = dynamic_cast<ui::GTKWindow*>(window_.get());
-  const bool library_shown =
-      gtk_window_for_pad && gtk_window_for_pad->idle_widget_shown();
+  const bool library_shown = DashboardShown();
 
   // GTK closes the menus itself when an item is activated, so ask the shell
   // rather than trusting our own flag. Left stale, it kept up and down as
   // arrow keys after a menu had opened a settings window, and an arrow key
   // on a combo box there silently changes the setting under it.
+#if XE_PLATFORM_LINUX
   if (pad_ui_menu_open_) {
     auto* open_menu = dynamic_cast<ui::GTKMenuItem*>(main_menu_for_pad_);
     GtkWidget* menubar = open_menu ? open_menu->handle() : nullptr;
@@ -8921,10 +8939,10 @@ void EmulatorWindow::PollGamepadUi() {
         !gtk_menu_shell_get_selected_item(GTK_MENU_SHELL(menubar))) {
       pad_ui_menu_open_ = false;
       // Hand the pad back to the game too, or it stays held with no menu up.
-      auto* gtk_window = dynamic_cast<ui::GTKWindow*>(window_.get());
-      SetPadHoldsUi(gtk_window && gtk_window->idle_widget_shown());
+      SetPadHoldsUi(DashboardShown());
     }
   }
+#endif
 
   if (GamepadUiHotkey(buttons, pressed)) {
     if (pad_ui_menu_open_) {
@@ -8955,8 +8973,7 @@ void EmulatorWindow::PollGamepadUi() {
   // and lost it, with nothing focused at all afterwards. Left and right stay
   // arrows everywhere, since that is what changes a combo box, a slider or
   // the selected tab.
-  GtkWidget* pad_main_window =
-      gtk_window_for_pad ? gtk_window_for_pad->window() : nullptr;
+  GtkWidget* pad_main_window = static_cast<GtkWidget*>(MainUiToplevel());
   // Tab moves between the controls of a settings window, but an open
   // drop-down inside one is a list again and only arrows move its
   // highlight - Tab does nothing there, so the selection could not be
@@ -9009,7 +9026,7 @@ void EmulatorWindow::PollGamepadUi() {
     SendUiKey(GDK_KEY_Return);
   }
   if (pressed & hid::X_INPUT_GAMEPAD_B) {
-    auto* gtk_window = dynamic_cast<ui::GTKWindow*>(window_.get());
+    GtkWidget* main_window = static_cast<GtkWidget*>(MainUiToplevel());
     GtkWidget* active = static_cast<GtkWidget*>(ActiveUiToplevel());
     if (gtk_grab_get_current()) {
       // A drop-down is open: Escape closes it and leaves the window behind
@@ -9017,13 +9034,14 @@ void EmulatorWindow::PollGamepadUi() {
       SendUiKey(GDK_KEY_Escape);
       return;
     }
-    if (active && gtk_window && active != gtk_window->window()) {
+    if (active && active != main_window) {
       // One of our own windows is up. Escape closes a GtkDialog but not a
       // plain GtkWindow, which is what Preferences is, so close it.
       gtk_window_close(GTK_WINDOW(active));
       return;
     }
     if (pad_ui_menu_open_) {
+#if XE_PLATFORM_LINUX
       SendUiKey(GDK_KEY_Escape);
       // Escape closes one level; the shell tells us when it is all the way
       // out rather than guessing here.
@@ -9033,6 +9051,7 @@ void EmulatorWindow::PollGamepadUi() {
           !gtk_menu_shell_get_selected_item(GTK_MENU_SHELL(menubar))) {
         CloseMenuBarFromPad();
       }
+#endif
     } else {
       SendUiKey(GDK_KEY_Escape);
     }
@@ -9063,8 +9082,6 @@ void EmulatorWindow::StartGamepadUi() {
       },
       this);
 }
-
-#endif  // XE_PLATFORM_LINUX
 
 void EmulatorWindow::UpdateDashboardFullscreen(bool dashboard_shown) {
   // Everywhere else the overlay draws over the presented frame correctly, so
