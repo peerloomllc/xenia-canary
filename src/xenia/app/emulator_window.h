@@ -617,6 +617,8 @@ class EmulatorWindow {
   uint64_t pad_ui_repeat_after_ms_ = 0;
   unsigned int pad_ui_repeat_key_ = 0;
   bool pad_ui_menu_open_ = false;
+  bool pad_ui_menu_seen_open_ = false;  // Windows: the posted open arrived
+  std::chrono::steady_clock::time_point pad_ui_menu_opened_at_;
   bool pad_ui_holds_pad_ = false;
   // Fullscreen was turned off to show the library and is owed back.
   bool dashboard_suspended_fullscreen_ = false;

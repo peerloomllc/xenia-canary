@@ -8768,7 +8768,59 @@ bool EmulatorWindow::HasNotebook(void* widget_ptr) {
   return found;
 }
 
+#if XE_PLATFORM_WIN32
+namespace {
+bool Win32MenuOpen() {
+  GUITHREADINFO info = {};
+  info.cbSize = sizeof(info);
+  return GetGUIThreadInfo(GetCurrentThreadId(), &info) &&
+         (info.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE));
+}
+
+void PostWin32Key(HWND hwnd, UINT vk) {
+  // A menu's loop reads key messages off the thread's queue whatever window
+  // they are addressed to, and needs no keyboard focus for it.
+  LPARAM lparam = 1 | (LPARAM(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)) << 16);
+  PostMessageW(hwnd, WM_KEYDOWN, vk, lparam);
+  PostMessageW(hwnd, WM_KEYUP, vk, lparam | (LPARAM(3) << 30));
+}
+}  // namespace
+#endif
+
 void EmulatorWindow::SendUiKey(unsigned int keyval, unsigned int modifiers) {
+#if XE_PLATFORM_WIN32
+  if (pad_ui_menu_open_) {
+    // The Win32 menus, not GTK.
+    UINT vk = 0;
+    switch (keyval) {
+      case GDK_KEY_Up:
+        vk = VK_UP;
+        break;
+      case GDK_KEY_Down:
+        vk = VK_DOWN;
+        break;
+      case GDK_KEY_Left:
+        vk = VK_LEFT;
+        break;
+      case GDK_KEY_Right:
+        vk = VK_RIGHT;
+        break;
+      case GDK_KEY_Return:
+        vk = VK_RETURN;
+        break;
+      case GDK_KEY_Escape:
+        vk = VK_ESCAPE;
+        break;
+      default:
+        break;
+    }
+    auto* main = dynamic_cast<ui::Win32Window*>(window_.get());
+    if (vk && main) {
+      PostWin32Key(main->hwnd(), vk);
+    }
+    return;
+  }
+#endif
   GtkWidget* toplevel = static_cast<GtkWidget*>(ActiveUiToplevel());
   GdkWindow* gdk_window = toplevel ? gtk_widget_get_window(toplevel) : nullptr;
   if (!gdk_window) {
@@ -8845,7 +8897,25 @@ void EmulatorWindow::OpenMenuBarFromPad() {
   pad_ui_menu_open_ = true;
   SetPadHoldsUi(true);
   XELOGI("Gamepad UI: menus opened");
-#endif  // XE_PLATFORM_LINUX: the Win32 menus are not GTK
+#elif XE_PLATFORM_WIN32
+  auto* main = dynamic_cast<ui::Win32Window*>(window_.get());
+  if (!main) {
+    return;
+  }
+  // As on Linux: a fullscreen window has no menu bar to show.
+  if (window_->IsFullscreen()) {
+    SetFullscreen(false);
+  }
+  // What Alt on its own does: the menu bar takes the keyboard with its first
+  // menu highlighted. Posted, since Windows runs the menu in a loop of its
+  // own until it closes, and this is inside the pad's timer.
+  PostMessageW(main->hwnd(), WM_SYSCOMMAND, SC_KEYMENU, 0);
+  pad_ui_menu_open_ = true;
+  pad_ui_menu_seen_open_ = false;
+  pad_ui_menu_opened_at_ = std::chrono::steady_clock::now();
+  SetPadHoldsUi(true);
+  XELOGI("Gamepad UI: menus opened");
+#endif
 }
 
 void EmulatorWindow::CloseMenuBarFromPad() {
@@ -8855,6 +8925,8 @@ void EmulatorWindow::CloseMenuBarFromPad() {
   if (menubar && GTK_IS_MENU_SHELL(menubar)) {
     gtk_menu_shell_deactivate(GTK_MENU_SHELL(menubar));
   }
+#elif XE_PLATFORM_WIN32
+  EndMenu();
 #endif
   pad_ui_menu_open_ = false;
   SetPadHoldsUi(DashboardShown());
@@ -8940,6 +9012,23 @@ void EmulatorWindow::PollGamepadUi() {
       pad_ui_menu_open_ = false;
       // Hand the pad back to the game too, or it stays held with no menu up.
       SetPadHoldsUi(DashboardShown());
+    }
+  }
+#elif XE_PLATFORM_WIN32
+  // Windows closes the menus itself when an item is chosen or the menu loses
+  // the mouse; ask it rather than trust the flag. Not before it has been seen
+  // open: the request to open it is posted and may still be on its way.
+  if (pad_ui_menu_open_) {
+    if (Win32MenuOpen()) {
+      pad_ui_menu_seen_open_ = true;
+    } else if (pad_ui_menu_seen_open_ ||
+               std::chrono::steady_clock::now() - pad_ui_menu_opened_at_ >
+                   std::chrono::seconds(1)) {
+      // Closed, or it never opened (the menu bar is disabled while the
+      // emulator starts): either way the pad goes back to the game.
+      pad_ui_menu_open_ = false;
+      SetPadHoldsUi(DashboardShown());
+      XELOGI("Gamepad UI: menus closed");
     }
   }
 #endif
@@ -9028,6 +9117,15 @@ void EmulatorWindow::PollGamepadUi() {
   if (pressed & hid::X_INPUT_GAMEPAD_B) {
     GtkWidget* main_window = static_cast<GtkWidget*>(MainUiToplevel());
     GtkWidget* active = static_cast<GtkWidget*>(ActiveUiToplevel());
+#if XE_PLATFORM_WIN32
+    if (pad_ui_menu_open_) {
+      // A Win32 menu holds no GTK grab, so check it before the windows
+      // below: one level back; the poll sees the menu loop end after the
+      // last.
+      SendUiKey(GDK_KEY_Escape);
+      return;
+    }
+#endif
     if (gtk_grab_get_current()) {
       // A drop-down is open: Escape closes it and leaves the window behind
       // it alone, which closing the toplevel would not.
@@ -9051,6 +9149,9 @@ void EmulatorWindow::PollGamepadUi() {
           !gtk_menu_shell_get_selected_item(GTK_MENU_SHELL(menubar))) {
         CloseMenuBarFromPad();
       }
+#else
+      // One level; the poll sees the menu loop end after the last.
+      SendUiKey(GDK_KEY_Escape);
 #endif
     } else {
       SendUiKey(GDK_KEY_Escape);
@@ -9074,6 +9175,20 @@ void EmulatorWindow::StartGamepadUi() {
   if (pad_ui_timer_ || !cvars::gamepad_ui) {
     return;
   }
+#if XE_PLATFORM_WIN32
+  // A Win32 timer on the main window: while a menu is open Windows runs a
+  // loop of its own, which dispatches WM_TIMER but never returns to GLib,
+  // so a GLib timeout would stop polling the pad exactly when it drives the
+  // menu.
+  if (auto* main = dynamic_cast<ui::Win32Window*>(window_.get())) {
+    static EmulatorWindow* polled = nullptr;
+    polled = this;
+    pad_ui_timer_ = unsigned(
+        SetTimer(main->hwnd(), 0x58475055 /* 'XGPU' */, 33,
+                 [](HWND, UINT, UINT_PTR, DWORD) { polled->PollGamepadUi(); }));
+  }
+  return;
+#endif
   pad_ui_timer_ = g_timeout_add(
       33,
       +[](gpointer data) -> gboolean {
