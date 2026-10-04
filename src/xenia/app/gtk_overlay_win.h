@@ -30,6 +30,7 @@ class GtkOverlayWin {
 
   void Show(bool show);
   bool shown() const { return shown_; }
+  GtkWidget* window() const { return window_; }
 
  private:
   static LRESULT CALLBACK OwnerSubclassProc(HWND hwnd, UINT message,
