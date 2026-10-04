@@ -49,6 +49,7 @@ class XAudio2AudioDriver : public AudioDriver {
   void Shutdown() override;
 
  private:
+  void ApplyMute();
   // First CPU (2.8 default). XAUDIO2_ANY_PROCESSOR (2.7 default) steals too
   // much time from other things. Ideally should process audio on what roughly
   // represents thread 4 (5th) on the Xbox 360 (2.7 default on the console), or
@@ -71,6 +72,10 @@ class XAudio2AudioDriver : public AudioDriver {
       api::XAUDIO2_PROCESSOR xaudio2_processor) = nullptr;
   // clang-format on
   uint32_t api_minor_version_ = 7;
+  // The game's volume, and whether the voice is silenced for the mute
+  // setting, which can change while the voice plays (the mute hotkey).
+  float volume_ = 1.0f;
+  bool voice_muted_ = false;
 
   bool mta_thread_initialization_completion_result_;
   std::mutex mta_thread_initialization_completion_mutex_;

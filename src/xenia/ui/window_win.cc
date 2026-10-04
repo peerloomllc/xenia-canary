@@ -961,6 +961,20 @@ bool Win32Window::HandleKeyboard(
     case WM_KEYUP:
       OnKeyUp(e, destruction_receiver);
       break;
+    // Windows sends F10 as a system key (it activates the menu bar), so a
+    // hotkey on it, the load state one by default, never fired. Pass it on
+    // like any key; if nothing handles it, it still opens the menu. Alt
+    // combinations stay with Windows.
+    case WM_SYSKEYDOWN:
+      if (wParam == VK_F10 && !(GetKeyState(VK_MENU) & 0x80)) {
+        OnKeyDown(e, destruction_receiver);
+      }
+      break;
+    case WM_SYSKEYUP:
+      if (wParam == VK_F10 && !(GetKeyState(VK_MENU) & 0x80)) {
+        OnKeyUp(e, destruction_receiver);
+      }
+      break;
     case WM_CHAR:
       OnKeyChar(e, destruction_receiver);
       break;
