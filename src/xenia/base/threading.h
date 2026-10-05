@@ -174,6 +174,13 @@ void NanoSleep(int64_t ns);
 // precision. Use only where wake-up jitter would miss a frame budget; the
 // spin costs CPU.
 void NanoSleepPrecise(int64_t ns);
+// Windows: requests the finest system timer resolution again if the
+// process's request has lapsed. GTK's GDK calls timeBeginPeriod and
+// timeEndPeriod, which share the process's one request with the
+// NtSetTimerResolution made at start-up, so its timeEndPeriod cancelled
+// ours too and every sleep fell back to the 15.6 ms tick. Cheap enough to
+// call once per frame. Does nothing elsewhere.
+void KeepHighResolutionTimer();
 template <typename Rep, typename Period>
 void Sleep(std::chrono::duration<Rep, Period> duration) {
   Sleep(std::chrono::duration_cast<std::chrono::microseconds>(duration));
