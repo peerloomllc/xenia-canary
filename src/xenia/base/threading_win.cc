@@ -10,6 +10,7 @@
 #include <winternl.h>
 #include "xenia/base/assert.h"
 #include "xenia/base/chrono_steady_cast.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/platform_win.h"
 #include "xenia/base/threading.h"
@@ -56,6 +57,8 @@ XE_NTDLL_IMPORT(NtReleaseSemaphore, cls_NtReleaseSemaphore,
 XE_NTDLL_IMPORT(NtDelayExecution, cls_NtDelayExecution,
                 NtDelayExecutionPointer);
 XE_NTDLL_IMPORT(NtQueryEvent, cls_NtQueryEvent, NtQueryEventPointer);
+DECLARE_bool(win32_high_resolution_timer);
+
 namespace xe {
 namespace threading {
 
@@ -170,6 +173,28 @@ void Sleep(std::chrono::microseconds duration) {
 }
 
 void NanoSleepPrecise(int64_t ns) { NanoSleep(ns); }
+
+void KeepHighResolutionTimer() {
+  if (!cvars::win32_high_resolution_timer) {
+    return;
+  }
+  using QueryFn = LONG(NTAPI*)(PULONG minimum, PULONG maximum, PULONG current);
+  using SetFn = LONG(NTAPI*)(ULONG desired, BOOLEAN set, PULONG current);
+  static const auto query = reinterpret_cast<QueryFn>(
+      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryTimerResolution"));
+  static const auto set = reinterpret_cast<SetFn>(
+      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetTimerResolution"));
+  if (!query || !set) {
+    return;
+  }
+  // Resolutions are in 100 ns units; "maximum" is the finest.
+  ULONG minimum, maximum, current;
+  if (query(&minimum, &maximum, &current) < 0 || current <= maximum) {
+    return;
+  }
+  ULONG actual;
+  set(maximum, TRUE, &actual);
+}
 
 SleepResult AlertableSleep(std::chrono::microseconds duration) {
   if (SleepEx(static_cast<DWORD>(duration.count() / 1000), true) ==

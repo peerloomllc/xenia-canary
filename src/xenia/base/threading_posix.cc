@@ -197,6 +197,8 @@ void NanoSleep(int64_t duration) {
             static_cast<long>(duration % 1000000000LL)});
 }
 
+void KeepHighResolutionTimer() {}
+
 void NanoSleepPrecise(int64_t ns) {
 #if XE_PLATFORM_MAC
   // Darwin's nanosleep can oversleep by 100-500us under load. Land precisely

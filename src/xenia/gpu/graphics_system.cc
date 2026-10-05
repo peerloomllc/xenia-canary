@@ -184,6 +184,8 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
                   last_frame_time = current_time;
 
                   MarkVblank();
+                  // The sleep below relies on a fine timer resolution.
+                  threading::KeepHighResolutionTimer();
                   const uint64_t estimated_nanoseconds = static_cast<uint64_t>(
                       (vsync_duration_d * 1000000.0) *
                       duration_scalar);  // 1000 microseconds = 1 ms
