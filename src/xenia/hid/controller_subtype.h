@@ -30,6 +30,17 @@ std::optional<uint8_t> ForcedControllerSubtype(std::string_view setting,
                                                size_t user_index,
                                                std::string_view device_name);
 
+// True for a guitar that reports itself as an ordinary pad, so nothing but
+// its USB ids says what it is: the CRKD Les Paul (0351:1300 in its Xbox mode,
+// 0351:4161 in its other one).
+bool IsKnownGuitar(uint16_t vendor_id, uint16_t product_id);
+
+// The subtype a title needs before it plays a guitar as an instrument, or
+// nothing for a title not listed. Guitar Hero III and Aerosmith sort the
+// plain guitar subtype in with the pads and want the alternate one; the later
+// Guitar Hero titles want the plain one.
+std::optional<uint8_t> TitleGuitarSubtype(uint32_t title_id);
+
 }  // namespace hid
 }  // namespace xe
 

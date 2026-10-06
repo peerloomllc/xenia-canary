@@ -9,19 +9,27 @@
 
 #include "xenia/hid/sdl/sdl_input_driver.h"
 
+#include <algorithm>
+#include <cstdlib>
 #include <limits>
+#include <string>
 
 #if XE_PLATFORM_WIN32
 #include "xenia/base/platform_win.h"
+
+#include <cfgmgr32.h>
 #endif  // XE_PLATFORM_WIN32
 
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/threading.h"
+#include "xenia/base/utf8.h"
 #include "xenia/helper/sdl/sdl_helper.h"
 #include "xenia/hid/controller_subtype.h"
 #include "xenia/hid/hid_flags.h"
+#include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/util/shim_utils.h"
 #include "xenia/ui/virtual_key.h"
 #include "xenia/ui/window.h"
 
@@ -553,6 +561,77 @@ void SDLInputDriver::HandleEvent(const SDL_Event& event) {
   return;
 }
 
+namespace {
+
+#if XE_PLATFORM_WIN32
+// Windows republishes an Xbox One-class device under Microsoft's generic ids
+// (045E:02FF, "Xbox One Controller"), which is all SDL can see; the device's
+// own ids are on a parent of that one in the device tree. SDL's path for it is
+// the raw input name, \\?\HID#VID_045E&PID_02FF&IG_00#7&523bacf&0&0000#{...},
+// which names the device instance HID\VID_045E&PID_02FF&IG_00\7&523bacf&0&0000.
+bool KnownGuitarInDeviceTree(const char* path) {
+  if (!path) {
+    return false;
+  }
+  std::string instance(path);
+  if (instance.rfind("\\\\?\\", 0) == 0) {
+    instance.erase(0, 4);
+  }
+  const size_t interface_guid = instance.rfind("#{");
+  if (interface_guid == std::string::npos) {
+    return false;
+  }
+  instance.resize(interface_guid);
+  std::replace(instance.begin(), instance.end(), '#', '\\');
+  DEVINST node;
+  if (CM_Locate_DevNodeA(&node, instance.data(), CM_LOCATE_DEVNODE_NORMAL) !=
+      CR_SUCCESS) {
+    return false;
+  }
+  // The HID device, the Xbox one it belongs to, then the USB device.
+  for (int level = 0; level < 4; ++level) {
+    char id[MAX_DEVICE_ID_LEN];
+    if (CM_Get_Device_IDA(node, id, sizeof(id), 0) != CR_SUCCESS) {
+      return false;
+    }
+    const std::string upper = xe::utf8::upper_ascii(id);
+    const size_t vid = upper.find("VID_");
+    const size_t pid = upper.find("PID_");
+    if (vid != std::string::npos && pid != std::string::npos &&
+        IsKnownGuitar(
+            uint16_t(std::strtoul(upper.c_str() + vid + 4, nullptr, 16)),
+            uint16_t(std::strtoul(upper.c_str() + pid + 4, nullptr, 16)))) {
+      XELOGI("SDL HID: '{}' is a known guitar ({})", path, id);
+      return true;
+    }
+    DEVINST parent;
+    if (CM_Get_Parent(&parent, node, 0) != CR_SUCCESS) {
+      return false;
+    }
+    node = parent;
+  }
+  return false;
+}
+#endif
+
+bool IsKnownGuitarController(SDL_GameController* controller) {
+#if SDL_VERSION_ATLEAST(2, 0, 6)
+  if (IsKnownGuitar(SDL_GameControllerGetVendor(controller),
+                    SDL_GameControllerGetProduct(controller))) {
+    return true;
+  }
+#endif
+#if XE_PLATFORM_WIN32 && SDL_VERSION_ATLEAST(2, 24, 0)
+  if (KnownGuitarInDeviceTree(
+          SDL_JoystickPath(SDL_GameControllerGetJoystick(controller)))) {
+    return true;
+  }
+#endif
+  return false;
+}
+
+}  // namespace
+
 void SDLInputDriver::OnControllerDeviceAdded(const SDL_Event& event) {
   // Open the controller.
   const auto controller = SDL_GameControllerOpen(event.cdevice.which);
@@ -614,6 +693,7 @@ void SDLInputDriver::OnControllerDeviceAdded(const SDL_Event& event) {
   if (user_id >= 0) {
     auto& state = controllers_.at(user_id);
     state = {controller, {}};
+    state.known_guitar = IsKnownGuitarController(controller);
     // XInput seems to start with packet_number = 1 .
     state.state_changed = true;
     UpdateXCapabilities(state, size_t(user_id));
@@ -938,6 +1018,17 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state,
           ForcedControllerSubtype(cvars::controller_subtypes, user_index,
                                   device_name ? device_name : "")) {
     c.sub_type = *forced;
+  } else if (state.known_guitar || IsGuitarSubtype(c.sub_type)) {
+    // A guitar, by its ids or by what it says it is. Which guitar subtype a
+    // title plays as an instrument depends on the title (Guitar Hero III
+    // plays the plain one as a pad), so the title decides where it is known.
+    const uint32_t title_id =
+        kernel::kernel_state() ? kernel::kernel_state()->title_id() : 0;
+    if (auto wanted = TitleGuitarSubtype(title_id)) {
+      c.sub_type = *wanted;
+    } else if (!IsGuitarSubtype(c.sub_type)) {
+      c.sub_type = XINPUT_DEVSUBTYPE_GUITAR;
+    }
   }
   guitar_slot_[user_index] = IsGuitarSubtype(c.sub_type);
   // A guitar built for the newer consoles sends its whammy as a trigger,
