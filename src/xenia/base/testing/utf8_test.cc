@@ -220,8 +220,19 @@ TEST_CASE("UTF-8 Count", "[utf8]") {
   TEST_LANGUAGE_EXAMPLES(utf8::count, results);
 }
 
-// TODO(gibbed): lower_ascii
-// TODO(gibbed): upper_ascii
+TEST_CASE("UTF-8 Lower ASCII", "[utf8]") {
+  REQUIRE(utf8::lower_ascii("USB\\VID_0351&PID_1300") ==
+          "usb\\vid_0351&pid_1300");
+  REQUIRE(utf8::lower_ascii("Æble ÅB") == "Æble Åb");
+}
+
+TEST_CASE("UTF-8 Upper ASCII", "[utf8]") {
+  REQUIRE(utf8::upper_ascii("usb\\vid_0351&pid_1300") ==
+          "USB\\VID_0351&PID_1300");
+  REQUIRE(utf8::upper_ascii("USB\\VID_0351") == "USB\\VID_0351");
+  REQUIRE(utf8::upper_ascii("æble åb") == "æBLE åB");
+}
+
 // TODO(gibbed): hash_fnv1a
 // TODO(gibbed): hash_fnv1a_case
 
