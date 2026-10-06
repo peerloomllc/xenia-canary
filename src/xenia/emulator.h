@@ -68,8 +68,9 @@ constexpr fourcc_t kSaveStateContainerSignature = make_fourcc("XSSC");
 // created suspended and not yet started is restored that way. 6 adds the
 // guest clock (tick count, system time) to the header. 7 adds the mounted
 // content packages (DLC, saves opened through XAM) to the kernel section, so
-// their files can be reopened.
-constexpr uint32_t kSaveStateFormatVersion = 9;
+// their files can be reopened. 10 adds the memory only the host GPU holds
+// (resolve and memexport results, scaled resolve data) to the GPU section.
+constexpr uint32_t kSaveStateFormatVersion = 10;
 // Restoring a file older than this rebuilds the object table with no timers,
 // which silences a title whose audio mixer runs off a periodic one; the load
 // warns rather than refusing, since everything else in the file still works.

@@ -19,6 +19,7 @@
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/gpu/packet_disassembler.h"
 #include "xenia/gpu/sampler_info.h"
+#include "xenia/gpu/shared_memory.h"
 #include "xenia/gpu/texture_info.h"
 #include "xenia/gpu/xenos_zpd_report.h"
 #include "xenia/kernel/kernel_state.h"
@@ -421,6 +422,10 @@ void CommandProcessor::Pause(bool capture_edram) {
         edram_snapshot_.clear();
         XELOGW("Save state: EDRAM contents not captured (see above)");
       }
+      gpu_memory_snapshot_.clear();
+      if (!CaptureGpuMemorySnapshot(gpu_memory_snapshot_)) {
+        gpu_memory_snapshot_.clear();
+      }
     }
     fence.Signal();
     threading::Thread::GetCurrentThread()->Suspend();
@@ -439,6 +444,17 @@ void CommandProcessor::RestoreSavedEdramSnapshot() {
     XELOGW("Restore: EDRAM contents not restored; the guest redraws them");
   }
   std::vector<uint8_t>().swap(edram_snapshot_);
+}
+
+void CommandProcessor::RestoreSavedGpuMemorySnapshot() {
+  if (gpu_memory_snapshot_.empty()) {
+    return;
+  }
+  if (!RestoreGpuMemorySnapshot(gpu_memory_snapshot_, edram_snapshot_scale_x_,
+                                edram_snapshot_scale_y_)) {
+    XELOGW("Restore: GPU-written memory not restored");
+  }
+  std::vector<GpuMemorySnapshotRange>().swap(gpu_memory_snapshot_);
 }
 
 void CommandProcessor::Resume() {
@@ -479,10 +495,28 @@ bool CommandProcessor::Save(ByteStream* stream) {
   }
   std::vector<uint8_t>().swap(edram_snapshot_);
 
+  // Format 10: memory only the GPU holds, captured at the pause.
+  uint64_t gpu_memory_bytes = 0;
+  stream->Write<uint32_t>(uint32_t(gpu_memory_snapshot_.size()));
+  for (const GpuMemorySnapshotRange& range : gpu_memory_snapshot_) {
+    stream->Write<uint32_t>(range.start);
+    stream->Write<uint32_t>(range.length);
+    stream->Write<uint32_t>(range.scaled ? 1 : 0);
+    stream->Write<uint64_t>(range.data.size());
+    stream->Write(range.data.data(), range.data.size());
+    gpu_memory_bytes += range.data.size();
+  }
+  if (!gpu_memory_snapshot_.empty()) {
+    XELOGI("Save state: {} bytes of GPU-written memory in {} ranges",
+           gpu_memory_bytes, gpu_memory_snapshot_.size());
+  }
+  std::vector<GpuMemorySnapshotRange>().swap(gpu_memory_snapshot_);
+
   return true;
 }
 
-bool CommandProcessor::Restore(ByteStream* stream, bool has_edram_snapshot) {
+bool CommandProcessor::Restore(ByteStream* stream, bool has_edram_snapshot,
+                               bool has_gpu_memory_snapshot) {
   assert_true(paused_);
 
   primary_buffer_ptr_ = stream->Read<uint32_t>();
@@ -500,6 +534,7 @@ bool CommandProcessor::Restore(ByteStream* stream, bool has_edram_snapshot) {
   }
   stream->Read(register_file_->values, sizeof(register_file_->values[0]) *
                                            RegisterFile::kRegisterCount);
+  fast_draw_valid_ = false;
 
   std::vector<uint8_t>().swap(edram_snapshot_);
   if (has_edram_snapshot) {
@@ -514,6 +549,31 @@ bool CommandProcessor::Restore(ByteStream* stream, bool has_edram_snapshot) {
     if (size) {
       edram_snapshot_.resize(size_t(size));
       stream->Read(edram_snapshot_.data(), edram_snapshot_.size());
+    }
+  }
+
+  std::vector<GpuMemorySnapshotRange>().swap(gpu_memory_snapshot_);
+  if (has_gpu_memory_snapshot) {
+    uint32_t range_count = stream->Read<uint32_t>();
+    // At most one range per 4 KB page; a scaled range is up to 49 times the
+    // memory (7x7 scale).
+    if (range_count > (SharedMemory::kBufferSize >> 12)) {
+      XELOGE("CommandProcessor::Restore - {} GPU memory ranges", range_count);
+      return false;
+    }
+    gpu_memory_snapshot_.resize(range_count);
+    for (GpuMemorySnapshotRange& range : gpu_memory_snapshot_) {
+      range.start = stream->Read<uint32_t>();
+      range.length = stream->Read<uint32_t>();
+      range.scaled = stream->Read<uint32_t>() != 0;
+      uint64_t size = stream->Read<uint64_t>();
+      if (size > uint64_t(SharedMemory::kBufferSize) * 49) {
+        XELOGE("CommandProcessor::Restore - GPU memory range of {} bytes",
+               size);
+        return false;
+      }
+      range.data.resize(size_t(size));
+      stream->Read(range.data.data(), range.data.size());
     }
   }
 
@@ -786,6 +846,12 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   if (XE_LIKELY(index < RegisterFile::kRegisterCount)) {
     register_file_->values[index] = value;
+    // Shader constant changes are noted by the backend.
+    if (index != XE_GPU_REG_VGT_INDX_OFFSET &&
+        (index < XE_GPU_REG_SHADER_CONSTANT_000_X ||
+         index > XE_GPU_REG_SHADER_CONSTANT_FLUSH_FETCH_2)) {
+      fast_draw_valid_ = false;
+    }
 
     // quick pre-test
     // todo: figure out just how unlikely this is. if very (it ought to be,

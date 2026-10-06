@@ -59,6 +59,7 @@ class VulkanDevice {
     uint32_t maxImageDimension3D = 256;
     uint32_t maxImageDimensionCube = 4096;
     uint32_t maxImageArrayLayers = 256;
+    uint32_t maxBoundDescriptorSets = 4;
     uint32_t maxStorageBufferRange = uint32_t(1) << 27;
     float timestampPeriod = 0.0f;
     uint32_t timestampComputeAndGraphics = 0;
@@ -73,6 +74,8 @@ class VulkanDevice {
     uint32_t maxGeometryOutputComponents = 64;
     uint32_t maxFragmentInputComponents = 64;
     uint32_t maxFragmentCombinedOutputResources = 4;
+    uint32_t maxColorAttachments = 4;
+    uint32_t maxUniformBufferRange = 16384;
     float maxSamplerAnisotropy = 1.0f;
     uint32_t maxViewportDimensions[2] = {4096, 4096};
     VkDeviceSize minUniformBufferOffsetAlignment = 256;
@@ -90,6 +93,7 @@ class VulkanDevice {
     VkSampleCountFlags sampledImageColorSampleCounts =
         VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
     VkSampleCountFlags sampledImageIntegerSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    VkSampleCountFlags storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT;
     VkSampleCountFlags sampledImageDepthSampleCounts =
         VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
     VkSampleCountFlags sampledImageStencilSampleCounts =
@@ -112,6 +116,7 @@ class VulkanDevice {
     bool occlusionQueryPrecise = false;
     bool vertexPipelineStoresAndAtomics = false;
     bool fragmentStoresAndAtomics = false;
+    bool shaderStorageImageMultisample = false;
     bool shaderClipDistance = false;
     bool shaderCullDistance = false;
     bool sparseBinding = false;

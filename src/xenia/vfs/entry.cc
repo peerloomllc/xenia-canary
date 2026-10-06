@@ -150,7 +150,10 @@ void Entry::Rename(const std::filesystem::path file_path) {
   absolute_path_ =
       xe::utf8::join_guest_paths(device_->mount_path(), guest_path);
   path_ = guest_path;
-  name_ = xe::path_to_utf8(file_path.filename());
+  // The last part of the split guest path: filename() does not split at a
+  // backslash on POSIX, so it returned the whole guest path there and a
+  // lookup of the renamed file by its new name failed.
+  name_ = path_parts.empty() ? std::string() : std::string(path_parts.back());
 }
 
 }  // namespace vfs

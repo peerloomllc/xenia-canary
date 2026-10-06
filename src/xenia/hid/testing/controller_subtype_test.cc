@@ -83,4 +83,20 @@ TEST_CASE("controller_subtypes name containing a colon",
       XINPUT_DEVSUBTYPE_GUITAR);
 }
 
+TEST_CASE("known guitars by USB ids", "[controller_subtype]") {
+  REQUIRE(IsKnownGuitar(0x0351, 0x1300));
+  REQUIRE(IsKnownGuitar(0x0351, 0x4161));
+  // Microsoft's generic Xbox One ids, which a real pad also has.
+  REQUIRE_FALSE(IsKnownGuitar(0x045E, 0x02FF));
+  REQUIRE_FALSE(IsKnownGuitar(0x0351, 0x0001));
+}
+
+TEST_CASE("guitar subtype by title", "[controller_subtype]") {
+  REQUIRE(TitleGuitarSubtype(0x415607F7) == XINPUT_DEVSUBTYPE_GUITAR_ALTERNATE);
+  REQUIRE(TitleGuitarSubtype(0x41560819) == XINPUT_DEVSUBTYPE_GUITAR_ALTERNATE);
+  REQUIRE(TitleGuitarSubtype(0x41560840) == XINPUT_DEVSUBTYPE_GUITAR);
+  REQUIRE_FALSE(TitleGuitarSubtype(0x4D5307DF).has_value());
+  REQUIRE_FALSE(TitleGuitarSubtype(0).has_value());
+}
+
 }  // namespace xe::hid::test

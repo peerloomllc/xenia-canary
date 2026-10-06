@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 #include "xenia/base/logging.h"
 #include "xenia/base/utf8.h"
@@ -95,6 +96,33 @@ std::optional<uint8_t> ForcedControllerSubtype(std::string_view setting,
     return it->second;
   }
   return std::nullopt;
+}
+
+bool IsKnownGuitar(uint16_t vendor_id, uint16_t product_id) {
+  static constexpr std::pair<uint16_t, uint16_t> kGuitars[] = {
+      {0x0351, 0x1300},  // CRKD Les Paul, Xbox mode
+      {0x0351, 0x4161},  // CRKD Les Paul
+  };
+  for (const auto& [vendor, product] : kGuitars) {
+    if (vendor == vendor_id && product == product_id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::optional<uint8_t> TitleGuitarSubtype(uint32_t title_id) {
+  switch (title_id) {
+    case 0x415607F7:  // Guitar Hero III: Legends of Rock
+    case 0x41560819:  // Guitar Hero: Aerosmith
+      return XINPUT_DEVSUBTYPE_GUITAR_ALTERNATE;
+    case 0x4156081A:  // later Guitar Hero titles, on the Guitar Hero 5 engine
+    case 0x41560830:
+    case 0x41560840:  // Guitar Hero 5
+      return XINPUT_DEVSUBTYPE_GUITAR;
+    default:
+      return std::nullopt;
+  }
 }
 
 }  // namespace hid

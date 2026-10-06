@@ -2,16 +2,22 @@ add_library(xenia-gpu STATIC)
 xe_platform_sources(xenia-gpu ${CMAKE_CURRENT_SOURCE_DIR})
 if(APPLE)
   # No Vulkan/SPIR-V backend on macOS — remove spirv_* sources
+  target_include_directories(xenia-gpu PRIVATE
+    ${PROJECT_SOURCE_DIR}/third_party/FFmpeg
+    ${PROJECT_SOURCE_DIR}/third_party/ffmpeg-xenia
+  )
   get_target_property(_gpu_srcs xenia-gpu SOURCES)
   list(FILTER _gpu_srcs EXCLUDE REGEX "spirv_")
   set_target_properties(xenia-gpu PROPERTIES SOURCES "${_gpu_srcs}")
-  target_link_libraries(xenia-gpu PUBLIC dxbc fmt snappy xxhash xenia-base xenia-ui)
+  target_link_libraries(xenia-gpu PUBLIC dxbc fmt libavcodec libavformat libavutil snappy xxhash xenia-base xenia-ui)
 else()
   target_include_directories(xenia-gpu PRIVATE
     ${PROJECT_SOURCE_DIR}/third_party/Vulkan-Headers/include
     ${PROJECT_SOURCE_DIR}/third_party/glslang
+    ${PROJECT_SOURCE_DIR}/third_party/FFmpeg
+    ${PROJECT_SOURCE_DIR}/third_party/ffmpeg-xenia
   )
-  target_link_libraries(xenia-gpu PUBLIC dxbc fmt glslang-spirv snappy xxhash xenia-base xenia-ui)
+  target_link_libraries(xenia-gpu PUBLIC dxbc fmt glslang-spirv libavcodec libavformat libavutil snappy xxhash xenia-base xenia-ui)
 endif()
 xe_target_defaults(xenia-gpu)
 

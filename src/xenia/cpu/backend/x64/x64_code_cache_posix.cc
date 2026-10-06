@@ -15,7 +15,6 @@
 #include "xenia/base/assert.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
-#include "xenia/cpu/backend/x64/x64_stack_layout.h"
 
 // libgcc/libunwind APIs for registering DWARF .eh_frame unwind info.
 extern "C" void __register_frame(void*);
@@ -274,9 +273,10 @@ void PosixX64CodeCache::InitializeUnwindEntry(
     *p++ = kDW_CFA_def_cfa_offset;
     p += WriteULEB128(p, 8 + func_info.stack_size);
 
-    // For thunk functions, encode callee-saved register save locations.
-    // The thunk saves non-volatile registers at known offsets from RSP.
-    if (func_info.stack_size == StackLayout::THUNK_STACK_SIZE) {
+    // HostToGuest thunk: encode callee-saved register save locations. The
+    // guest-to-host and resolve thunks allocate the same frame without saving
+    // them, and a guest frame can match the size too.
+    if (func_info.is_host_to_guest_thunk) {
       size_t cfa = 8 + func_info.stack_size;  // 272
 
       // RBX at rsp+0x18 → CFA-248, factored offset = 31

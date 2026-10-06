@@ -91,8 +91,8 @@ GraphicsUploadBufferPool::Page* GraphicsUploadBufferPool::Request(
   alignment = std::max(alignment, size_t(1));
   assert_true(xe::is_pow2(alignment));
   size = xe::align(size, alignment);
-  assert_true(size <= page_size_);
-  if (size > page_size_) {
+  assert_true(size + page_tail_reserve_ <= page_size_);
+  if (size + page_tail_reserve_ > page_size_) {
     return nullptr;
   }
   assert_true(!current_page_used_ ||
@@ -100,7 +100,8 @@ GraphicsUploadBufferPool::Page* GraphicsUploadBufferPool::Request(
   assert_true(!submitted_last_ ||
               submission_index >= submitted_last_->last_submission_index_);
   size_t current_page_used_aligned = xe::align(current_page_used_, alignment);
-  if (current_page_used_aligned + size > page_size_ || !writable_first_) {
+  if (current_page_used_aligned + size + page_tail_reserve_ > page_size_ ||
+      !writable_first_) {
     // Start a new page if can't fit all the bytes or don't have an open page.
     if (writable_first_) {
       // Close the page that was current.

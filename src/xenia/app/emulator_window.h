@@ -17,6 +17,8 @@
 #include <optional>
 #include <string>
 
+#include "xenia/app/game_library.h"
+#include "xenia/app/patch_files.h"
 #include "xenia/app/profile_dialogs.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/command_processor.h"
@@ -35,6 +37,7 @@ namespace xe {
 namespace app {
 
 class ConsoleSettingsDialog;
+class GtkOverlayWin;
 class ContentListDialog;
 
 struct RecentTitleEntry {
@@ -42,17 +45,6 @@ struct RecentTitleEntry {
   std::filesystem::path path_to_file;
   std::time_t last_run_time;
 };
-
-// Which tab of the Preferences window a .patch.toml entry appears on. The
-// file format has no category field, so this is guessed from the entry's
-// name and description unless the user has moved it (patch_categories.txt
-// in the storage root).
-enum class PatchCategory {
-  kFix = 0,    // fixes, graphics and speed
-  kCheat = 1,  // gameplay advantages
-  kExtra = 2,  // debug menus, free camera, skipped intros
-};
-constexpr int kPatchCategoryCount = 3;
 
 class EmulatorWindow {
  public:
@@ -135,7 +127,6 @@ class EmulatorWindow {
 
   void ToggleProfilesConfigDialog();
   void ToggleXMPConfigDialog();
-  void ToggleSupportDialog();
   void ToggleConsoleSettingsDialog();
   void ToggleContentListDialog();
 
@@ -300,7 +291,7 @@ class EmulatorWindow {
   std::unique_ptr<ReShadeOverlayDialog> reshade_overlay_dialog_;
   // Display > Dialog size: cvar ui_scale, applied to the ImGui drawer.
   void SetUIScale(float scale);
-#if XE_PLATFORM_LINUX
+#if XE_UI_GTK
   // Display > Settings window...: a GTK window (Graphics, Folders, Hotkeys
   // tabs) over the same config variables as the ImGui dialogs; a real
   // window that can sit next to or outside the game.
@@ -328,22 +319,7 @@ class EmulatorWindow {
   void LookupCommunityPatches();
   void DownloadCommunityPatch(const std::string& name);
   std::map<uint32_t, std::string> PatchTitles();
-  // The tab an entry belongs on: the user's choice if there is one,
-  // otherwise guessed from its name and description.
-  PatchCategory PatchCategoryOf(const std::filesystem::path& file,
-                                const std::string& name,
-                                const std::string& desc);
-  void SetPatchCategory(const std::filesystem::path& file,
-                        const std::string& name, PatchCategory category);
-  void LoadPatchCategories();
-  // Switches off any enabled patch for this title that writes the same
-  // guest address as the one just enabled; returns their names.
-  std::vector<std::string> DisableConflictingPatches(
-      const std::filesystem::path& file, const std::string& name);
-  void SavePatchCategories();
   std::string patches_notice_;  // survives the rebuild after a conflict
-  std::map<std::string, PatchCategory> patch_categories_;  // "file|patch"
-  bool patch_categories_loaded_ = false;
   void* patches_status_[kPatchCategoryCount] = {};  // GtkLabel*
   void* patches_combo_[kPatchCategoryCount] = {};   // GtkComboBoxText*
   void* patches_box_[kPatchCategoryCount] = {};     // GtkBox*: the entries
@@ -355,11 +331,6 @@ class EmulatorWindow {
   std::vector<uint32_t> patches_combo_title_ids_;
   uint32_t patches_selected_title_ = 0;
   bool patches_refreshing_ = false;
-  struct CommunityPatchFile {
-    std::string name;  // file name in the repository's patches/ folder
-    std::string sha;   // git blob id
-    uint32_t title_id;
-  };
   std::vector<CommunityPatchFile> community_patch_files_;
   bool community_looked_up_ = false;
   bool community_lookup_running_ = false;
@@ -374,6 +345,7 @@ class EmulatorWindow {
   // Full-window dimming overlay with "PAUSED" while Emulator::is_paused().
   class PausedOverlayDialog final : public ui::ImGuiDialog {
    public:
+    bool IsOverlay() const override { return true; }
     PausedOverlayDialog(ui::ImGuiDrawer* imgui_drawer,
                         EmulatorWindow& emulator_window)
         : ui::ImGuiDialog(imgui_drawer), emulator_window_(emulator_window) {}
@@ -389,6 +361,7 @@ class EmulatorWindow {
   // the guest time scalar is not 1, "MUTED" while audio is muted.
   class StatusOverlayDialog final : public ui::ImGuiDialog {
    public:
+    bool IsOverlay() const override { return true; }
     StatusOverlayDialog(ui::ImGuiDrawer* imgui_drawer,
                         EmulatorWindow& emulator_window)
         : ui::ImGuiDialog(imgui_drawer), emulator_window_(emulator_window) {}
@@ -409,19 +382,6 @@ class EmulatorWindow {
    public:
     KeyboardHotkeysDialog(ui::ImGuiDrawer* imgui_drawer,
                           EmulatorWindow& emulator_window)
-        : ui::ImGuiDialog(imgui_drawer), emulator_window_(emulator_window) {}
-
-   protected:
-    void OnDraw(ImGuiIO& io) override;
-
-   private:
-    EmulatorWindow& emulator_window_;
-  };
-
-  class SupportDialog final : public ui::ImGuiDialog {
-   public:
-    SupportDialog(ui::ImGuiDrawer* imgui_drawer,
-                  EmulatorWindow& emulator_window)
         : ui::ImGuiDialog(imgui_drawer), emulator_window_(emulator_window) {}
 
    protected:
@@ -559,30 +519,32 @@ class EmulatorWindow {
     EmulatorWindow& emulator_window_;
   };
   void ToggleGameLibraryDialog();
-#if XE_PLATFORM_LINUX
-  // Game library dashboard: a native list over the game view while no
-  // title runs (File > Game Library toggles it). Backed by library.toml
-  // in the storage root: one entry per file under games_dir with what the
-  // XEX header says (title id, discs, media id, region), the name once
-  // the title was launched, time played, last played and Tim's rating.
-  struct LibraryTitle {
-    std::filesystem::path path;
-    std::string type;  // ISO, XEX, ZAR
-    uint32_t title_id = 0;
-    std::string title_name;
-    uint8_t disc_number = 0;
-    uint8_t disc_count = 0;
-    uint32_t media_id = 0;
-    uint32_t region = 0;
-    uint64_t size = 0;
-    int64_t seconds_played = 0;
-    int64_t last_played = 0;
-    int rating = 0;  // 0 none, 1-5 stars
-  };
+  // Game library (library.toml, see game_library.h) and the play time it
+  // records. On every platform; the dashboard that shows it is GTK only.
+  using LibraryTitle = GameLibrary::Title;
   void LoadLibrary();
   void SaveLibrary();
   void ScanLibrary();
-  static bool ReadTitleInfo(LibraryTitle& title);
+  // Credits a successful launch to its library entry (adding one for a file
+  // outside games_dir) and starts timing the session.
+  void RecordLibraryLaunch();
+  void AddPlayTime();
+  // The library entry a launch should be credited to. A playlist launch
+  // maps to the disc file currently mounted (or the first disc), so the
+  // .m3u itself never becomes a library entry.
+  LibraryTitle* LibraryEntryForLaunch(const std::filesystem::path& path);
+  // The entry for the disc mounted right now, falling back to the launch
+  // entry. What a finished session should be credited to.
+  LibraryTitle* LibraryEntryMounted(const std::filesystem::path& path);
+  GameLibrary library_;
+  // Which Preferences tab each patch entry is on (patch_files.h).
+  PatchCategories patch_categories_;
+  std::chrono::steady_clock::time_point session_start_;
+  bool session_running_ = false;
+  std::filesystem::path session_path_;
+#if XE_UI_GTK
+  // Game library dashboard: a native list over the game view while no
+  // title runs (File > Game Library toggles it).
   void BuildDashboard();
   void RefreshDashboard();
   void ShowDashboard(bool show);
@@ -592,31 +554,21 @@ class EmulatorWindow {
   // black but for the ImGui overlay. Leave fullscreen while the library is
   // up and take it back when a title has the screen.
   void UpdateDashboardFullscreen(bool dashboard_shown);
+  // The dashboard widget's host (GtkWidget*): the GTK main window's overlay
+  // on Linux, a GtkOverlayWin over the Win32 main window on Windows.
+  void AttachDashboardWidget(void* widget);
+  void ShowDashboardWidget(bool show);
+#if XE_PLATFORM_WIN32
+  std::unique_ptr<GtkOverlayWin> dashboard_overlay_;
+#endif
   bool DashboardShown() const;
   void ToggleDashboard();
-  void OnDashboardTitleLaunched();
-  void AddPlayTime();
-  LibraryTitle* LibraryEntryFor(const std::filesystem::path& path);
-  // The library entry a launch should be credited to. A playlist launch
-  // maps to the disc file currently mounted (or the first disc), so the
-  // .m3u itself never becomes a library entry.
-  LibraryTitle* LibraryEntryForLaunch(const std::filesystem::path& path);
-  // The entry for the disc mounted right now, falling back to the launch
-  // entry. What a finished session should be credited to.
-  LibraryTitle* LibraryEntryMounted(const std::filesystem::path& path);
-  // Indices of every library entry that belongs to the same multi-disc
-  // title as entry `index` (same title id and folder), including itself,
-  // in disc order. A single-disc title yields just itself.
-  std::vector<size_t> LibraryDiscGroup(size_t index) const;
-  // The playlist a library launch of a multi-disc title goes through,
-  // written under the storage root; empty for a single-disc title.
-  std::filesystem::path WriteLibraryPlaylist(size_t index);
+  void UpdateDashboardForPanels();
 
  public:
   bool DashboardRowVisible(void* model, void* iter);  // GTK filter callback
 
  private:
-  std::vector<LibraryTitle> library_titles_;
   void* dashboard_widget_ = nullptr;  // GtkWidget*
   void* dashboard_store_ = nullptr;   // GtkListStore*
   void* dashboard_filter_ = nullptr;  // GtkTreeModelFilter*
@@ -655,6 +607,7 @@ class EmulatorWindow {
   // GtkWidget* / GtkWidget*, as void* like the rest of the GTK members here,
   // so this header stays free of gtk.h.
   void* ActiveUiToplevel() const;
+  void* MainUiToplevel() const;
   static bool HasNotebook(void* widget);
   void SetPadHoldsUi(bool holds);
 
@@ -664,20 +617,23 @@ class EmulatorWindow {
   uint64_t pad_ui_repeat_after_ms_ = 0;
   unsigned int pad_ui_repeat_key_ = 0;
   bool pad_ui_menu_open_ = false;
+  bool pad_ui_menu_seen_open_ = false;  // Windows: the posted open arrived
+  std::chrono::steady_clock::time_point pad_ui_menu_opened_at_;
   bool pad_ui_holds_pad_ = false;
   // Fullscreen was turned off to show the library and is owed back.
   bool dashboard_suspended_fullscreen_ = false;
-  std::chrono::steady_clock::time_point session_start_;
-  bool session_running_ = false;
-  std::filesystem::path session_path_;
+  // The dashboard was hidden so an ImGui panel opened over it can be seen.
+  bool dashboard_hidden_for_panel_ = false;
 #endif
   // File > Reset Game / Close Game. RunTitle closes a running title first.
   void ResetGame();
   void CloseGame();
   // Starts a new emulator process with this one's arguments and `path` as
-  // the title (none if empty), then closes this window. Linux only.
+  // the title (none if empty), then closes this window. Linux and Windows.
   bool RelaunchProcess(const std::filesystem::path& path);
   std::filesystem::path last_launched_path_;
+  void PickFmvReplacementDir();  // folder picker; call from the UI loop
+  void SetFmvReplacementDir(const std::filesystem::path& dir);
   void PickGamesDir();  // folder picker; call from the UI loop
   void SetGamesDir(const std::filesystem::path& dir);
   void ScanGamesDir();
@@ -752,6 +708,7 @@ class EmulatorWindow {
   // closes it at once.
   class SlotOverlayDialog final : public ui::ImGuiDialog {
    public:
+    bool IsOverlay() const override { return true; }
     SlotOverlayDialog(ui::ImGuiDrawer* imgui_drawer,
                       EmulatorWindow& emulator_window)
         : ui::ImGuiDialog(imgui_drawer), emulator_window_(emulator_window) {}
@@ -852,6 +809,7 @@ class EmulatorWindow {
   // operation runs (they pause the game for its duration).
   class StateOverlayDialog final : public ui::ImGuiDialog {
    public:
+    bool IsOverlay() const override { return true; }
     StateOverlayDialog(ui::ImGuiDrawer* imgui_drawer,
                        EmulatorWindow& emulator_window)
         : ui::ImGuiDialog(imgui_drawer), emulator_window_(emulator_window) {}
@@ -875,7 +833,6 @@ class EmulatorWindow {
   std::unique_ptr<ProfileConfigDialog> profile_config_dialog_;
 
   std::unique_ptr<XMPConfigDialog> xmp_config_dialog_;
-  std::unique_ptr<SupportDialog> support_dialog_;
 
   std::vector<RecentTitleEntry> recently_launched_titles_;
 };

@@ -197,6 +197,7 @@ bool XAudio2AudioDriver::InitializeObjects(Objects& objects) {
 
   if (cvars::mute) {
     objects.pcm_voice->SetVolume(0.0f);
+    voice_muted_ = true;
   }
 
   return true;
@@ -204,6 +205,7 @@ bool XAudio2AudioDriver::InitializeObjects(Objects& objects) {
 
 void XAudio2AudioDriver::SubmitFrame(float* frame) {
   HRESULT hr;
+  ApplyMute();
 
   api::XAUDIO2_VOICE_STATE state;
   if (api_minor_version_ >= 8) {
@@ -273,10 +275,26 @@ void XAudio2AudioDriver::Resume() {
 }
 
 void XAudio2AudioDriver::SetVolume(float volume) {
+  volume_ = volume;
   if (cvars::mute) {
     return;
   }
 
+  if (api_minor_version_ >= 8) {
+    objects_.api_2_8.pcm_voice->SetVolume(volume);
+  } else {
+    objects_.api_2_7.pcm_voice->SetVolume(volume);
+  }
+}
+
+void XAudio2AudioDriver::ApplyMute() {
+  // The mute setting was read only when the voice was created, so the mute
+  // hotkey said "Muted" and the sound played on.
+  if (cvars::mute == voice_muted_) {
+    return;
+  }
+  voice_muted_ = cvars::mute;
+  const float volume = voice_muted_ ? 0.0f : volume_;
   if (api_minor_version_ >= 8) {
     objects_.api_2_8.pcm_voice->SetVolume(volume);
   } else {

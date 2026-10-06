@@ -63,7 +63,29 @@ jobs:
           $SUBMODULES=(Select-String -CaseSensitive '(?<=path = )(?!third_party\/xbyak_aarch64).+' .gitmodules).Matches.Value
           git submodule update --init --depth=1 -j $env:NUMBER_OF_PROCESSORS $SUBMODULES
 
+      - name: Cache GTK3
+        id: cache-gtk3
+        uses: actions/cache@v6
+        with:
+          path: C:\gtk3
+          key: gtk3-gvsbuild-2026.8.0
+
+      # The Settings window and game library are GTK, as on Linux.
+      - name: Download GTK3 (gvsbuild)
+        if: steps.cache-gtk3.outputs.cache-hit != 'true'
+        run: |-
+          Invoke-WebRequest -Uri "https://github.com/wingtk/gvsbuild/releases/download/2026.8.0/GTK3_Gvsbuild_2026.8.0_x64.zip" -OutFile gtk3.zip
+          $hash = (Get-FileHash gtk3.zip -Algorithm SHA256).Hash
+          if ($hash -ne "9BE43D9029749062D2637070C856E73F8A1327A72259D08326B38155C139ECDC") {
+            echo "::error:: GTK3 zip hash $hash does not match."
+            exit 1
+          }
+          7z x gtk3.zip -oC:\gtk3 "bin\*.dll" "lib\*" "include\*" "share\icons\*" "share\glib-2.0\*" "share\doc\*" "-xr!gtk-4.0" -y -bso0
+          Remove-Item gtk3.zip
+
       - name: Build Xenia
+        env:
+          XE_GTK3_ROOT: C:\gtk3
         run: python xenia-build.py build --config=Release --target=xenia-app
 
       - name: Prepare artifacts
@@ -73,13 +95,37 @@ jobs:
             echo "::error:: Executable is too small."
             exit 1
           }
-          $path="xenia_canary_windows.7z"
-          7z a $path .\build\bin\Windows\Release\xenia_canary.exe LICENSE -mx9 -bb3
+          # The Visual C++ runtime the build links against, next to the exe
+          # (Microsoft allows redistributing it this way): a PC without the
+          # VC++ 2015-2022 redistributable otherwise cannot start it.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $crt = & $vswhere -latest -find "VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT" | Sort-Object | Select-Object -Last 1
+          if (-not $crt) {
+            echo "::error:: Visual C++ runtime redistributable not found."
+            exit 1
+          }
+          echo "VC++ runtime from $crt"
+          foreach ($dll in @("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_atomic_wait.dll")) {
+            Copy-Item (Join-Path $crt $dll) .\build\bin\Windows\Release\
+          }
+          # A zip: Windows opens it without extra software.
+          $path="xenia_canary_windows.zip"
+          7z a -tzip $path .\build\bin\Windows\Release\xenia_canary.exe .\build\bin\Windows\Release\*.dll .\build\bin\Windows\Release\share LICENSE -mx9 -bb1
           if ((Get-Item "$path").Length -le 100000) {
             echo "::error:: Archive is too small."
             exit 1
           }
           echo "path=$path" >> $env:GITHUB_OUTPUT
+
+      # Symbols, so a crash offset from a user's machine can be turned into
+      # a function and line.
+      - name: Upload symbols
+        uses: actions/upload-artifact@v7
+        with:
+          name: xenia_canary_windows_pdb
+          path: build/bin/Windows/Release/xenia_canary.pdb
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Upload Xenia Canary artifact
         if: ${{ steps.prepare_artifacts.outcome == 'success' }}

@@ -57,6 +57,11 @@ namespace gpu {
 // because textures are streamed this way anyway.
 class TextureCache {
  public:
+  // A texture's memory was written since the bindings were last checked.
+  bool texture_became_outdated() const {
+    return texture_became_outdated_.load(std::memory_order_relaxed);
+  }
+
   // Hard limit, originating from the half-pixel offset filling hack in the
   // resolve shaders only filling up to 3 pixels, due to the bit counts used for
   // passing the scale to shaders, and because the full 490 MB EDRAM buffer is
@@ -105,6 +110,9 @@ class TextureCache {
   // scaled state of the range.
   void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled,
                            bool resolution_scaled);
+  // Runs of 4 KB pages whose data is in the scaled resolve address space, as
+  // (start, length) in unscaled bytes, ascending. For save states.
+  std::vector<std::pair<uint32_t, uint32_t>> GetScaledResolvedRanges();
   // Ensures the memory backing the range in the scaled resolve address space is
   // allocated and returns whether it is.
   virtual bool EnsureScaledResolveMemoryCommitted(

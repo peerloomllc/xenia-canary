@@ -10,9 +10,10 @@
 This is [PeerLoom LLC](https://peerloomllc.com)'s fork of the
 [Xenia Canary](https://github.com/xenia-canary/xenia-canary) Xbox 360
 emulator. It adds save states and a set of quality-of-life features and
-fixes, currently developed and tested on the **native Linux build**
-(Vulkan, SDL audio, GTK UI); bringing the same features to the Windows
-build is planned. It is not affiliated with the Xenia project.
+fixes. It is developed and tested mainly on the **native Linux build**
+(Vulkan, SDL audio, GTK UI); since `linux-native-2026.10.05` every release
+also carries a **Windows build** with the same menus. It is not affiliated
+with the Xenia project.
 
 Problems with this fork (save states, the added features, Linux issues)
 belong in [this repository's issues](https://github.com/peerloomllc/xenia-canary/issues).
@@ -50,6 +51,12 @@ General questions about Xenia are covered by the upstream
     <img src="assets/peerloom/quality.png" width="900" alt="Defaults vs 2x resolution scale with FXAA and CAS sharpening" />
 </p>
 
+* **ReShade and DLSS**: ReShade effects run natively inside the emulator
+  (Home opens the overlay, per-game presets, an optional depth buffer),
+  and NVIDIA DLSS/DLAA is a scaling choice on the Vulkan renderer.
+* **Guitars and the Steam Deck**: per-port controller subtypes for
+  Guitar Hero and Rock Band guitars, and a one-file installer for the
+  Deck (see below).
 * **Linux fixes**: guest threads that never started (games hanging at
   loading screens), kernel timers with past due times never firing
   (silent games), a syscall on every mutex lock, ImGui crashes with CJK
@@ -70,8 +77,17 @@ carries an **AppImage** built on Ubuntu 24.04: download, `chmod +x`, run.
 It needs glibc 2.38 or newer and a Vulkan driver, nothing else (the
 runtime is static; no FUSE package required), and it updates in place
 with [AppImageUpdate](https://appimage.github.io/AppImageUpdate/). Some
-releases also carry a **tarball** built on Fedora 44 against its system
-libraries.
+older releases also carry a **tarball** built on Fedora 44 against its
+system libraries.
+
+### Windows
+
+Releases from `linux-native-2026.10.05` on carry
+`xenia_canary_<tag>-windows-x64.zip`: unzip it anywhere and run
+`xenia_canary.exe`. The Visual C++ runtime and the GTK libraries are
+inside, so nothing else needs installing. Linux remains the platform this
+fork is tested on most; Windows problems belong in
+[our issues](https://github.com/peerloomllc/xenia-canary/issues) too.
 
 ### Steam Deck
 
@@ -108,7 +124,8 @@ build/bin/Linux/Release/xenia_canary --gpu=vulkan --apu=sdl
 
 Other distributions need the same libraries under their own names; see
 [docs/building.md](docs/building.md) for the Ubuntu package list and the
-`xb` script.
+`xb` script. The Windows build is made by GitHub Actions with MSVC
+(`.github/workflows/Windows_x86.yml`).
 
 ## Game compatibility
 
@@ -126,12 +143,10 @@ fork too.
 
 ## Relationship to upstream
 
-Based on xenia-canary `9d08d64b5`. General fixes from this fork are
-offered upstream as pull requests
-([#1187](https://github.com/xenia-canary/xenia-canary/pull/1187),
-[#1193](https://github.com/xenia-canary/xenia-canary/pull/1193),
-[#1194](https://github.com/xenia-canary/xenia-canary/pull/1194));
-the branch is rebased onto upstream periodically.
+Based on xenia-canary `9d08d64b5` (2026-08-26). General fixes from this
+fork are offered upstream as
+[pull requests](https://github.com/xenia-canary/xenia-canary/pulls?q=is%3Apr+author%3Apeerloomllc);
+many have been merged there.
 
 ## Licence
 

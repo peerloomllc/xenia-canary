@@ -184,6 +184,8 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
                   last_frame_time = current_time;
 
                   MarkVblank();
+                  // The sleep below relies on a fine timer resolution.
+                  threading::KeepHighResolutionTimer();
                   const uint64_t estimated_nanoseconds = static_cast<uint64_t>(
                       (vsync_duration_d * 1000000.0) *
                       duration_scalar);  // 1000 microseconds = 1 ms
@@ -234,7 +236,10 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
                   const auto period = std::chrono::nanoseconds(
                       std::max<uint64_t>(1, sleep_duration_ns));
                   auto now = std::chrono::steady_clock::now();
-                  if (next_vblank_deadline == steady_time_point()) {
+                  // A pause is not missed beats: start again from now after
+                  // one.
+                  if (vblank_deadline_reset_.exchange(false) ||
+                      next_vblank_deadline == steady_time_point()) {
                     next_vblank_deadline = now;
                   }
                   next_vblank_deadline += period;
@@ -246,8 +251,10 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
                   } else if (now - next_vblank_deadline > kMaxVblankCatchUp) {
                     // Further behind than catching up could hide. Give the
                     // missed beats up and start again from here rather than
-                    // fast-forwarding the guest through a long freeze.
-                    next_vblank_deadline = now + period;
+                    // fast-forwarding the guest through a long freeze. The
+                    // next pass adds the period, so the next beat is one
+                    // period away.
+                    next_vblank_deadline = now;
                   }
                   // Otherwise fall straight through without sleeping, which
                   // delivers the missed beats back to back until the guest
@@ -478,6 +485,7 @@ void GraphicsSystem::Pause(bool capture_edram) {
 
 void GraphicsSystem::Resume() {
   paused_ = false;
+  vblank_deadline_reset_ = true;
 
   command_processor_->Resume();
 }
@@ -497,7 +505,12 @@ bool GraphicsSystem::Restore(ByteStream* stream) {
   bool has_edram_snapshot =
       kernel_state_ && kernel_state_->emulator() &&
       kernel_state_->emulator()->save_state_version() >= 8;
-  if (!command_processor_->Restore(stream, has_edram_snapshot)) {
+  // Format 10 adds the memory only the GPU holds.
+  bool has_gpu_memory_snapshot =
+      kernel_state_ && kernel_state_->emulator() &&
+      kernel_state_->emulator()->save_state_version() >= 10;
+  if (!command_processor_->Restore(stream, has_edram_snapshot,
+                                   has_gpu_memory_snapshot)) {
     return false;
   }
   // Guest memory and the register file were rewritten behind the host GPU
@@ -513,6 +526,7 @@ bool GraphicsSystem::Restore(ByteStream* stream) {
     cp->TracePlaybackWroteMemory(0, 0x20000000);
     cp->ClearCaches();
     cp->RestoreSavedEdramSnapshot();
+    cp->RestoreSavedGpuMemorySnapshot();
   });
   return true;
 }

@@ -54,6 +54,11 @@ class VulkanPipelineCache {
    public:
     virtual ~PipelineLayoutProvider() {}
     virtual VkPipelineLayout GetPipelineLayout() const = 0;
+    // The guest layout plus the storage image set for the k_2_10_10_10_FLOAT
+    // alpha rounding redraw, or VK_NULL_HANDLE.
+    virtual VkPipelineLayout GetRound7e3AlphaPipelineLayout() const {
+      return VK_NULL_HANDLE;
+    }
 
    protected:
     PipelineLayoutProvider() = default;
@@ -70,6 +75,12 @@ class VulkanPipelineCache {
     // the real pipeline is being compiled in the background.
     std::atomic<bool> is_placeholder{false};
 
+    // Variant drawing the same geometry to round the alpha of a
+    // k_2_10_10_10_FLOAT render target (GetRound7e3AlphaPipeline), and
+    // whether it's 0 not requested, 1 requested, 2 unavailable.
+    std::atomic<VkPipeline> round_7e3_alpha_pipeline{VK_NULL_HANDLE};
+    std::atomic<uint8_t> round_7e3_alpha_state{0};
+
     Pipeline(const PipelineLayoutProvider* pipeline_layout_provider)
         : pipeline_layout(pipeline_layout_provider) {}
 
@@ -77,15 +88,21 @@ class VulkanPipelineCache {
     Pipeline(const Pipeline& other)
         : pipeline(other.pipeline.load(std::memory_order_acquire)),
           pipeline_layout(other.pipeline_layout),
-          is_placeholder(other.is_placeholder.load(std::memory_order_acquire)) {
-    }
+          is_placeholder(other.is_placeholder.load(std::memory_order_acquire)),
+          round_7e3_alpha_pipeline(
+              other.round_7e3_alpha_pipeline.load(std::memory_order_acquire)),
+          round_7e3_alpha_state(
+              other.round_7e3_alpha_state.load(std::memory_order_acquire)) {}
 
     // Move constructor
     Pipeline(Pipeline&& other) noexcept
         : pipeline(other.pipeline.load(std::memory_order_acquire)),
           pipeline_layout(other.pipeline_layout),
-          is_placeholder(other.is_placeholder.load(std::memory_order_acquire)) {
-    }
+          is_placeholder(other.is_placeholder.load(std::memory_order_acquire)),
+          round_7e3_alpha_pipeline(
+              other.round_7e3_alpha_pipeline.load(std::memory_order_acquire)),
+          round_7e3_alpha_state(
+              other.round_7e3_alpha_state.load(std::memory_order_acquire)) {}
 
     // Deleted copy assignment to prevent accidental copying
     Pipeline& operator=(const Pipeline&) = delete;
@@ -139,6 +156,15 @@ class VulkanPipelineCache {
 
   bool EnsureShadersTranslated(VulkanShader::VulkanTranslation* vertex_shader,
                                VulkanShader::VulkanTranslation* pixel_shader);
+  // The variant of pipeline, the last one ConfigurePipeline returned, that
+  // draws the same geometry to round the alpha of the k_2_10_10_10_FLOAT
+  // render target it covers (VulkanRenderTargetCache::Round7e3AlphaByRedraw).
+  // Created in the background on the first request; VK_NULL_HANDLE until it's
+  // ready or if it can't be made (tessellation).
+  VkPipeline GetRound7e3AlphaPipeline(
+      Pipeline* pipeline, VulkanShader::VulkanTranslation* vertex_shader,
+      VulkanShader::VulkanTranslation* pixel_shader);
+
   bool ConfigurePipeline(
       VulkanShader::VulkanTranslation* vertex_shader,
       VulkanShader::VulkanTranslation* pixel_shader,
@@ -154,6 +180,10 @@ class VulkanPipelineCache {
     kPointList,
     kRectangleList,
     kQuadList,
+    // Triangles passed through unchanged. Chosen when the pipeline is created
+    // (GetHostGeometryShader), never stored in PipelineDescription, whose
+    // geometry_shader field has only 2 bits.
+    kTrianglePassthrough,
   };
 
   enum class PipelinePrimitiveTopology : uint32_t {
@@ -299,6 +329,8 @@ class VulkanPipelineCache {
     VkShaderModule tessellation_vertex_shader;   // VS for passing data to TCS.
     VkShaderModule tessellation_control_shader;  // TCS (hull shader).
     VkRenderPass render_pass;
+    // Create Pipeline::round_7e3_alpha_pipeline instead of the pipeline.
+    bool round_7e3_alpha = false;
     // Priority for async compilation (higher = compiled sooner).
     // Pipelines that write to visible render targets get higher priority.
     uint8_t priority = 0;
@@ -315,7 +347,7 @@ class VulkanPipelineCache {
   union GeometryShaderKey {
     uint32_t key;
     struct {
-      PipelineGeometryShader type : 2;
+      PipelineGeometryShader type : 3;
       uint32_t interpolator_count : 5;
       uint32_t has_user_clip_planes : 1;
       uint32_t user_clip_plane_cull : 1;
@@ -363,6 +395,11 @@ class VulkanPipelineCache {
   // Whether the pipeline for the given description is supported by the device.
   bool ArePipelineRequirementsMet(const PipelineDescription& description) const;
 
+  // The geometry shader a pipeline is created with: the description's, or
+  // kTrianglePassthrough for triangle draws of the pixel shaders listed in
+  // --vulkan_geometry_passthrough_pixel_shaders.
+  PipelineGeometryShader GetHostGeometryShader(
+      const PipelineDescription& description) const;
   static bool GetGeometryShaderKey(
       PipelineGeometryShader geometry_shader_type,
       SpirvShaderTranslator::Modification vertex_shader_modification,
@@ -452,6 +489,9 @@ class VulkanPipelineCache {
   // Placeholder pixel shader for pipeline hot-swap to reduce stutter.
   // Outputs transparent black while the real shader compiles in background.
   VkShaderModule placeholder_pixel_shader_ = VK_NULL_HANDLE;
+  // Fragment shaders of the alpha rounding redraw, single-sampled and
+  // multisampled.
+  VkShaderModule round_7e3_alpha_fragment_shaders_[2] = {};
 
   // Tessellation shaders.
   // Vertex shaders for tessellation - pass indices/factors to TCS.
@@ -497,6 +537,10 @@ class VulkanPipelineCache {
                       PipelineCreationPriorityCompare>
       creation_queue_;
   std::mutex creation_request_lock_;
+  // vulkan_serialize_pipeline_creation: vkCreateGraphicsPipelines is called by
+  // one thread at a time.
+  bool serialize_pipeline_creation_ = false;
+  std::mutex pipeline_creation_mutex_;
   std::condition_variable creation_request_cond_;
   std::unique_ptr<xe::threading::Event> creation_completion_event_ = nullptr;
   std::atomic<bool> creation_completion_set_event_{false};

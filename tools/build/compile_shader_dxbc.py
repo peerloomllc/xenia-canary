@@ -74,8 +74,16 @@ def main():
     # Start with base command — use wine on non-Windows platforms.
     if sys.platform != "win32":
         compiler_args = ["wine", fxc]
+        # FXC reads an argument starting with '/' as a switch, so absolute
+        # POSIX paths go through Wine's Z: drive.
+        def to_wine(path):
+            return "Z:" + os.path.abspath(path).replace("/", "\\")
+        input_path = to_wine(input_path)
+        output_path_arg = to_wine(output_path)
+        src_dir = to_wine(src_dir)
     else:
         compiler_args = [fxc]
+        output_path_arg = output_path
 
     if is_dxc:
         # DXC only supports SM 6.0+.
@@ -84,7 +92,7 @@ def main():
             "-HV", "2017",
             "-D", "SHADING_LANGUAGE_HLSL_XE=1",
             "-I", src_dir,
-            "-Fh", output_path,
+            "-Fh", output_path_arg,
             "-Vn", identifier,
             "-nologo",
             input_path,
@@ -94,7 +102,7 @@ def main():
         compiler_args.extend([
             "/D", "SHADING_LANGUAGE_HLSL_XE=1",
             "/I", src_dir,
-            "/Fh", output_path,
+            "/Fh", output_path_arg,
             "/T", f"{stage}_5_1",
             "/Vn", identifier,
             "/O3",

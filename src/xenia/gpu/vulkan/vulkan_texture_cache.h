@@ -107,6 +107,8 @@ class VulkanTextureCache final : public TextureCache {
 
   SamplerParameters GetSamplerParameters(
       const VulkanShader::SamplerBinding& binding) const;
+  SamplerParameters ComputeSamplerParameters(
+      const VulkanShader::SamplerBinding& binding) const;
 
   // Must be called for every used sampler at least once in a single submission,
   // and a submission must be open for this to be callable.
@@ -128,9 +130,12 @@ class VulkanTextureCache final : public TextureCache {
   // Returns the 2D view of the front buffer texture (for fragment shader
   // reading - the barrier will be pushed in the command processor if needed),
   // or VK_NULL_HANDLE in case of failure. May call LoadTextureData.
+  // image_out, when given, receives the image behind the view, for reading a
+  // thumbnail of what the guest itself is showing (fmv_replacement.h).
   VkImageView RequestSwapTexture(uint32_t& width_scaled_out,
                                  uint32_t& height_scaled_out,
-                                 xenos::TextureFormat& format_out);
+                                 xenos::TextureFormat& format_out,
+                                 VkImage* image_out = nullptr);
 
   // Scaled resolve buffer management (for use by VulkanRenderTargetCache)
   // Simple non-overlapping buffer (fallback when sparse binding unavailable)
@@ -475,6 +480,18 @@ class VulkanTextureCache final : public TextureCache {
   uint32_t sampler_max_count_;
 
   xenos::AnisoFilter max_anisotropy_;
+
+  // The last GetSamplerParameters result for each fetch constant, with what
+  // it was computed from: most draws sample through the same fetch constants
+  // as the previous one.
+  struct SamplerParametersCacheEntry {
+    uint32_t fetch[6];
+    uint32_t binding;
+    int32_t anisotropic_override;
+    bool valid;
+    SamplerParameters parameters;
+  };
+  mutable SamplerParametersCacheEntry sampler_parameters_cache_[32] = {};
 
   std::unordered_map<SamplerParameters, Sampler, SamplerParameters::Hasher>
       samplers_;

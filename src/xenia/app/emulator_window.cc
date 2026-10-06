@@ -8,13 +8,17 @@
  */
 
 #include "xenia/app/emulator_window.h"
-#include "third_party/qrcodegen/qrcodegen.hpp"
 
 #include "xenia/apu/apu_flags.h"
 #include "xenia/config.h"
 
 #include <regex>
 #include <thread>
+#if XE_PLATFORM_WIN32
+#include "xenia/base/platform_win.h"
+
+#include <shellapi.h>
+#endif
 #if XE_PLATFORM_LINUX
 #include <unistd.h>
 #include <cerrno>
@@ -48,6 +52,7 @@
 
 #include "xenia/app/console_settings_dialog.h"
 #include "xenia/app/content_list_dialog.h"
+#include "xenia/app/patch_files.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
@@ -60,6 +65,7 @@
 #include "xenia/cpu/processor.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/command_processor.h"
+#include "xenia/gpu/fmv_replacement.h"
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/hid/input_system.h"
 #include "xenia/kernel/user_module.h"
@@ -93,6 +99,8 @@ DECLARE_string(readback_resolve);
 DECLARE_bool(readback_memexport);
 
 DECLARE_path(content_root);
+
+DECLARE_path(fmv_replacement_dir);
 DEFINE_bool(show_fps, false,
             "Show the frame rate (guest swaps per second) in the top-left "
             "overlay. Emulation > Show FPS toggles it.",
@@ -104,6 +112,7 @@ DECLARE_uint64(framerate_limit);
 DECLARE_int32(draw_resolution_scale_x);
 DECLARE_int32(draw_resolution_scale_y);
 DECLARE_string(render_target_path_vulkan);
+DECLARE_path(target);
 DECLARE_bool(vulkan_sparse_shared_memory);
 DECLARE_bool(dirty_region_tracking);
 DECLARE_bool(promote_vector_context_values);
@@ -134,18 +143,7 @@ DEFINE_string(ui_experiment_dialog, "",
               "without a keyboard.",
               "General");
 DEFINE_string(support_page_url, "https://peerloomllc.com/about/",
-              "Help > Support Development: the page the button opens.", "UI");
-DEFINE_string(support_coffee_url, "https://buymeacoffee.com/peerloomllc",
-              "Help > Support Development: card tips page for the second "
-              "button (empty hides it).",
-              "UI");
-DEFINE_string(support_btc_address, "bc1q0kksenz3j4u9ppe6f4krclvzwxk7sjy00cc9cf",
-              "Help > Support Development: Bitcoin on-chain donation address "
-              "(empty hides its QR code).",
-              "UI");
-DEFINE_string(support_lightning_address, "peerloomllc@strike.me",
-              "Help > Support Development: Lightning donation address (empty "
-              "hides its QR code).",
+              "Help > Support development: the page it opens in the browser.",
               "UI");
 DEFINE_int32(
     screenshot_burst_seconds, 0,
@@ -404,7 +402,8 @@ constexpr std::string_view kBaseTitle = "Xenia-canary";
 EmulatorWindow::EmulatorWindow(Emulator* emulator,
                                ui::WindowedAppContext& app_context,
                                uint32_t width, uint32_t height)
-    : emulator_(emulator),
+    : patch_categories_(emulator->storage_root() / "patch_categories.txt"),
+      emulator_(emulator),
       app_context_(app_context),
       window_listener_(*this),
       window_(ui::Window::Create(app_context, kBaseTitle, width, height)),
@@ -412,6 +411,12 @@ EmulatorWindow::EmulatorWindow(Emulator* emulator,
           std::make_unique<ui::ImGuiDrawer>(window_.get(), kZOrderImGui)),
       display_config_game_config_load_callback_(
           new DisplayConfigGameConfigLoadCallback(*emulator, *this)) {
+#if XE_UI_GTK
+  imgui_drawer_->SetDialogsChangedCallback([this]() {
+    app_context_.CallInUIThreadDeferred(
+        [this]() { UpdateDashboardForPanels(); });
+  });
+#endif
   base_title_ = std::string(kBaseTitle) +
 #ifdef DEBUG
 #if _NO_DEBUG_HEAP == 1
@@ -445,10 +450,14 @@ std::unique_ptr<EmulatorWindow> EmulatorWindow::Create(
 EmulatorWindow::~EmulatorWindow() {
 #if XE_PLATFORM_LINUX
   SaveResumeState();
+#endif
   AddPlayTime();
-  if (!library_titles_.empty()) {
+  if (!library_.titles.empty()) {
     SaveLibrary();
   }
+#if XE_UI_GTK && XE_PLATFORM_WIN32
+  // Before window_, which owns its window.
+  dashboard_overlay_.reset();
 #endif
   // Notify the ImGui drawer that the immediate drawer is being destroyed.
   ShutdownGraphicsSystemPresenterPainting();
@@ -512,11 +521,15 @@ void EmulatorWindow::OnEmulatorInitialized() {
     // Under gamescope the library is invisible in fullscreen, and this runs
     // after it has been shown. Owe the fullscreen instead and take it when a
     // title has the screen, rather than entering and leaving it in a flash.
+#if XE_PLATFORM_LINUX
     if (DashboardShown() && RunningUnderGamescope()) {
       dashboard_suspended_fullscreen_ = true;
     } else {
       SetFullscreen(true);
     }
+#else
+    SetFullscreen(true);
+#endif
   }
 
   if (IsUseNexusForGameBarEnabled()) {
@@ -534,15 +547,15 @@ void EmulatorWindow::OnEmulatorInitialized() {
 }
 
 void EmulatorWindow::EmulatorWindowListener::OnClosing(ui::UIEvent& e) {
-#if XE_PLATFORM_LINUX
   // The process exits without destructors ("Cheap-skate exit"): write the
   // resume state and book the session's play time now.
+#if XE_PLATFORM_LINUX
   emulator_window_.SaveResumeState();
+#endif
   emulator_window_.AddPlayTime();
-  if (!emulator_window_.library_titles_.empty()) {
+  if (!emulator_window_.library_.titles.empty()) {
     emulator_window_.SaveLibrary();
   }
-#endif
   emulator_window_.app_context_.QuitFromUIThread();
 }
 
@@ -1119,7 +1132,7 @@ bool EmulatorWindow::Initialize() {
         MenuItem::Create(MenuItem::Type::kString, "&Open...", "Ctrl+O",
                          std::bind(&EmulatorWindow::FileOpen, this)));
     file_menu->AddChild(std::move(recent_menu));
-#if XE_PLATFORM_LINUX
+#if XE_UI_GTK
     file_menu->AddChild(
         MenuItem::Create(MenuItem::Type::kString, "Game &Library", "",
                          std::bind(&EmulatorWindow::ToggleDashboard, this)));
@@ -1216,7 +1229,7 @@ bool EmulatorWindow::Initialize() {
   // adjusted while watching the picture.
   auto settings_menu = MenuItem::Create(MenuItem::Type::kPopup, "&Settings");
   {
-#if XE_PLATFORM_LINUX
+#if XE_UI_GTK
     settings_menu->AddChild(MenuItem::Create(
         MenuItem::Type::kString, "&Preferences...", "",
         std::bind(&EmulatorWindow::ToggleSettingsWindow, this)));
@@ -1257,7 +1270,7 @@ bool EmulatorWindow::Initialize() {
           std::bind(&EmulatorWindow::SetUIScale, this, scale)));
     }
     panels->AddChild(std::move(size_menu));
-#if XE_PLATFORM_LINUX
+#if XE_UI_GTK
     settings_menu->AddChild(std::move(panels));
 #endif
   }
@@ -1340,15 +1353,17 @@ bool EmulatorWindow::Initialize() {
         MenuItem::Type::kString, "&About...",
         []() { LaunchWebBrowser("https://xenia.jp/about/"); }));
     help_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
-    help_menu->AddChild(MenuItem::Create(
-        MenuItem::Type::kString, "&Support development...",
-        std::bind(&EmulatorWindow::ToggleSupportDialog, this)));
+    help_menu->AddChild(
+        MenuItem::Create(MenuItem::Type::kString, "&Support development...",
+                         []() { LaunchWebBrowser(cvars::support_page_url); }));
   }
   main_menu->AddChild(std::move(help_menu));
 
   // Kept so the gamepad can open the menu bar: the window's own accessor for
   // it is protected, and this is the last point where we own the pointer.
+#if XE_PLATFORM_LINUX
   main_menu_for_pad_ = main_menu.get();
+#endif
   window_->SetMainMenu(std::move(main_menu));
 
   if (cvars::screenshot_burst_seconds > 0) {
@@ -1431,10 +1446,13 @@ bool EmulatorWindow::Initialize() {
   // SDL ignore lists refuse, and a title runs with no controller at all while
   // nothing on screen explains why (notes/84). Check once, a few seconds in,
   // and name the thing doing the filtering if one is set.
-#if XE_PLATFORM_LINUX
+#if XE_UI_GTK
   // The menus and the library it drives are GTK, as is the dashboard built
-  // above, so this goes with them rather than into the shared path.
+  // above, so this goes with them rather than into the shared path. On
+  // Windows the menus are Win32 and the pad drives the GTK windows only.
   StartGamepadUi();
+#endif
+#if XE_PLATFORM_LINUX
   CheckForUpdates();
 #endif
 
@@ -1525,7 +1543,7 @@ bool EmulatorWindow::Initialize() {
         } else if (which == "gpu") {
           ToggleGpuOptionsDialog();
         } else if (which == "settings") {
-#if XE_PLATFORM_LINUX
+#if XE_UI_GTK
           ToggleSettingsWindow();
 #endif
         } else if (which == "large") {
@@ -1534,16 +1552,16 @@ bool EmulatorWindow::Initialize() {
         } else if (which == "reset") {
           ResetGame();
         } else if (which == "dashboard") {
-#if XE_PLATFORM_LINUX
+#if XE_UI_GTK
           ToggleDashboard();
 #endif
         } else if (which.rfind("open:", 0) == 0) {
           RunTitle(which.substr(5));
+#if XE_UI_GTK
         } else if (which.rfind("launch_index:", 0) == 0) {
           // A library launch by index, as a double-click on the row would.
           LaunchLibraryIndex(std::atoi(which.c_str() + 13));
-        } else if (which == "support") {
-          ToggleSupportDialog();
+#endif
         } else if (which == "keyboard_capture") {
           ToggleKeyboardHotkeysDialog();
           capturing_action_ = int(HotkeyAction::kPauseResume);
@@ -1561,9 +1579,9 @@ bool EmulatorWindow::Initialize() {
     XELOGE("Failed to open the platform window");
     return false;
   }
-#if XE_PLATFORM_LINUX
   LoadLibrary();
   ScanLibrary();
+#if XE_UI_GTK
   BuildDashboard();
   ShowDashboard(!emulator_->is_title_open());
 #endif
@@ -2674,6 +2692,41 @@ void EmulatorWindow::ToggleGameLibraryDialog() {
       game_library_dialog_.reset();
     }
   }
+}
+
+void EmulatorWindow::PickFmvReplacementDir() {
+  auto picker = xe::ui::FilePicker::Create();
+  picker->set_mode(ui::FilePicker::Mode::kOpen);
+  picker->set_type(ui::FilePicker::Type::kDirectory);
+  picker->set_multi_selection(false);
+  picker->set_title("Select the upscaled cutscenes folder");
+  if (!cvars::fmv_replacement_dir.empty()) {
+    picker->set_default_path(cvars::fmv_replacement_dir);
+  }
+  if (!picker->Show(window_.get())) {
+    return;
+  }
+  auto selected = picker->selected_files();
+  if (!selected.empty() && !selected[0].empty()) {
+    SetFmvReplacementDir(selected[0]);
+  }
+}
+
+void EmulatorWindow::SetFmvReplacementDir(const std::filesystem::path& dir) {
+  // fmv_replacement_dir is defined in the GPU module; reach it through the
+  // registry, the same way the content folder does.
+  auto it = cvar::ConfigVars
+                ? cvar::ConfigVars->find("fmv_replacement_dir")
+                : std::map<std::string, cvar::IConfigVar*>::iterator();
+  if (!cvar::ConfigVars || it == cvar::ConfigVars->end()) {
+    XELOGE("Upscaled cutscenes: no fmv_replacement_dir config variable");
+    return;
+  }
+  dynamic_cast<cvar::ConfigVar<std::filesystem::path>*>(it->second)
+      ->OverrideConfigValue(dir);
+  config::SaveConfig();
+  XELOGI("Upscaled cutscenes folder: {}", dir.empty() ? "(off)" : dir.string());
+  gpu::FmvReplacement::Get().RescanFolder();
 }
 
 void EmulatorWindow::PickGamesDir() {
@@ -4835,10 +4888,73 @@ void EmulatorWindow::CloseGame() {
   RelaunchProcess("");
 }
 
+namespace {
+// The command line of a relaunch: this process's arguments with the title
+// path replaced (or removed), a numbered log file so the old log is kept,
+// and none of this session's experiment timers. args[0] is the executable.
+std::vector<std::string> RelaunchArguments(const std::vector<std::string>& args,
+                                           const std::filesystem::path& path) {
+  std::vector<std::string> new_args;
+  new_args.push_back(args[0]);
+  for (size_t i = 1; i < args.size(); ++i) {
+    const std::string& a = args[i];
+    if (a.rfind("--", 0) != 0) {
+      continue;  // the old title path (or any positional argument)
+    }
+    if (a.rfind("--log_file=", 0) == 0) {
+      std::filesystem::path log = xe::to_path(a.substr(11));
+      std::string stem = xe::path_to_utf8(log.stem());
+      int n = 2;
+      size_t p = stem.rfind("-relaunch");
+      if (p != std::string::npos) {
+        n = std::atoi(stem.c_str() + p + 9) + 1;
+        stem.resize(p);
+      }
+      log = log.parent_path() /
+            xe::to_path(stem + "-relaunch" + std::to_string(n) +
+                        xe::path_to_utf8(log.extension()));
+      new_args.push_back("--log_file=" + xe::path_to_utf8(log));
+      continue;
+    }
+    if (a.rfind("--ui_experiment", 0) == 0 ||
+        a.rfind("--savestate_experiment", 0) == 0) {
+      continue;  // timers of this session, not the next one
+    }
+    new_args.push_back(a);
+  }
+  if (!path.empty()) {
+    new_args.push_back(xe::path_to_utf8(std::filesystem::absolute(path)));
+  }
+  return new_args;
+}
+
+#if XE_PLATFORM_WIN32
+// One argument quoted for CommandLineToArgvW: backslashes are literal except
+// in front of a quote, where they are doubled.
+std::wstring QuoteWin32Argument(const std::wstring& arg) {
+  if (!arg.empty() && arg.find_first_of(L" \t\n\v\"") == std::wstring::npos) {
+    return arg;
+  }
+  std::wstring out = L"\"";
+  size_t backslashes = 0;
+  for (wchar_t c : arg) {
+    if (c == L'\\') {
+      ++backslashes;
+      continue;
+    }
+    out.append(c == L'"' ? backslashes * 2 + 1 : backslashes, L'\\');
+    backslashes = 0;
+    out += c;
+  }
+  out.append(backslashes * 2, L'\\');
+  out += L'"';
+  return out;
+}
+#endif
+}  // namespace
+
 bool EmulatorWindow::RelaunchProcess(const std::filesystem::path& path) {
 #if XE_PLATFORM_LINUX
-  // The same command line as this process, with the title path replaced
-  // (or removed) and a numbered log file so the old log is kept.
   std::vector<std::string> args;
   {
     std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
@@ -4858,36 +4974,7 @@ bool EmulatorWindow::RelaunchProcess(const std::filesystem::path& path) {
     XELOGE("Relaunch: cannot read /proc/self/cmdline");
     return false;
   }
-  std::vector<std::string> new_args;
-  new_args.push_back(args[0]);
-  for (size_t i = 1; i < args.size(); ++i) {
-    const std::string& a = args[i];
-    if (a.rfind("--", 0) != 0) {
-      continue;  // the old title path (or any positional argument)
-    }
-    if (a.rfind("--log_file=", 0) == 0) {
-      std::filesystem::path log = a.substr(11);
-      std::string stem = log.stem().string();
-      int n = 2;
-      size_t p = stem.rfind("-relaunch");
-      if (p != std::string::npos) {
-        n = std::atoi(stem.c_str() + p + 9) + 1;
-        stem.resize(p);
-      }
-      log = log.parent_path() /
-            (stem + "-relaunch" + std::to_string(n) + log.extension().string());
-      new_args.push_back("--log_file=" + log.string());
-      continue;
-    }
-    if (a.rfind("--ui_experiment", 0) == 0 ||
-        a.rfind("--savestate_experiment", 0) == 0) {
-      continue;  // timers of this session, not the next one
-    }
-    new_args.push_back(a);
-  }
-  if (!path.empty()) {
-    new_args.push_back(std::filesystem::absolute(path).string());
-  }
+  std::vector<std::string> new_args = RelaunchArguments(args, path);
   std::vector<char*> argv;
   for (auto& a : new_args) {
     argv.push_back(a.data());
@@ -4912,15 +4999,57 @@ bool EmulatorWindow::RelaunchProcess(const std::filesystem::path& path) {
     _exit(127);
   }
   XELOGI("Relaunch: new process {}, closing this one", child);
+#elif XE_PLATFORM_WIN32
+  std::vector<std::string> args;
+  {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) {
+      XELOGE("Relaunch: cannot read the command line");
+      return false;
+    }
+    for (int i = 0; i < argc; ++i) {
+      args.push_back(xe::to_utf8(reinterpret_cast<const char16_t*>(argv[i])));
+    }
+    LocalFree(argv);
+  }
+  wchar_t exe[MAX_PATH];
+  DWORD exe_length = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+  if (args.empty() || !exe_length || exe_length == MAX_PATH) {
+    XELOGE("Relaunch: cannot find this executable");
+    return false;
+  }
+  std::vector<std::string> new_args = RelaunchArguments(args, path);
+  std::wstring command_line = QuoteWin32Argument(exe);
+  for (size_t i = 1; i < new_args.size(); ++i) {
+    std::u16string arg = xe::to_utf16(new_args[i]);
+    command_line +=
+        L" " + QuoteWin32Argument(std::wstring(arg.begin(), arg.end()));
+  }
+  XELOGI("Relaunch: {}",
+         xe::to_utf8(std::u16string(command_line.begin(), command_line.end())));
+  xe::FlushLog();
+  STARTUPINFOW startup_info = {};
+  startup_info.cb = sizeof(startup_info);
+  PROCESS_INFORMATION process_info = {};
+  if (!CreateProcessW(exe, command_line.data(), nullptr, nullptr, FALSE, 0,
+                      nullptr, nullptr, &startup_info, &process_info)) {
+    XELOGE("Relaunch: CreateProcess failed ({})", GetLastError());
+    return false;
+  }
+  CloseHandle(process_info.hThread);
+  CloseHandle(process_info.hProcess);
+  XELOGI("Relaunch: new process {}, closing this one",
+         process_info.dwProcessId);
+#else
+  XELOGE("Relaunch: not implemented on this platform");
+  return false;
+#endif
   SaveResumeState();
   AddPlayTime();
   SaveLibrary();
   window_->RequestClose();
   return true;
-#else
-  XELOGE("Relaunch: not implemented on this platform");
-  return false;
-#endif
 }
 
 void EmulatorWindow::InstallContent() {
@@ -5369,7 +5498,9 @@ void EmulatorWindow::GpuClearCaches() {
 void EmulatorWindow::SetFullscreen(bool fullscreen_) {
   // The user asking for a fullscreen state of their own settles it, so stop
   // owing the one UpdateDashboardFullscreen turned off.
+#if XE_PLATFORM_LINUX
   dashboard_suspended_fullscreen_ = false;
+#endif
   if (window_->IsFullscreen() == fullscreen_) {
     return;
   }
@@ -5423,128 +5554,6 @@ void EmulatorWindow::ToggleProfilesConfigDialog() {
       profile_config_dialog_.reset();
     }
     emulator_->kernel_state()->xam_state()->is_xam_dialog_present_.store(false);
-  }
-}
-
-namespace {
-// One QR code as filled rectangles, with a quiet zone, on a white card,
-// centred in the window.
-void DrawQrCodeCentered(const std::string& text, float module_px) {
-  using qrcodegen::QrCode;
-  QrCode qr = QrCode::encodeText(text.c_str(), QrCode::Ecc::MEDIUM);
-  const int n = qr.getSize();
-  const float quiet = module_px * 4.0f;
-  const float size = n * module_px + 2.0f * quiet;
-  ImGui::SetCursorPosX(
-      std::max(0.0f, (ImGui::GetWindowSize().x - size) * 0.5f));
-  ImDrawList* draw_list = ImGui::GetWindowDrawList();
-  const ImVec2 p = ImGui::GetCursorScreenPos();
-  draw_list->AddRectFilled(p, ImVec2(p.x + size, p.y + size),
-                           IM_COL32(255, 255, 255, 255));
-  for (int y = 0; y < n; ++y) {
-    for (int x = 0; x < n; ++x) {
-      if (qr.getModule(x, y)) {
-        const float x0 = p.x + quiet + x * module_px;
-        const float y0 = p.y + quiet + y * module_px;
-        draw_list->AddRectFilled(ImVec2(x0, y0),
-                                 ImVec2(x0 + module_px, y0 + module_px),
-                                 IM_COL32(0, 0, 0, 255));
-      }
-    }
-  }
-  ImGui::Dummy(ImVec2(size, size));
-}
-
-void CenteredText(const char* text) {
-  ImGui::SetCursorPosX(std::max(
-      0.0f, (ImGui::GetWindowSize().x - ImGui::CalcTextSize(text).x) * 0.5f));
-  ImGui::TextUnformatted(text);
-}
-
-// The string under its QR code, selectable for copying; wide enough for
-// the whole text, centred.
-void CenteredField(const char* id, const std::string& text) {
-  std::string buffer = text;
-  const float width = ImGui::CalcTextSize(buffer.c_str()).x +
-                      ImGui::GetStyle().FramePadding.x * 2.0f + 10.0f;
-  ImGui::SetCursorPosX(
-      std::max(0.0f, (ImGui::GetWindowSize().x - width) * 0.5f));
-  ImGui::SetNextItemWidth(width);
-  ImGui::InputText(
-      id, buffer.data(), buffer.size() + 1,
-      ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_AutoSelectAll);
-}
-
-// Label + QR code + copyable string, as one centred block.
-void QrSection(const char* label, const char* id, const std::string& qr_text,
-               const std::string& shown_text, float module_px) {
-  CenteredText(label);
-  DrawQrCodeCentered(qr_text, module_px);
-  CenteredField(id, shown_text);
-}
-}  // namespace
-
-void EmulatorWindow::SupportDialog::OnDraw(ImGuiIO& io) {
-  ImGui::SetNextWindowPos(ImVec2(60, 60), ImGuiCond_FirstUseEver);
-  bool dialog_open = true;
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowTitleAlign, ImVec2(0.5f, 0.5f));
-  if (!ImGui::Begin(
-          "Support Development", &dialog_open,
-          ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
-    ImGui::End();
-    ImGui::PopStyleVar();
-    return;
-  }
-  CenteredText("This build is free software by PeerLoom LLC.");
-  CenteredText(
-      "If you receive value from it, please consider returning value.");
-  ImGui::Spacing();
-  if (!cvars::support_page_url.empty()) {
-    const char* button_label = "Open the support page in the browser...";
-    const float button_width = ImGui::CalcTextSize(button_label).x +
-                               ImGui::GetStyle().FramePadding.x * 2.0f;
-    ImGui::SetCursorPosX(
-        std::max(0.0f, (ImGui::GetWindowSize().x - button_width) * 0.5f));
-    if (ImGui::Button(button_label)) {
-      LaunchWebBrowser(cvars::support_page_url);
-    }
-  }
-  const float module_px = std::max(3.0f, 3.0f * io.FontGlobalScale);
-  ImGui::Spacing();
-  ImGui::Separator();
-  ImGui::Spacing();
-  if (!cvars::support_btc_address.empty()) {
-    QrSection("Bitcoin (on-chain)", "##support_btc",
-              "bitcoin:" + cvars::support_btc_address,
-              cvars::support_btc_address, module_px);
-    ImGui::Spacing();
-    ImGui::Spacing();
-  }
-  if (!cvars::support_lightning_address.empty()) {
-    QrSection("Bitcoin (lightning)", "##support_ln",
-              cvars::support_lightning_address,
-              cvars::support_lightning_address, module_px);
-    ImGui::Spacing();
-    ImGui::Spacing();
-  }
-  if (!cvars::support_coffee_url.empty()) {
-    QrSection("Buy Me a Coffee (card)", "##support_coffee",
-              cvars::support_coffee_url, cvars::support_coffee_url, module_px);
-  }
-  ImGui::End();
-  ImGui::PopStyleVar();
-  if (!dialog_open) {
-    emulator_window_.ToggleSupportDialog();
-    return;
-  }
-}
-
-void EmulatorWindow::ToggleSupportDialog() {
-  if (!support_dialog_) {
-    support_dialog_ = std::unique_ptr<SupportDialog>(
-        new SupportDialog(imgui_drawer_.get(), *this));
-  } else {
-    support_dialog_.reset();
   }
 }
 
@@ -6173,6 +6182,29 @@ xe::X_STATUS EmulatorWindow::RunTitle(
     return X_STATUS_UNSUCCESSFUL;
   }
 
+  // A title's own settings are read when it launches, after the graphics
+  // system was built from the main config, so the ones read while setting up
+  // (the render target path, for one) would not apply. A process started with
+  // the path reads them before that (xenia_main.cc), so start one when this
+  // title has settings of its own and this process was not started for it.
+  {
+    Emulator::DiscInfo disc_info;
+    std::error_code ec;
+    bool started_for_it =
+        !cvars::target.empty() &&
+        std::filesystem::equivalent(cvars::target, path_to_file, ec);
+    if (!started_for_it && Emulator::ReadDiscInfo(path_to_file, &disc_info) &&
+        disc_info.title_id &&
+        !config::GameConfigValues(fmt::format("{:08X}", disc_info.title_id))
+             .empty()) {
+      XELOGI("RunTitle: {:08X} has its own settings; restarting to apply them",
+             disc_info.title_id);
+      if (RelaunchProcess(path_to_file)) {
+        return X_STATUS_SUCCESS;
+      }
+    }
+  }
+
   // Prevent crashing the emulator by not loading a game if a game is already
   // loaded.
   auto abs_path = std::filesystem::absolute(path_to_file);
@@ -6208,9 +6240,10 @@ xe::X_STATUS EmulatorWindow::RunTitle(
     AddRecentlyLaunchedTitle(path_to_file, emulator_->title_name());
     last_launched_path_ = path_to_file;
     ScheduleResumeFromState();
-#if XE_PLATFORM_LINUX
+    RecordLibraryLaunch();
+#if XE_UI_GTK
     SaveTitleIcon();
-    OnDashboardTitleLaunched();
+    ShowDashboard(false);
 #endif
 
     auto xam =
@@ -6358,18 +6391,136 @@ void EmulatorWindow::ClearDialogs() {
   emulator_->kernel_state()->xam_state()->is_xam_dialog_present_.store(false);
 }
 
+// ---- Game library (library.toml) ----
+
+void EmulatorWindow::LoadLibrary() {
+  library_.Load(emulator_->storage_root() / GameLibrary::kFilename);
+}
+
+void EmulatorWindow::SaveLibrary() {
+  library_.Save(emulator_->storage_root() / GameLibrary::kFilename);
+}
+
+void EmulatorWindow::ScanLibrary() {
+  std::vector<GameLibrary::Recent> recent;
+  for (const auto& entry : recently_launched_titles_) {
+    recent.push_back(
+        {entry.path_to_file, entry.title_name, entry.last_run_time});
+  }
+  if (library_.Scan(xe::to_path(cvars::games_dir), recent)) {
+    SaveLibrary();
+  }
+}
+
+EmulatorWindow::LibraryTitle* EmulatorWindow::LibraryEntryForLaunch(
+    const std::filesystem::path& path) {
+  std::string ext = xe::utf8::lower_ascii(xe::path_to_utf8(path.extension()));
+  if (ext != ".m3u") {
+    return library_.EntryFor(path);
+  }
+  const auto& playlist = emulator_->disc_playlist();
+  if (playlist.empty()) {
+    return nullptr;
+  }
+  std::filesystem::path disc =
+      emulator_->PlaylistDisc(emulator_->disc_number());
+  if (disc.empty()) {
+    disc = playlist.front();
+  }
+  return library_.EntryFor(disc);
+}
+
+EmulatorWindow::LibraryTitle* EmulatorWindow::LibraryEntryMounted(
+    const std::filesystem::path& path) {
+  // The disc that is mounted now, which is not the one the title was launched
+  // with once it has swapped. A title opened directly rather than through a
+  // playlist still swaps (the next disc is looked for beside the current one),
+  // and the session belongs to the disc it ended on.
+  const std::filesystem::path& mounted = emulator_->disc_image_path();
+  if (!mounted.empty()) {
+    if (LibraryTitle* entry = library_.EntryFor(mounted)) {
+      return entry;
+    }
+  }
+  return LibraryEntryForLaunch(path);
+}
+
+void EmulatorWindow::RecordLibraryLaunch() {
+  AddPlayTime();
+  session_running_ = true;
+  session_start_ = std::chrono::steady_clock::now();
+  session_path_ = last_launched_path_;
+  LibraryTitle* title = LibraryEntryForLaunch(last_launched_path_);
+  if (!title) {
+    LibraryTitle fresh;
+    fresh.path = last_launched_path_;
+    if (xe::utf8::lower_ascii(
+            xe::path_to_utf8(last_launched_path_.extension())) == ".m3u") {
+      // The playlist is not a library entry; its first disc is.
+      const auto& playlist = emulator_->disc_playlist();
+      if (playlist.empty()) {
+        return;
+      }
+      fresh.path = playlist.front();
+    }
+    fresh.type = GameLibrary::TypeOf(fresh.path);
+    std::error_code ec;
+    fresh.size = std::filesystem::file_size(fresh.path, ec);
+    GameLibrary::ReadTitleInfo(fresh);
+    library_.titles.push_back(std::move(fresh));
+    title = &library_.titles.back();
+  }
+  if (emulator_->is_title_open()) {
+    title->title_id = emulator_->title_id();
+    if (!emulator_->title_name().empty()) {
+      title->title_name = emulator_->title_name();
+    }
+  }
+  title->last_played = int64_t(time(nullptr));
+  SaveLibrary();
+}
+
+void EmulatorWindow::AddPlayTime() {
+  if (!session_running_) {
+    return;
+  }
+  session_running_ = false;
+  int64_t seconds = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now() - session_start_)
+                        .count();
+  if (LibraryTitle* title = LibraryEntryMounted(session_path_)) {
+    title->seconds_played += seconds;
+    // For a multi-disc title this is the entry for the disc that is mounted
+    // now, which is the one the session ended on. Stamping it here is what
+    // makes the next launch from the library start on that disc rather than
+    // going back to disc 1.
+    title->last_played = int64_t(time(nullptr));
+    XELOGI("Library: {} played {} s this session, {} s in total (disc {})",
+           title->title_name, seconds, title->seconds_played,
+           title->disc_number);
+  }
+}
+
 }  // namespace app
 }  // namespace xe
 
-#if XE_PLATFORM_LINUX
-// Display > Settings window...: GTK, on the UI thread.
+#if XE_UI_GTK
+// The Preferences window (and, on Linux, the game library dashboard,
+// gamepad navigation and the AppImage updater): GTK, on the UI thread.
 
 #include <gtk/gtk.h>
 
 #include "xenia/kernel/util/xex2_info.h"
 #include "xenia/kernel/xam/profile_manager.h"
 #include "xenia/kernel/xam/ui/gamercard_ui.h"
+#if XE_PLATFORM_LINUX
 #include "xenia/ui/window_gtk.h"
+#elif XE_PLATFORM_WIN32
+#include <gdk/gdkwin32.h>
+
+#include "xenia/app/gtk_overlay_win.h"
+#include "xenia/ui/window_win.h"
+#endif
 #include "xenia/vfs/devices/disc_image_device.h"
 #include "xenia/vfs/devices/disc_zarchive_device.h"
 #include "xenia/vfs/file.h"
@@ -6455,8 +6606,30 @@ GtkWidget* LeftLabel(const char* text) {
 // happens to rest on a combo box is not discoverable, and hovering a control
 // to read about it invites changing it by accident.
 GtkWidget* HelpIcon(const char* name) {
+#if XE_PLATFORM_WIN32
+  // Adwaita's symbolic icons are SVG, and the SVG loader (librsvg) would add
+  // 32 MB to the Windows build for this one icon: a "?" in a circle instead.
+  static GtkCssProvider* css = []() {
+    GtkCssProvider* provider = gtk_css_provider_new();
+    gtk_css_provider_load_from_data(
+        provider,
+        "label.xe-help { border: 1px solid; border-radius: 50%; "
+        "min-width: 13px; min-height: 13px; padding: 0; "
+        "font-size: 8pt; font-weight: bold; }",
+        -1, nullptr);
+    gtk_style_context_add_provider_for_screen(
+        gdk_screen_get_default(), GTK_STYLE_PROVIDER(provider),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    return provider;
+  }();
+  (void)css;
+  GtkWidget* icon = gtk_label_new("?");
+  gtk_style_context_add_class(gtk_widget_get_style_context(icon), "xe-help");
+  gtk_widget_set_halign(icon, GTK_ALIGN_START);
+#else
   GtkWidget* icon =
       gtk_image_new_from_icon_name("help-about-symbolic", GTK_ICON_SIZE_MENU);
+#endif
   gtk_widget_set_valign(icon, GTK_ALIGN_CENTER);
   gtk_widget_set_opacity(icon, 0.55);
   SetTooltipFromCvar(icon, name);
@@ -6688,6 +6861,7 @@ void SetGpuOptionDeferred(const char* name, const T& value) {
 
 // ---- Patches tab helpers ----
 
+#if XE_PLATFORM_LINUX
 // Run a shell command and return its stdout; exit code in *exit_code.
 std::string RunCommandCapture(const std::string& command, int* exit_code) {
   std::string output;
@@ -6723,261 +6897,7 @@ std::string ShellQuote(const std::string& text) {
   return quoted;
 }
 
-// GitHub's blob id of a local file: sha1 of "blob <size>\0" + contents. Used
-// to tell an up-to-date community patch file from an updated one.
-std::string GitBlobSha(const std::filesystem::path& path) {
-  std::error_code ec;
-  auto size = std::filesystem::file_size(path, ec);
-  if (ec) {
-    return "";
-  }
-  int code = 0;
-  std::string out =
-      RunCommandCapture(fmt::format("(printf 'blob {}\\0'; cat {}) | sha1sum",
-                                    size, ShellQuote(path.string())),
-                        &code);
-  if (code != 0 || out.size() < 40) {
-    return "";
-  }
-  return out.substr(0, 40);
-}
-
-void AppendUtf8(std::string& out, uint32_t cp) {
-  if (cp < 0x80) {
-    out += char(cp);
-  } else if (cp < 0x800) {
-    out += char(0xC0 | (cp >> 6));
-    out += char(0x80 | (cp & 0x3F));
-  } else if (cp < 0x10000) {
-    out += char(0xE0 | (cp >> 12));
-    out += char(0x80 | ((cp >> 6) & 0x3F));
-    out += char(0x80 | (cp & 0x3F));
-  } else {
-    out += char(0xF0 | (cp >> 18));
-    out += char(0x80 | ((cp >> 12) & 0x3F));
-    out += char(0x80 | ((cp >> 6) & 0x3F));
-    out += char(0x80 | (cp & 0x3F));
-  }
-}
-
-// Unescape a JSON string body (\" \\ \/ \n \t \uXXXX with surrogate pairs).
-std::string JsonUnescape(const std::string& in) {
-  std::string out;
-  for (size_t i = 0; i < in.size(); ++i) {
-    char c = in[i];
-    if (c != '\\' || i + 1 >= in.size()) {
-      out += c;
-      continue;
-    }
-    char e = in[++i];
-    switch (e) {
-      case 'n':
-        out += '\n';
-        break;
-      case 't':
-        out += '\t';
-        break;
-      case 'u': {
-        if (i + 4 >= in.size()) {
-          return out;
-        }
-        uint32_t cp =
-            uint32_t(strtoul(in.substr(i + 1, 4).c_str(), nullptr, 16));
-        i += 4;
-        if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 < in.size() &&
-            in[i + 1] == '\\' && in[i + 2] == 'u') {
-          uint32_t low =
-              uint32_t(strtoul(in.substr(i + 3, 4).c_str(), nullptr, 16));
-          if (low >= 0xDC00 && low <= 0xDFFF) {
-            cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
-            i += 6;
-          }
-        }
-        AppendUtf8(out, cp);
-        break;
-      }
-      default:
-        out += e;  // \" \\ \/ and anything else
-        break;
-    }
-  }
-  return out;
-}
-
-// Percent-encode a path component for a raw.githubusercontent.com URL.
-std::string UrlEncodeComponent(const std::string& in) {
-  static const char* hex = "0123456789ABCDEF";
-  std::string out;
-  for (unsigned char c : in) {
-    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
-      out += char(c);
-    } else {
-      out += '%';
-      out += hex[c >> 4];
-      out += hex[c & 15];
-    }
-  }
-  return out;
-}
-
-// Flip is_enabled for the [[patch]] entry named patch_name in a patch file,
-// keeping every other byte of the file (community files carry comments).
-bool SetPatchEnabledInFile(const std::filesystem::path& path,
-                           const std::string& patch_name, bool enabled) {
-  std::ifstream in(path);
-  if (!in) {
-    return false;
-  }
-  std::vector<std::string> lines;
-  std::string line;
-  while (std::getline(in, line)) {
-    lines.push_back(line);
-  }
-  in.close();
-  auto trimmed = [](const std::string& l) {
-    size_t b = l.find_first_not_of(" \t");
-    return b == std::string::npos ? std::string() : l.substr(b);
-  };
-  auto quoted_value = [](const std::string& t) {
-    size_t q1 = t.find('"');
-    size_t q2 = q1 == std::string::npos ? q1 : t.find('"', q1 + 1);
-    return q2 == std::string::npos ? std::string()
-                                   : t.substr(q1 + 1, q2 - q1 - 1);
-  };
-  bool in_patch = false;
-  bool in_target = false;
-  size_t name_line = std::string::npos;
-  bool done = false;
-  for (size_t i = 0; i < lines.size() && !done; ++i) {
-    std::string t = trimmed(lines[i]);
-    if (t.rfind("[[patch]]", 0) == 0) {
-      if (in_target && name_line != std::string::npos) {
-        break;  // the target had no is_enabled line: insert after its name
-      }
-      in_patch = true;
-      in_target = false;
-      continue;
-    }
-    if (t.rfind("[[", 0) == 0 || t.rfind("[", 0) == 0) {
-      if (in_target && name_line != std::string::npos) {
-        break;
-      }
-      in_patch = false;  // a data table such as [[patch.be32]]
-      continue;
-    }
-    if (!in_patch) {
-      continue;
-    }
-    if (!in_target && t.rfind("name", 0) == 0 &&
-        t.find('=') != std::string::npos && quoted_value(t) == patch_name) {
-      in_target = true;
-      name_line = i;
-      continue;
-    }
-    if (in_target && t.rfind("is_enabled", 0) == 0) {
-      size_t indent = lines[i].find_first_not_of(" \t");
-      std::string prefix =
-          indent == std::string::npos ? "" : lines[i].substr(0, indent);
-      size_t hash = lines[i].find('#');
-      std::string comment =
-          hash == std::string::npos ? "" : " " + lines[i].substr(hash);
-      lines[i] =
-          prefix + "is_enabled = " + (enabled ? "true" : "false") + comment;
-      done = true;
-    }
-  }
-  if (!done) {
-    if (name_line == std::string::npos) {
-      return false;
-    }
-    size_t indent = lines[name_line].find_first_not_of(" \t");
-    std::string prefix =
-        indent == std::string::npos ? "" : lines[name_line].substr(0, indent);
-    lines.insert(lines.begin() + name_line + 1,
-                 prefix + "is_enabled = " + (enabled ? "true" : "false"));
-  }
-  std::ofstream out(path, std::ios::trunc);
-  if (!out) {
-    return false;
-  }
-  for (const std::string& l : lines) {
-    out << l << '\n';
-  }
-  return bool(out);
-}
-
-// Blob ids of the community files downloaded through the tab, one
-// "<sha> <file name>" per line in the storage root, so a file whose
-// is_enabled flags were toggled still counts as up to date.
-std::filesystem::path CommunityShaFile(const std::filesystem::path& root) {
-  return root / "community_patch_shas.txt";
-}
-
-std::map<std::string, std::string> LoadCommunityShas(
-    const std::filesystem::path& root) {
-  std::map<std::string, std::string> shas;
-  std::ifstream in(CommunityShaFile(root));
-  std::string line;
-  while (std::getline(in, line)) {
-    size_t space = line.find(' ');
-    if (space == 40) {
-      shas[line.substr(41)] = line.substr(0, 40);
-    }
-  }
-  return shas;
-}
-
-void RecordCommunitySha(const std::filesystem::path& root,
-                        const std::string& name, const std::string& sha) {
-  auto shas = LoadCommunityShas(root);
-  shas[name] = sha;
-  std::ofstream out(CommunityShaFile(root), std::ios::trunc);
-  for (const auto& [n, s] : shas) {
-    out << s << ' ' << n << '\n';
-  }
-}
-
-// Blob id of the file with every "is_enabled = true" set back to false (the
-// repository ships them all off), for copies that were not downloaded here.
-std::string NormalisedBlobSha(const std::filesystem::path& path) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) {
-    return "";
-  }
-  std::string content((std::istreambuf_iterator<char>(in)),
-                      std::istreambuf_iterator<char>());
-  static const std::regex enabled_true(
-      "(^|\n)([ \t]*is_enabled[ \t]*=[ \t]*)true");
-  content = std::regex_replace(content, enabled_true, "$1$2false");
-  std::error_code ec;
-  std::filesystem::path temp =
-      std::filesystem::temp_directory_path(ec) / "xenia_patch_sha.tmp";
-  {
-    std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-    out << content;
-  }
-  std::string sha = GitBlobSha(temp);
-  std::filesystem::remove(temp, ec);
-  return sha;
-}
-
-enum class CommunityFileState { kMissing, kOutdated, kCurrent };
-CommunityFileState StateOfCommunityFile(
-    const std::filesystem::path& root, const std::string& name,
-    const std::string& tree_sha,
-    const std::map<std::string, std::string>& recorded) {
-  std::filesystem::path local = root / "patches" / name;
-  if (!std::filesystem::exists(local)) {
-    return CommunityFileState::kMissing;
-  }
-  auto it = recorded.find(name);
-  if (it != recorded.end()) {
-    return it->second == tree_sha ? CommunityFileState::kCurrent
-                                  : CommunityFileState::kOutdated;
-  }
-  return NormalisedBlobSha(local) == tree_sha ? CommunityFileState::kCurrent
-                                              : CommunityFileState::kOutdated;
-}
+#endif  // XE_PLATFORM_LINUX
 
 struct IdleCall {
   std::function<void()> fn;
@@ -6999,13 +6919,6 @@ void ClearChildren(GtkWidget* container) {
   }
   g_list_free(children);
 }
-
-const char* kCommunityPatchesTreeUrl =
-    "https://api.github.com/repos/xenia-canary/game-patches/git/trees/"
-    "main?recursive=1";
-const char* kCommunityPatchesRawUrl =
-    "https://raw.githubusercontent.com/xenia-canary/game-patches/main/"
-    "patches/";
 
 std::optional<ui::VirtualKey> VirtualKeyFromGdk(guint keyval) {
   if (keyval >= GDK_KEY_F1 && keyval <= GDK_KEY_F24) {
@@ -7043,69 +6956,6 @@ std::optional<ui::VirtualKey> VirtualKeyFromGdk(guint keyval) {
   }
 }
 
-// Guess which tab a patch entry belongs on from its name. The .patch.toml
-// format has no category field, so the community files mix graphics fixes,
-// gameplay cheats and debug toys in one list. The name decides: descriptions
-// mention cheats too often to be safe ("No clipping, collision bugs..." under
-// a 60 FPS entry, "Cheat Engine address: ..." under a camera one), and only
-// the two most unmistakable phrases are read out of one. Anything the words
-// do not recognise is a plain patch; the user can move an entry with the
-// button beside it and the choice is remembered.
-PatchCategory GuessPatchCategory(const std::string& name,
-                                 const std::string& desc) {
-  auto lower = [](const std::string& text) {
-    std::string out = text;
-    std::transform(out.begin(), out.end(), out.begin(),
-                   [](unsigned char c) { return char(::tolower(c)); });
-    return out;
-  };
-  std::string lower_name = lower(name);
-  std::string lower_desc = lower(desc);
-  auto name_has = [&lower_name](const char* needle) {
-    return lower_name.find(needle) != std::string::npos;
-  };
-  // A stability or rendering fix wins over any word below: entries like
-  // "Skip infinite loop on race end" are fixes that read as something else.
-  if (name_has("fix") || name_has("loop") || name_has("crash") ||
-      name_has("hash check")) {
-    return PatchCategory::kFix;
-  }
-  // The game's own toys, checked first: "Enable Debug Menu" is an extra even
-  // though such menus are where the cheats usually live.
-  static const char* kExtraWords[] = {
-      "debug menu",         "debug settings", "developer menu",
-      "developer settings", "dev menu",       "test menu",
-      "level select",       "free cam",       "freecam",
-      "free camera",        "helicam",        "fly around",
-      "wireframe",          "skip intro",     "skip logo",
-      "skip video",         "skip movie",     "camera bounding box",
-  };
-  for (const char* word : kExtraWords) {
-    if (name_has(word)) {
-      return PatchCategory::kExtra;
-    }
-  }
-  static const char* kCheatWords[] = {
-      "infinite",     "unlimited",     "god mode",   "godmode",
-      "invincib",     "no clip",       "noclip",     "one hit kill",
-      "one-hit kill", "instant kill",  "unlock all", "all items",
-      "all weapons",  "all character", "all cars",   "bottomless",
-      "max money",    "max health",    "max ammo",   "max level",
-      "max stats",    "never die",     "always win", "no reload",
-      "cheat",
-  };
-  for (const char* word : kCheatWords) {
-    if (name_has(word)) {
-      return PatchCategory::kCheat;
-    }
-  }
-  if (lower_desc.find("god mode") != std::string::npos ||
-      lower_desc.find("invincib") != std::string::npos) {
-    return PatchCategory::kCheat;
-  }
-  return PatchCategory::kFix;
-}
-
 }  // namespace
 
 namespace {
@@ -7120,7 +6970,12 @@ void ApplyComboListStyle() {
   applied = true;
   GtkCssProvider* provider = gtk_css_provider_new();
   gtk_css_provider_load_from_data(
-      provider, "combobox { -GtkComboBox-appears-as-list: 1; }", -1, nullptr);
+      provider,
+      "combobox { -GtkComboBox-appears-as-list: 1; }\n"
+      // The library's rows are drawn dark whatever the theme
+      // (DashboardRowBackground); the space below them goes with them.
+      "treeview.view.xe-library:not(:selected) { background-color: #101010; }",
+      -1, nullptr);
   gtk_style_context_add_provider_for_screen(
       gdk_screen_get_default(), GTK_STYLE_PROVIDER(provider),
       GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -7146,6 +7001,10 @@ void EmulatorWindow::RefreshSettingsWindow() {
       }
     } else if (key == "games_dir") {
       text = cvars::games_dir.empty() ? "(none)" : cvars::games_dir;
+    } else if (key == "fmv_replacement_dir") {
+      text = cvars::fmv_replacement_dir.empty()
+                 ? "(none)"
+                 : cvars::fmv_replacement_dir.string();
     } else if (key.rfind("hotkey:", 0) == 0) {
       int a = std::stoi(key.substr(7));
       if (settings_capture_action_ == a) {
@@ -7176,10 +7035,22 @@ void EmulatorWindow::ToggleSettingsWindow() {
   GtkWidget* win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
   gtk_window_set_title(GTK_WINDOW(win), "Xenia preferences");
   gtk_window_set_default_size(GTK_WINDOW(win), 700, 560);
+#if XE_PLATFORM_LINUX
   if (auto* gtk_main = dynamic_cast<ui::GTKWindow*>(window_.get())) {
     gtk_window_set_transient_for(GTK_WINDOW(win),
                                  GTK_WINDOW(gtk_main->window()));
   }
+#elif XE_PLATFORM_WIN32
+  // The main window is not GTK here. Owned by it, the window stays above it
+  // and is minimised with it, as a transient GTK window is on Linux.
+  if (auto* main = dynamic_cast<ui::Win32Window*>(window_.get())) {
+    gtk_widget_realize(win);
+    HWND hwnd = static_cast<HWND>(
+        gdk_win32_window_get_handle(gtk_widget_get_window(win)));
+    SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT,
+                      reinterpret_cast<LONG_PTR>(main->hwnd()));
+  }
+#endif
   settings_refresh_labels_.clear();
   settings_refresh_hooks_.clear();
   settings_changed_notifier = [this]() { RefreshSettingsWindow(); };
@@ -7450,6 +7321,8 @@ void EmulatorWindow::ToggleSettingsWindow() {
           }
         } else if (is_cas) {
           note = "FSR settings do not apply to CAS.";
+        } else if (mode == "dlaa") {
+          note = "DLAA does no sharpening, so neither slider applies.";
         } else {
           note = "Bilinear does no sharpening, so neither slider applies.";
         }
@@ -7462,7 +7335,8 @@ void EmulatorWindow::ToggleSettingsWindow() {
           "postprocess_scaling_and_sharpening",
           {{"", "Bilinear (plain stretch)"},
            {"cas", "AMD CAS sharpening (up to 2x2 scaling)"},
-           {"fsr", "AMD FSR 1.0 upscaling, CAS when not upscaling"}},
+           {"fsr", "AMD FSR 1.0 upscaling, CAS when not upscaling"},
+           {"dlaa", "NVIDIA DLAA anti-aliasing (RTX, bilinear elsewhere)"}},
           GetCvarValueForGuestOutputPaintEffect(
               GetGuestOutputPaintEffectForCvarValue(
                   cvars::postprocess_scaling_and_sharpening)),
@@ -7527,6 +7401,8 @@ void EmulatorWindow::ToggleSettingsWindow() {
           }
         } else if (is_cas) {
           note = "FSR settings do not apply to CAS.";
+        } else if (mode == "dlaa") {
+          note = "DLAA does no sharpening, so neither slider applies.";
         } else {
           note = "Bilinear does no sharpening, so neither slider applies.";
         }
@@ -7733,6 +7609,8 @@ void EmulatorWindow::ToggleSettingsWindow() {
 
     // The displays this machine has, by the name the system gives them, so a
     // machine with two identical monitors can still be told which is which.
+#if XE_PLATFORM_LINUX
+    // Only the GTK main window places itself on a chosen display.
     std::vector<std::pair<std::string, std::string>> displays = {
         {"-1", "Automatic (wherever the system puts the window)"}};
     if (GdkDisplay* gdk_display = gdk_display_get_default()) {
@@ -7758,6 +7636,7 @@ void EmulatorWindow::ToggleSettingsWindow() {
                SetGpuOption<int32_t>("display_index",
                                      int32_t(std::atoi(v.c_str())));
              });
+#endif
     AddCheck(grid, row, "Start in fullscreen", "fullscreen", cvars::fullscreen);
 
     grid = NewSection(box, "While a game runs", true);
@@ -7948,6 +7827,9 @@ void EmulatorWindow::ToggleSettingsWindow() {
          [this]() { SetContentRoot(""); }},
         {"Games", "games_dir", "Use default", [this]() { PickGamesDir(); },
          [this]() { SetGamesDir(""); }},
+        {"Upscaled cutscenes (replacement videos)", "fmv_replacement_dir",
+         "Turn off", [this]() { PickFmvReplacementDir(); },
+         [this]() { SetFmvReplacementDir(""); }},
     };
     for (auto& f : folders) {
       GtkWidget* heading = HeadingLabel(f.heading);
@@ -8066,10 +7948,10 @@ void EmulatorWindow::ToggleSettingsWindow() {
   XELOGI("Settings window opened");
 }
 
+// The dashboard; on Windows a borderless GTK window over the game area.
 // ---- Game library dashboard ----
 
 namespace {
-constexpr std::string_view kLibraryFilename = "library.toml";
 
 enum DashboardColumn {
   kColType = 0,
@@ -8081,7 +7963,7 @@ enum DashboardColumn {
   kColRegion,
   kColDiscs,
   kColRating,
-  kColIndex,         // int: index into library_titles_
+  kColIndex,         // int: index into library_.titles
   kColSeconds,       // int64 sort key
   kColLastPlayedTs,  // int64 sort key
   kColSizeBytes,     // int64 sort key
@@ -8090,430 +7972,13 @@ enum DashboardColumn {
   kColCount
 };
 
-std::string RegionText(uint32_t region) {
-  if (region == 0) {
-    return "";
-  }
-  if (region == 0xFFFFFFFFu) {
-    return "All";
-  }
-  std::vector<std::string> parts;
-  if (region & 0x000000FF) {
-    parts.push_back("NTSC-U");
-  }
-  if (region & 0x0000FF00) {
-    parts.push_back("NTSC-J");
-  }
-  if (region & 0x00FF0000) {
-    parts.push_back("PAL");
-  }
-  if (region & 0xFF000000) {
-    parts.push_back("Other");
-  }
-  std::string out;
-  for (auto& part : parts) {
-    out += (out.empty() ? "" : ", ") + part;
-  }
-  return out;
-}
-
-std::string TimePlayedText(int64_t seconds) {
-  if (seconds <= 0) {
-    return "";
-  }
-  if (seconds < 3600) {
-    int64_t minutes = std::max<int64_t>(1, seconds / 60);
-    return fmt::format("{} minute{}", minutes, minutes == 1 ? "" : "s");
-  }
-  int64_t hours = seconds / 3600;
-  return fmt::format("{} hour{}", hours, hours == 1 ? "" : "s");
-}
-
-std::string DateText(int64_t ts) {
-  if (ts <= 0) {
-    return "";
-  }
-  std::time_t t = std::time_t(ts);
-  char buf[32];
-  std::strftime(buf, sizeof(buf), "%m/%d/%Y", std::localtime(&t));
-  return buf;
-}
-
-std::string RatingText(int rating) {
-  std::string out;
-  for (int i = 1; i <= 5; ++i) {
-    out += i <= rating ? "\xE2\x98\x85" : "\xE2\x98\x86";  // filled/empty star
-  }
-  return rating ? out : "";
-}
-
 std::string LowerAscii(std::string s) {
   for (auto& c : s) {
     c = char(std::tolower((unsigned char)c));
   }
   return s;
 }
-}  // namespace
 
-EmulatorWindow::LibraryTitle* EmulatorWindow::LibraryEntryFor(
-    const std::filesystem::path& path) {
-  std::error_code ec;
-  for (auto& title : library_titles_) {
-    if (title.path == path ||
-        std::filesystem::equivalent(title.path, path, ec)) {
-      return &title;
-    }
-  }
-  return nullptr;
-}
-
-EmulatorWindow::LibraryTitle* EmulatorWindow::LibraryEntryForLaunch(
-    const std::filesystem::path& path) {
-  std::string ext = xe::utf8::lower_ascii(path.extension().string());
-  if (ext != ".m3u") {
-    return LibraryEntryFor(path);
-  }
-  const auto& playlist = emulator_->disc_playlist();
-  if (playlist.empty()) {
-    return nullptr;
-  }
-  std::filesystem::path disc =
-      emulator_->PlaylistDisc(emulator_->disc_number());
-  if (disc.empty()) {
-    disc = playlist.front();
-  }
-  return LibraryEntryFor(disc);
-}
-
-EmulatorWindow::LibraryTitle* EmulatorWindow::LibraryEntryMounted(
-    const std::filesystem::path& path) {
-  // The disc that is mounted now, which is not the one the title was launched
-  // with once it has swapped. A title opened directly rather than through a
-  // playlist still swaps (the next disc is looked for beside the current one),
-  // and the session belongs to the disc it ended on.
-  const std::filesystem::path& mounted = emulator_->disc_image_path();
-  if (!mounted.empty()) {
-    if (LibraryTitle* entry = LibraryEntryFor(mounted)) {
-      return entry;
-    }
-  }
-  return LibraryEntryForLaunch(path);
-}
-
-std::vector<size_t> EmulatorWindow::LibraryDiscGroup(size_t index) const {
-  std::vector<size_t> group;
-  if (index >= library_titles_.size()) {
-    return group;
-  }
-  const LibraryTitle& t = library_titles_[index];
-  if (t.disc_count > 1 && t.title_id) {
-    for (size_t i = 0; i < library_titles_.size(); ++i) {
-      const LibraryTitle& o = library_titles_[i];
-      if (o.title_id == t.title_id && o.disc_count > 1 &&
-          o.path.parent_path() == t.path.parent_path()) {
-        group.push_back(i);
-      }
-    }
-    std::sort(group.begin(), group.end(), [this](size_t a, size_t b) {
-      return library_titles_[a].disc_number < library_titles_[b].disc_number;
-    });
-  } else {
-    group.push_back(index);
-  }
-  return group;
-}
-
-std::filesystem::path EmulatorWindow::WriteLibraryPlaylist(size_t index) {
-  std::vector<size_t> group = LibraryDiscGroup(index);
-  if (group.size() < 2) {
-    return {};
-  }
-  std::filesystem::path dir = emulator_->storage_root() / "playlists";
-  std::error_code ec;
-  std::filesystem::create_directories(dir, ec);
-  std::filesystem::path playlist =
-      dir / fmt::format("{:08X}.m3u", library_titles_[index].title_id);
-  std::ofstream out(playlist, std::ios::trunc);
-  if (!out) {
-    XELOGE("Library: cannot write the playlist {}", playlist.string());
-    return {};
-  }
-  // The title boots the first entry, and swaps look entries up by disc
-  // number, so put the disc that was played most recently first: launching a
-  // multi-disc title from the library otherwise always started at disc 1,
-  // whichever disc the last session ended on (and the save state slots shown
-  // are the booted disc's).
-  size_t first = group.front();
-  int64_t newest = 0;
-  for (size_t i : group) {
-    if (library_titles_[i].last_played > newest) {
-      newest = library_titles_[i].last_played;
-      first = i;
-    }
-  }
-  out << "# Written by the game library; the discs of this title in order,\n";
-  out << "# starting with the one played most recently.\n";
-  out << xe::path_to_utf8(library_titles_[first].path) << '\n';
-  for (size_t i : group) {
-    if (i != first) {
-      out << xe::path_to_utf8(library_titles_[i].path) << '\n';
-    }
-  }
-  if (first != group.front()) {
-    XELOGI("Library: starting {} at disc {}, played most recently",
-           library_titles_[first].title_name.empty()
-               ? library_titles_[first].path.filename().string()
-               : library_titles_[first].title_name,
-           library_titles_[first].disc_number);
-  }
-  return playlist;
-}
-
-void EmulatorWindow::LoadLibrary() {
-  library_titles_.clear();
-  std::ifstream file(emulator()->storage_root() / kLibraryFilename);
-  if (!file.is_open()) {
-    return;
-  }
-  toml::parse_result parsed;
-  try {
-    parsed = toml::parse(file);
-  } catch (toml::parse_error& e) {
-    XELOGE("Cannot parse library.toml: {}", e.what());
-    return;
-  }
-  auto* titles = parsed["titles"].as_array();
-  if (!titles) {
-    return;
-  }
-  for (auto& node : *titles) {
-    auto* t = node.as_table();
-    if (!t) {
-      continue;
-    }
-    LibraryTitle title;
-    title.path = t->get_as<std::string>("path")
-                     ? t->get_as<std::string>("path")->get()
-                     : "";
-    if (title.path.empty()) {
-      continue;
-    }
-    auto str = [&](const char* key) {
-      auto* v = t->get_as<std::string>(key);
-      return v ? v->get() : std::string();
-    };
-    auto num = [&](const char* key) -> int64_t {
-      auto* v = t->get_as<int64_t>(key);
-      return v ? v->get() : 0;
-    };
-    title.type = str("type");
-    title.title_id =
-        uint32_t(std::strtoul(str("title_id").c_str(), nullptr, 16));
-    title.title_name = str("title_name");
-    title.disc_number = uint8_t(num("disc_number"));
-    title.disc_count = uint8_t(num("disc_count"));
-    title.media_id =
-        uint32_t(std::strtoul(str("media_id").c_str(), nullptr, 16));
-    title.region = uint32_t(std::strtoul(str("region").c_str(), nullptr, 16));
-    title.size = uint64_t(num("size"));
-    title.seconds_played = num("seconds_played");
-    title.last_played = num("last_played");
-    title.rating = int(std::clamp<int64_t>(num("rating"), 0, 5));
-    library_titles_.push_back(std::move(title));
-  }
-  XELOGI("Library: {} title(s) loaded", library_titles_.size());
-}
-
-void EmulatorWindow::SaveLibrary() {
-  toml::array titles;
-  for (const auto& title : library_titles_) {
-    toml::table t;
-    t.insert("path", xe::path_to_utf8(title.path));
-    t.insert("type", title.type);
-    t.insert("title_id", fmt::format("{:08X}", title.title_id));
-    t.insert("title_name", title.title_name);
-    t.insert("disc_number", int64_t(title.disc_number));
-    t.insert("disc_count", int64_t(title.disc_count));
-    t.insert("media_id", fmt::format("{:08X}", title.media_id));
-    t.insert("region", fmt::format("{:08X}", title.region));
-    t.insert("size", int64_t(title.size));
-    t.insert("seconds_played", title.seconds_played);
-    t.insert("last_played", title.last_played);
-    t.insert("rating", int64_t(title.rating));
-    titles.push_back(std::move(t));
-  }
-  toml::table root;
-  root.insert("titles", std::move(titles));
-  std::ofstream file(emulator()->storage_root() / kLibraryFilename,
-                     std::ofstream::trunc);
-  file << root;
-}
-
-// Title id, discs, media id and region from the XEX2 header of the file
-// (ISO/ZAR: default.xex at the disc root), without launching. The name
-// lives in the compressed part of the XEX and is filled in at first launch.
-bool EmulatorWindow::ReadTitleInfo(LibraryTitle& title) {
-  std::vector<uint8_t> header;
-  std::unique_ptr<vfs::Device> device;
-  if (title.type == "XEX") {
-    auto* f = xe::filesystem::OpenFile(title.path, "rb");
-    if (!f) {
-      return false;
-    }
-    header.resize(64 * 1024);
-    size_t n = fread(header.data(), 1, header.size(), f);
-    fclose(f);
-    header.resize(n);
-  } else {
-    if (title.type == "ISO") {
-      device = std::make_unique<vfs::DiscImageDevice>("\\Device\\LibraryScan",
-                                                      title.path);
-    } else {
-      device = std::make_unique<vfs::DiscZarchiveDevice>(
-          "\\Device\\LibraryScan", title.path);
-    }
-    if (!device->Initialize()) {
-      return false;
-    }
-    auto* entry = device->ResolvePath("default.xex");
-    if (!entry) {
-      return false;
-    }
-    vfs::File* file = nullptr;
-    if (entry->Open(vfs::FileAccess::kFileReadData, &file) !=
-            X_STATUS_SUCCESS ||
-        !file) {
-      return false;
-    }
-    header.resize(std::min<size_t>(entry->size(), 64 * 1024));
-    size_t n = 0;
-    file->ReadSync(std::span<uint8_t>(header.data(), header.size()), 0, &n);
-    file->Destroy();
-    header.resize(n);
-  }
-  if (header.size() < sizeof(xex2_header) ||
-      xe::load_and_swap<uint32_t>(header.data()) != 0x58455832) {  // 'XEX2'
-    return false;
-  }
-  auto* xex = reinterpret_cast<const xex2_header*>(header.data());
-  uint32_t count = xex->header_count;
-  for (uint32_t i = 0; i < count; ++i) {
-    size_t at = offsetof(xex2_header, headers) + i * sizeof(xex2_opt_header);
-    if (at + sizeof(xex2_opt_header) > header.size()) {
-      break;
-    }
-    auto* opt = reinterpret_cast<const xex2_opt_header*>(header.data() + at);
-    if (opt->key == XEX_HEADER_EXECUTION_INFO) {
-      uint32_t offset = opt->offset;
-      if (offset + sizeof(xex2_opt_execution_info) <= header.size()) {
-        auto* info = reinterpret_cast<const xex2_opt_execution_info*>(
-            header.data() + offset);
-        title.title_id = info->title_id;
-        title.media_id = info->media_id;
-        title.disc_number = info->disc_number;
-        title.disc_count = info->disc_count;
-      }
-    }
-  }
-  uint32_t security = xex->security_offset;
-  if (security + 0x180 <= header.size()) {
-    title.region =
-        xe::load_and_swap<uint32_t>(header.data() + security + 0x178);
-  }
-  return title.title_id != 0;
-}
-
-// What to call a title the emulator has never run. A disc in its own folder
-// takes the folder's name, which is how a multi-disc set is usually kept;
-// anything else takes its file name. Empty when there is nothing useful.
-static std::string NameFromPath(const std::filesystem::path& path) {
-  std::error_code ec;
-  const std::filesystem::path root = cvars::games_dir;
-  if (!root.empty()) {
-    std::filesystem::path rel =
-        std::filesystem::relative(path.parent_path(), root, ec);
-    if (!ec && !rel.empty() && rel != "." &&
-        rel.string().find("..") == std::string::npos) {
-      std::string folder = rel.filename().string();
-      if (!folder.empty()) {
-        return folder;
-      }
-    }
-  }
-  return path.stem().string();
-}
-
-void EmulatorWindow::ScanLibrary() {
-  std::filesystem::path root = cvars::games_dir;
-  std::error_code ec;
-  if (root.empty()) {
-    XELOGW("Library: no games folder is set, nothing to scan");
-    return;
-  }
-  if (!std::filesystem::is_directory(root, ec)) {
-    XELOGW("Library: the games folder {} is not a readable directory",
-           root.string());
-    return;
-  }
-  size_t added = 0, unreadable = 0;
-  auto it = std::filesystem::recursive_directory_iterator(
-      root, std::filesystem::directory_options::skip_permission_denied, ec);
-  for (; !ec && it != std::filesystem::recursive_directory_iterator();
-       it.increment(ec)) {
-    if (it.depth() >= 3) {
-      it.disable_recursion_pending();
-    }
-    const auto& entry = *it;
-    if (!entry.is_regular_file(ec)) {
-      continue;
-    }
-    std::string ext = xe::utf8::lower_ascii(entry.path().extension().string());
-    std::string type = ext == ".iso"   ? "ISO"
-                       : ext == ".xex" ? "XEX"
-                       : ext == ".zar" ? "ZAR"
-                                       : "";
-    if (type.empty()) {
-      continue;
-    }
-    LibraryTitle* existing = LibraryEntryFor(entry.path());
-    if (existing) {
-      existing->size = entry.file_size(ec);
-      if (!existing->title_id) {
-        ReadTitleInfo(*existing);
-      }
-      continue;
-    }
-    LibraryTitle title;
-    title.path = entry.path();
-    title.type = type;
-    title.size = entry.file_size(ec);
-    if (!ReadTitleInfo(title)) {
-      ++unreadable;
-    }
-    for (const auto& recent : recently_launched_titles_) {
-      if (recent.path_to_file == entry.path()) {
-        title.title_name = recent.title_name;
-        title.last_played = recent.last_run_time;
-      }
-    }
-    library_titles_.push_back(std::move(title));
-    ++added;
-  }
-  // Drop entries whose file is gone, and playlists an older build recorded
-  // as titles.
-  std::erase_if(library_titles_, [&](const LibraryTitle& t) {
-    return !std::filesystem::exists(t.path, ec) ||
-           xe::utf8::lower_ascii(t.path.extension().string()) == ".m3u";
-  });
-  XELOGI(
-      "Library: {} scanned, {} new, {} without a readable XEX header, {} total",
-      root.string(), added, unreadable, library_titles_.size());
-  if (added) {
-    SaveLibrary();
-  }
-}
-
-namespace {
 // Alternating row backgrounds (near black / grey), set per cell so it does
 // not depend on the theme honouring the tree view's rules hint.
 void DashboardRowBackground(GtkTreeViewColumn*, GtkCellRenderer* renderer,
@@ -8578,10 +8043,14 @@ bool EmulatorWindow::DashboardRowVisible(void* model_ptr, void* iter_ptr) {
 }
 
 void EmulatorWindow::BuildDashboard() {
-  auto* gtk_main = dynamic_cast<ui::GTKWindow*>(window_.get());
-  if (!gtk_main || dashboard_widget_) {
+  if (dashboard_widget_) {
     return;
   }
+#if XE_PLATFORM_LINUX
+  if (!dynamic_cast<ui::GTKWindow*>(window_.get())) {
+    return;
+  }
+#endif
   ApplyComboListStyle();
   GtkWidget* box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
 
@@ -8759,6 +8228,7 @@ void EmulatorWindow::BuildDashboard() {
   gtk_box_pack_start(GTK_BOX(box), status, FALSE, FALSE, 0);
 
   dashboard_list_ = view;
+  gtk_style_context_add_class(gtk_widget_get_style_context(view), "xe-library");
   dashboard_widget_ = box;
   dashboard_store_ = store;
   dashboard_filter_ = filter;
@@ -8830,7 +8300,7 @@ void EmulatorWindow::BuildDashboard() {
                      }
                      gint index = -1;
                      gtk_tree_model_get(model, &iter, kColIndex, &index, -1);
-                     if (index >= 0 && index < int(w->library_titles_.size())) {
+                     if (index >= 0 && index < int(w->library_.titles.size())) {
                        // Through LaunchLibraryIndex, like the grid view and the
                        // Launch menu item: launching the file itself skips the
                        // playlist, so a multi-disc title started here knew
@@ -8862,7 +8332,7 @@ void EmulatorWindow::BuildDashboard() {
           gtk_tree_model_get(model, &iter, kColIndex, &index, -1);
         }
         gtk_tree_path_free(path);
-        if (index < 0 || index >= int(w->library_titles_.size())) {
+        if (index < 0 || index >= int(w->library_.titles.size())) {
           return TRUE;
         }
         w->dashboard_menu_index_ = index;
@@ -8876,12 +8346,12 @@ void EmulatorWindow::BuildDashboard() {
                 int rating = GPOINTER_TO_INT(
                     g_object_get_data(G_OBJECT(item), "rating"));
                 int i = w->dashboard_menu_index_;
-                if (i < 0 || i >= int(w->library_titles_.size())) {
+                if (i < 0 || i >= int(w->library_.titles.size())) {
                   return;
                 }
                 if (rating == -1) {
                   std::thread(LaunchFileExplorer,
-                              w->library_titles_[i].path.parent_path())
+                              w->library_.titles[i].path.parent_path())
                       .detach();
                   return;
                 }
@@ -8889,7 +8359,7 @@ void EmulatorWindow::BuildDashboard() {
                   w->LaunchLibraryIndex(i);
                   return;
                 }
-                w->library_titles_[i].rating = rating;
+                w->library_.titles[i].rating = rating;
                 w->SaveLibrary();
                 w->RefreshDashboard();
               }),
@@ -8915,8 +8385,47 @@ void EmulatorWindow::BuildDashboard() {
       }),
       this);
 
-  gtk_main->SetIdleWidget(box);
+  AttachDashboardWidget(box);
   RefreshDashboard();
+}
+
+// Where the dashboard lives: the GTK main window's overlay on Linux; on
+// Windows, where the main window is Win32, a borderless GTK window kept
+// over its client area.
+void EmulatorWindow::AttachDashboardWidget(void* widget) {
+#if XE_PLATFORM_LINUX
+  if (auto* gtk_main = dynamic_cast<ui::GTKWindow*>(window_.get())) {
+    gtk_main->SetIdleWidget(static_cast<GtkWidget*>(widget));
+  }
+#elif XE_PLATFORM_WIN32
+  if (auto* main = dynamic_cast<ui::Win32Window*>(window_.get())) {
+    dashboard_overlay_ = std::make_unique<GtkOverlayWin>(
+        main->hwnd(), static_cast<GtkWidget*>(widget));
+  }
+#endif
+}
+
+void EmulatorWindow::ShowDashboardWidget(bool show) {
+#if XE_PLATFORM_LINUX
+  if (auto* gtk_main = dynamic_cast<ui::GTKWindow*>(window_.get())) {
+    gtk_main->ShowIdleWidget(show);
+  }
+#elif XE_PLATFORM_WIN32
+  if (dashboard_overlay_) {
+    dashboard_overlay_->Show(show);
+  }
+#endif
+}
+
+bool EmulatorWindow::DashboardShown() const {
+#if XE_PLATFORM_LINUX
+  auto* gtk_main = dynamic_cast<ui::GTKWindow*>(window_.get());
+  return gtk_main && gtk_main->idle_widget_shown();
+#elif XE_PLATFORM_WIN32
+  return dashboard_overlay_ && dashboard_overlay_->shown();
+#else
+  return false;
+#endif
 }
 
 void EmulatorWindow::RefreshDashboard() {
@@ -8927,11 +8436,11 @@ void EmulatorWindow::RefreshDashboard() {
   gtk_list_store_clear(store);
   uint64_t total_seconds = 0;
   size_t rows = 0;
-  for (size_t i = 0; i < library_titles_.size(); ++i) {
-    const auto& t = library_titles_[i];
+  for (size_t i = 0; i < library_.titles.size(); ++i) {
+    const auto& t = library_.titles[i];
     // A multi-disc title is one row, on its lowest disc; the other discs
     // fold into it.
-    std::vector<size_t> group = LibraryDiscGroup(i);
+    std::vector<size_t> group = library_.DiscGroup(i);
     if (group.front() != i) {
       continue;
     }
@@ -8940,15 +8449,15 @@ void EmulatorWindow::RefreshDashboard() {
     int64_t last_played = 0;
     uint64_t size = 0;
     for (size_t g : group) {
-      seconds_played += library_titles_[g].seconds_played;
-      last_played = std::max(last_played, library_titles_[g].last_played);
-      size += library_titles_[g].size;
+      seconds_played += library_.titles[g].seconds_played;
+      last_played = std::max(last_played, library_.titles[g].last_played);
+      size += library_.titles[g].size;
     }
     total_seconds += seconds_played;
     std::string name = t.title_name;
     if (name.empty() && t.title_id) {
       // Another disc of the same title may have been played.
-      for (const auto& other : library_titles_) {
+      for (const auto& other : library_.titles) {
         if (other.title_id == t.title_id && !other.title_name.empty()) {
           name = other.title_name;
           break;
@@ -8959,7 +8468,7 @@ void EmulatorWindow::RefreshDashboard() {
       // Every unplayed row used to read "(not played yet)", so a shelf of
       // them was a column of identical labels. The folder a disc sits in
       // names a multi-disc set, and a loose file names itself.
-      name = NameFromPath(t.path);
+      name = NameFromPath(t.path, xe::to_path(cvars::games_dir));
       if (name.empty()) {
         name = t.title_id ? "(not played yet)" : "(unreadable)";
       }
@@ -9086,8 +8595,8 @@ void EmulatorWindow::RefreshDashboardGrid() {
     gint index = -1;
     gchar* title = nullptr;
     gtk_tree_model_get(model, &iter, kColIndex, &index, kColTitle, &title, -1);
-    if (index >= 0 && index < int(library_titles_.size())) {
-      const auto& t = library_titles_[index];
+    if (index >= 0 && index < int(library_.titles.size())) {
+      const auto& t = library_.titles[index];
       std::string label = title && *title ? title : t.path.stem().string();
       GtkTreeIter row;
       gtk_list_store_append(grid_store, &row);
@@ -9099,11 +8608,12 @@ void EmulatorWindow::RefreshDashboardGrid() {
 }
 
 void EmulatorWindow::LaunchLibraryIndex(int index) {
-  if (index < 0 || index >= int(library_titles_.size())) {
+  if (index < 0 || index >= int(library_.titles.size())) {
     return;
   }
-  auto path = library_titles_[index].path;
-  std::filesystem::path playlist = WriteLibraryPlaylist(size_t(index));
+  auto path = library_.titles[index].path;
+  std::filesystem::path playlist = library_.WritePlaylist(
+      size_t(index), emulator_->storage_root() / "playlists");
   if (!playlist.empty()) {
     path = playlist;
   }
@@ -9113,14 +8623,13 @@ void EmulatorWindow::LaunchLibraryIndex(int index) {
 }
 
 void EmulatorWindow::ShowDashboard(bool show) {
-  auto* gtk_main = dynamic_cast<ui::GTKWindow*>(window_.get());
-  if (!gtk_main || !dashboard_widget_) {
+  if (!dashboard_widget_) {
     return;
   }
   if (show) {
     RefreshDashboard();
   }
-  gtk_main->ShowIdleWidget(show);
+  ShowDashboardWidget(show);
   if (show) {
     // Put focus on the games themselves. Without this it starts on whatever
     // the window last focused, so an arrow key or a d-pad press changed a
@@ -9173,6 +8682,21 @@ void EmulatorWindow::ShowDashboard(bool show) {
 // including through submenus and a scrolling list. So the pad is translated
 // into those key events rather than each widget being driven by hand, which
 // keeps one path for the keyboard, the mouse and the controller.
+void* EmulatorWindow::MainUiToplevel() const {
+  // The GTK window the library is in: the main window on Linux, the window
+  // over the game area on Windows (none while it is hidden).
+#if XE_PLATFORM_LINUX
+  auto* gtk_window = dynamic_cast<ui::GTKWindow*>(window_.get());
+  return gtk_window ? gtk_window->window() : nullptr;
+#elif XE_PLATFORM_WIN32
+  return dashboard_overlay_ && dashboard_overlay_->shown()
+             ? dashboard_overlay_->window()
+             : nullptr;
+#else
+  return nullptr;
+#endif
+}
+
 void* EmulatorWindow::ActiveUiToplevel() const {
   // Whichever of our windows the user is looking at, which is not always the
   // main one: Preferences, the content list and the pickers are each their
@@ -9195,8 +8719,7 @@ void* EmulatorWindow::ActiveUiToplevel() const {
       return grab_toplevel;
     }
   }
-  auto* gtk_window = dynamic_cast<ui::GTKWindow*>(window_.get());
-  GtkWidget* main_window = gtk_window ? gtk_window->window() : nullptr;
+  GtkWidget* main_window = static_cast<GtkWidget*>(MainUiToplevel());
   GtkWidget* modal = nullptr;
   GtkWidget* other = nullptr;
   GList* toplevels = gtk_window_list_toplevels();
@@ -9246,7 +8769,59 @@ bool EmulatorWindow::HasNotebook(void* widget_ptr) {
   return found;
 }
 
+#if XE_PLATFORM_WIN32
+namespace {
+bool Win32MenuOpen() {
+  GUITHREADINFO info = {};
+  info.cbSize = sizeof(info);
+  return GetGUIThreadInfo(GetCurrentThreadId(), &info) &&
+         (info.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE));
+}
+
+void PostWin32Key(HWND hwnd, UINT vk) {
+  // A menu's loop reads key messages off the thread's queue whatever window
+  // they are addressed to, and needs no keyboard focus for it.
+  LPARAM lparam = 1 | (LPARAM(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)) << 16);
+  PostMessageW(hwnd, WM_KEYDOWN, vk, lparam);
+  PostMessageW(hwnd, WM_KEYUP, vk, lparam | (LPARAM(3) << 30));
+}
+}  // namespace
+#endif
+
 void EmulatorWindow::SendUiKey(unsigned int keyval, unsigned int modifiers) {
+#if XE_PLATFORM_WIN32
+  if (pad_ui_menu_open_) {
+    // The Win32 menus, not GTK.
+    UINT vk = 0;
+    switch (keyval) {
+      case GDK_KEY_Up:
+        vk = VK_UP;
+        break;
+      case GDK_KEY_Down:
+        vk = VK_DOWN;
+        break;
+      case GDK_KEY_Left:
+        vk = VK_LEFT;
+        break;
+      case GDK_KEY_Right:
+        vk = VK_RIGHT;
+        break;
+      case GDK_KEY_Return:
+        vk = VK_RETURN;
+        break;
+      case GDK_KEY_Escape:
+        vk = VK_ESCAPE;
+        break;
+      default:
+        break;
+    }
+    auto* main = dynamic_cast<ui::Win32Window*>(window_.get());
+    if (vk && main) {
+      PostWin32Key(main->hwnd(), vk);
+    }
+    return;
+  }
+#endif
   GtkWidget* toplevel = static_cast<GtkWidget*>(ActiveUiToplevel());
   GdkWindow* gdk_window = toplevel ? gtk_widget_get_window(toplevel) : nullptr;
   if (!gdk_window) {
@@ -9296,15 +8871,26 @@ void EmulatorWindow::SetPadHoldsUi(bool holds) {
     return;
   }
   pad_ui_holds_pad_ = holds;
+  XELOGI("Gamepad UI: game input {}", holds ? "held" : "released");
   if (emulator_ && emulator_->input_system()) {
     emulator_->input_system()->set_ui_holds_pad(holds);
   }
 }
 
 void EmulatorWindow::OpenMenuBarFromPad() {
+#if XE_PLATFORM_LINUX
   auto* menu = dynamic_cast<ui::GTKMenuItem*>(main_menu_for_pad_);
   GtkWidget* menubar = menu ? menu->handle() : nullptr;
   if (!menubar || !GTK_IS_MENU_SHELL(menubar)) {
+    return;
+  }
+  // Fullscreen takes the menu bar out of the window. A menu opened there is
+  // invisible but still takes the keyboard, and the pad stays held for it,
+  // so the game gets no input at all. Leave fullscreen so the menus show.
+  if (window_->IsFullscreen()) {
+    SetFullscreen(false);
+  }
+  if (!gtk_widget_get_visible(menubar)) {
     return;
   }
   gtk_widget_grab_focus(menubar);
@@ -9312,17 +8898,39 @@ void EmulatorWindow::OpenMenuBarFromPad() {
   pad_ui_menu_open_ = true;
   SetPadHoldsUi(true);
   XELOGI("Gamepad UI: menus opened");
+#elif XE_PLATFORM_WIN32
+  auto* main = dynamic_cast<ui::Win32Window*>(window_.get());
+  if (!main) {
+    return;
+  }
+  // As on Linux: a fullscreen window has no menu bar to show.
+  if (window_->IsFullscreen()) {
+    SetFullscreen(false);
+  }
+  // What Alt on its own does: the menu bar takes the keyboard with its first
+  // menu highlighted. Posted, since Windows runs the menu in a loop of its
+  // own until it closes, and this is inside the pad's timer.
+  PostMessageW(main->hwnd(), WM_SYSCOMMAND, SC_KEYMENU, 0);
+  pad_ui_menu_open_ = true;
+  pad_ui_menu_seen_open_ = false;
+  pad_ui_menu_opened_at_ = std::chrono::steady_clock::now();
+  SetPadHoldsUi(true);
+  XELOGI("Gamepad UI: menus opened");
+#endif
 }
 
 void EmulatorWindow::CloseMenuBarFromPad() {
+#if XE_PLATFORM_LINUX
   auto* menu = dynamic_cast<ui::GTKMenuItem*>(main_menu_for_pad_);
   GtkWidget* menubar = menu ? menu->handle() : nullptr;
   if (menubar && GTK_IS_MENU_SHELL(menubar)) {
     gtk_menu_shell_deactivate(GTK_MENU_SHELL(menubar));
   }
+#elif XE_PLATFORM_WIN32
+  EndMenu();
+#endif
   pad_ui_menu_open_ = false;
-  auto* gtk_window = dynamic_cast<ui::GTKWindow*>(window_.get());
-  SetPadHoldsUi(gtk_window && gtk_window->idle_widget_shown());
+  SetPadHoldsUi(DashboardShown());
   XELOGI("Gamepad UI: menus closed");
 }
 
@@ -9395,22 +9003,41 @@ void EmulatorWindow::PollGamepadUi() {
       static_cast<uint16_t>(buttons & ~pad_ui_prev_buttons_);
   pad_ui_prev_buttons_ = buttons;
 
-  auto* gtk_window_for_pad = dynamic_cast<ui::GTKWindow*>(window_.get());
-  const bool library_shown =
-      gtk_window_for_pad && gtk_window_for_pad->idle_widget_shown();
+  const bool library_shown = DashboardShown();
 
   // GTK closes the menus itself when an item is activated, so ask the shell
   // rather than trusting our own flag. Left stale, it kept up and down as
   // arrow keys after a menu had opened a settings window, and an arrow key
   // on a combo box there silently changes the setting under it.
+#if XE_PLATFORM_LINUX
   if (pad_ui_menu_open_) {
     auto* open_menu = dynamic_cast<ui::GTKMenuItem*>(main_menu_for_pad_);
     GtkWidget* menubar = open_menu ? open_menu->handle() : nullptr;
     if (!menubar || !GTK_IS_MENU_SHELL(menubar) ||
         !gtk_menu_shell_get_selected_item(GTK_MENU_SHELL(menubar))) {
       pad_ui_menu_open_ = false;
+      // Hand the pad back to the game too, or it stays held with no menu up.
+      SetPadHoldsUi(DashboardShown());
     }
   }
+#elif XE_PLATFORM_WIN32
+  // Windows closes the menus itself when an item is chosen or the menu loses
+  // the mouse; ask it rather than trust the flag. Not before it has been seen
+  // open: the request to open it is posted and may still be on its way.
+  if (pad_ui_menu_open_) {
+    if (Win32MenuOpen()) {
+      pad_ui_menu_seen_open_ = true;
+    } else if (pad_ui_menu_seen_open_ ||
+               std::chrono::steady_clock::now() - pad_ui_menu_opened_at_ >
+                   std::chrono::seconds(1)) {
+      // Closed, or it never opened (the menu bar is disabled while the
+      // emulator starts): either way the pad goes back to the game.
+      pad_ui_menu_open_ = false;
+      SetPadHoldsUi(DashboardShown());
+      XELOGI("Gamepad UI: menus closed");
+    }
+  }
+#endif
 
   if (GamepadUiHotkey(buttons, pressed)) {
     if (pad_ui_menu_open_) {
@@ -9441,8 +9068,7 @@ void EmulatorWindow::PollGamepadUi() {
   // and lost it, with nothing focused at all afterwards. Left and right stay
   // arrows everywhere, since that is what changes a combo box, a slider or
   // the selected tab.
-  GtkWidget* pad_main_window =
-      gtk_window_for_pad ? gtk_window_for_pad->window() : nullptr;
+  GtkWidget* pad_main_window = static_cast<GtkWidget*>(MainUiToplevel());
   // Tab moves between the controls of a settings window, but an open
   // drop-down inside one is a list again and only arrows move its
   // highlight - Tab does nothing there, so the selection could not be
@@ -9495,21 +9121,31 @@ void EmulatorWindow::PollGamepadUi() {
     SendUiKey(GDK_KEY_Return);
   }
   if (pressed & hid::X_INPUT_GAMEPAD_B) {
-    auto* gtk_window = dynamic_cast<ui::GTKWindow*>(window_.get());
+    GtkWidget* main_window = static_cast<GtkWidget*>(MainUiToplevel());
     GtkWidget* active = static_cast<GtkWidget*>(ActiveUiToplevel());
+#if XE_PLATFORM_WIN32
+    if (pad_ui_menu_open_) {
+      // A Win32 menu holds no GTK grab, so check it before the windows
+      // below: one level back; the poll sees the menu loop end after the
+      // last.
+      SendUiKey(GDK_KEY_Escape);
+      return;
+    }
+#endif
     if (gtk_grab_get_current()) {
       // A drop-down is open: Escape closes it and leaves the window behind
       // it alone, which closing the toplevel would not.
       SendUiKey(GDK_KEY_Escape);
       return;
     }
-    if (active && gtk_window && active != gtk_window->window()) {
+    if (active && active != main_window) {
       // One of our own windows is up. Escape closes a GtkDialog but not a
       // plain GtkWindow, which is what Preferences is, so close it.
       gtk_window_close(GTK_WINDOW(active));
       return;
     }
     if (pad_ui_menu_open_) {
+#if XE_PLATFORM_LINUX
       SendUiKey(GDK_KEY_Escape);
       // Escape closes one level; the shell tells us when it is all the way
       // out rather than guessing here.
@@ -9519,6 +9155,10 @@ void EmulatorWindow::PollGamepadUi() {
           !gtk_menu_shell_get_selected_item(GTK_MENU_SHELL(menubar))) {
         CloseMenuBarFromPad();
       }
+#else
+      // One level; the poll sees the menu loop end after the last.
+      SendUiKey(GDK_KEY_Escape);
+#endif
     } else {
       SendUiKey(GDK_KEY_Escape);
     }
@@ -9541,6 +9181,20 @@ void EmulatorWindow::StartGamepadUi() {
   if (pad_ui_timer_ || !cvars::gamepad_ui) {
     return;
   }
+#if XE_PLATFORM_WIN32
+  // A Win32 timer on the main window: while a menu is open Windows runs a
+  // loop of its own, which dispatches WM_TIMER but never returns to GLib,
+  // so a GLib timeout would stop polling the pad exactly when it drives the
+  // menu.
+  if (auto* main = dynamic_cast<ui::Win32Window*>(window_.get())) {
+    static EmulatorWindow* polled = nullptr;
+    polled = this;
+    pad_ui_timer_ = unsigned(
+        SetTimer(main->hwnd(), 0x58475055 /* 'XGPU' */, 33,
+                 [](HWND, UINT, UINT_PTR, DWORD) { polled->PollGamepadUi(); }));
+  }
+  return;
+#endif
   pad_ui_timer_ = g_timeout_add(
       33,
       +[](gpointer data) -> gboolean {
@@ -9553,7 +9207,11 @@ void EmulatorWindow::StartGamepadUi() {
 void EmulatorWindow::UpdateDashboardFullscreen(bool dashboard_shown) {
   // Everywhere else the overlay draws over the presented frame correctly, so
   // leave fullscreen alone: only gamescope hides it.
+#if XE_PLATFORM_LINUX
   static const bool under_gamescope = RunningUnderGamescope();
+#else
+  const bool under_gamescope = false;
+#endif
   if (!under_gamescope || !window_) {
     return;
   }
@@ -9577,79 +9235,20 @@ void EmulatorWindow::UpdateDashboardFullscreen(bool dashboard_shown) {
   }
 }
 
-void EmulatorWindow::ToggleDashboard() {
-  auto* gtk_main = dynamic_cast<ui::GTKWindow*>(window_.get());
-  if (!gtk_main) {
-    return;
-  }
-  ShowDashboard(!gtk_main->idle_widget_shown());
-}
+void EmulatorWindow::ToggleDashboard() { ShowDashboard(!DashboardShown()); }
 
-bool EmulatorWindow::DashboardShown() const {
-  auto* gtk_main = dynamic_cast<ui::GTKWindow*>(window_.get());
-  return gtk_main && gtk_main->idle_widget_shown();
-}
-
-void EmulatorWindow::OnDashboardTitleLaunched() {
-  AddPlayTime();
-  session_running_ = true;
-  session_start_ = std::chrono::steady_clock::now();
-  session_path_ = last_launched_path_;
-  LibraryTitle* title = LibraryEntryForLaunch(last_launched_path_);
-  if (!title) {
-    LibraryTitle fresh;
-    fresh.path = last_launched_path_;
-    std::string ext =
-        xe::utf8::lower_ascii(last_launched_path_.extension().string());
-    if (ext == ".m3u") {
-      // The playlist is not a library entry; its first disc is.
-      const auto& playlist = emulator_->disc_playlist();
-      if (playlist.empty()) {
-        ShowDashboard(false);
-        return;
-      }
-      fresh.path = playlist.front();
-      ext = xe::utf8::lower_ascii(fresh.path.extension().string());
+void EmulatorWindow::UpdateDashboardForPanels() {
+  // ImGui draws under the GTK dashboard, so a panel opened from the menu with
+  // no title running was invisible. Hide the dashboard while one is open.
+  bool panel_open = imgui_drawer_->IsAnyPanelOpen();
+  if (panel_open && DashboardShown()) {
+    dashboard_hidden_for_panel_ = true;
+    ShowDashboard(false);
+  } else if (!panel_open && dashboard_hidden_for_panel_) {
+    dashboard_hidden_for_panel_ = false;
+    if (!emulator_->is_title_open()) {
+      ShowDashboard(true);
     }
-    fresh.type = ext == ".iso"   ? "ISO"
-                 : ext == ".xex" ? "XEX"
-                 : ext == ".zar" ? "ZAR"
-                                 : "";
-    std::error_code ec;
-    fresh.size = std::filesystem::file_size(fresh.path, ec);
-    ReadTitleInfo(fresh);
-    library_titles_.push_back(std::move(fresh));
-    title = &library_titles_.back();
-  }
-  if (emulator_->is_title_open()) {
-    title->title_id = emulator_->title_id();
-    if (!emulator_->title_name().empty()) {
-      title->title_name = emulator_->title_name();
-    }
-  }
-  title->last_played = int64_t(time(nullptr));
-  SaveLibrary();
-  ShowDashboard(false);
-}
-
-void EmulatorWindow::AddPlayTime() {
-  if (!session_running_) {
-    return;
-  }
-  session_running_ = false;
-  int64_t seconds = std::chrono::duration_cast<std::chrono::seconds>(
-                        std::chrono::steady_clock::now() - session_start_)
-                        .count();
-  if (LibraryTitle* title = LibraryEntryMounted(session_path_)) {
-    title->seconds_played += seconds;
-    // For a multi-disc title this is the entry for the disc that is mounted
-    // now, which is the one the session ended on. Stamping it here is what
-    // makes the next launch from the library start on that disc rather than
-    // going back to disc 1.
-    title->last_played = int64_t(time(nullptr));
-    XELOGI("Library: {} played {} s this session, {} s in total (disc {})",
-           title->title_name, seconds, title->seconds_played,
-           title->disc_number);
   }
 }
 
@@ -9673,7 +9272,7 @@ std::map<uint32_t, std::string> EmulatorWindow::PatchTitles() {
   if (emulator_->is_title_open()) {
     add(emulator_->title_id(), emulator_->title_name());
   }
-  for (const LibraryTitle& title : library_titles_) {
+  for (const LibraryTitle& title : library_.titles) {
     add(title.title_id, title.title_name.empty() ? title.path.stem().string()
                                                  : title.title_name);
   }
@@ -9685,201 +9284,7 @@ std::map<uint32_t, std::string> EmulatorWindow::PatchTitles() {
   return titles;
 }
 
-namespace {
-
-const char* PatchCategoryTabName(PatchCategory category) {
-  switch (category) {
-    case PatchCategory::kCheat:
-      return "Cheats";
-    case PatchCategory::kExtra:
-      return "Extras";
-    default:
-      return "Patches";
-  }
-}
-
-const char* PatchCategoryIntro(PatchCategory category) {
-  switch (category) {
-    case PatchCategory::kCheat:
-      return "Cheats give an advantage in the game: infinite ammo or health, "
-             "god mode, everything unlocked. Most games have none.";
-    case PatchCategory::kExtra:
-      return "Extras are the game's own toys: debug menus, a free camera, "
-             "wireframe drawing, skipped intro videos.";
-    default:
-      return "Patches change how the game runs: frame rate, resolution, "
-             "filtering, broken effects.";
-  }
-}
-
-const char* PatchCategoryKeyword(PatchCategory category) {
-  switch (category) {
-    case PatchCategory::kCheat:
-      return "cheat";
-    case PatchCategory::kExtra:
-      return "extra";
-    default:
-      return "fix";
-  }
-}
-
-std::string PatchCategoryKey(const std::filesystem::path& file,
-                             const std::string& name) {
-  return file.filename().string() + "|" + name;
-}
-
-}  // namespace
-
-// The user's own placements, one per line: <category> <file> <patch>, tab
-// separated. Names never contain a tab; the file is rewritten whole.
-void EmulatorWindow::LoadPatchCategories() {
-  if (patch_categories_loaded_) {
-    return;
-  }
-  patch_categories_loaded_ = true;
-  std::ifstream in(emulator_->storage_root() / "patch_categories.txt");
-  if (!in) {
-    return;
-  }
-  std::string line;
-  while (std::getline(in, line)) {
-    size_t first = line.find('\t');
-    if (first == std::string::npos) {
-      continue;
-    }
-    size_t second = line.find('\t', first + 1);
-    if (second == std::string::npos) {
-      continue;
-    }
-    std::string keyword = line.substr(0, first);
-    std::string file = line.substr(first + 1, second - first - 1);
-    std::string name = line.substr(second + 1);
-    PatchCategory category = PatchCategory::kFix;
-    if (keyword == "cheat") {
-      category = PatchCategory::kCheat;
-    } else if (keyword == "extra") {
-      category = PatchCategory::kExtra;
-    }
-    patch_categories_[file + "|" + name] = category;
-  }
-}
-
-void EmulatorWindow::SavePatchCategories() {
-  std::filesystem::path path =
-      emulator_->storage_root() / "patch_categories.txt";
-  std::ofstream out(path, std::ios::trunc);
-  if (!out) {
-    XELOGE("Patches: cannot write {}", path.string());
-    return;
-  }
-  out << "# Where each patch entry appears in the Preferences window.\n";
-  out << "# <category>\\t<patch file>\\t<patch name>\n";
-  for (const auto& [key, category] : patch_categories_) {
-    size_t bar = key.find('|');
-    if (bar == std::string::npos) {
-      continue;
-    }
-    out << PatchCategoryKeyword(category) << '\t' << key.substr(0, bar) << '\t'
-        << key.substr(bar + 1) << '\n';
-  }
-}
-
-PatchCategory EmulatorWindow::PatchCategoryOf(const std::filesystem::path& file,
-                                              const std::string& name,
-                                              const std::string& desc) {
-  LoadPatchCategories();
-  auto it = patch_categories_.find(PatchCategoryKey(file, name));
-  if (it != patch_categories_.end()) {
-    return it->second;
-  }
-  return GuessPatchCategory(name, desc);
-}
-
-void EmulatorWindow::SetPatchCategory(const std::filesystem::path& file,
-                                      const std::string& name,
-                                      PatchCategory category) {
-  LoadPatchCategories();
-  patch_categories_[PatchCategoryKey(file, name)] = category;
-  SavePatchCategories();
-}
-
-// The guest addresses a patch entry writes, as [first, last) pairs.
-static std::vector<std::pair<uint32_t, uint32_t>> PatchWriteRanges(
-    const xe::patcher::PatchInfoEntry& patch) {
-  std::vector<std::pair<uint32_t, uint32_t>> ranges;
-  for (const auto& data : patch.patch_data) {
-    uint32_t size = uint32_t(std::max<size_t>(1, data.data.alloc_size));
-    ranges.emplace_back(data.address, data.address + size);
-  }
-  return ranges;
-}
-
-static bool PatchRangesOverlap(
-    const std::vector<std::pair<uint32_t, uint32_t>>& a,
-    const std::vector<std::pair<uint32_t, uint32_t>>& b) {
-  for (const auto& x : a) {
-    for (const auto& y : b) {
-      if (x.first < y.second && y.first < x.second) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-// Two enabled patches that write the same address fight, and whichever the
-// file loads last wins with nothing on screen to say so. Switching one on
-// switches those off and says which.
-std::vector<std::string> EmulatorWindow::DisableConflictingPatches(
-    const std::filesystem::path& file, const std::string& name) {
-  std::vector<std::string> turned_off;
-  auto* patcher = emulator_->patcher();
-  if (!patcher) {
-    return turned_off;
-  }
-  const xe::patcher::PatchInfoEntry* self = nullptr;
-  uint32_t title = 0;
-  for (const auto& f : patcher->patch_db()->GetAllPatches()) {
-    if (f.file_path != file) {
-      continue;
-    }
-    for (const auto& patch : f.patch_info) {
-      if (patch.patch_name == name) {
-        self = &patch;
-        title = f.title_id;
-      }
-    }
-  }
-  if (!self) {
-    return turned_off;
-  }
-  auto mine = PatchWriteRanges(*self);
-  for (const auto& f : patcher->patch_db()->GetAllPatches()) {
-    if (f.title_id != title) {
-      continue;
-    }
-    for (const auto& patch : f.patch_info) {
-      if (!patch.is_enabled ||
-          (f.file_path == file && patch.patch_name == name)) {
-        continue;
-      }
-      if (!PatchRangesOverlap(mine, PatchWriteRanges(patch))) {
-        continue;
-      }
-      if (SetPatchEnabledInFile(f.file_path, patch.patch_name, false)) {
-        turned_off.push_back(patch.patch_name);
-        XELOGI(
-            "Patches: switched off '{}' in {}, it writes the same "
-            "address as '{}'",
-            patch.patch_name, f.file_path.filename().string(), name);
-      }
-    }
-  }
-  if (!turned_off.empty()) {
-    patcher->patch_db()->Reload(true);
-  }
-  return turned_off;
-}
+namespace {}  // namespace
 
 void EmulatorWindow::BuildPatchesTab(void* notebook_ptr) {
   for (int index = 0; index < kPatchCategoryCount; ++index) {
@@ -10097,8 +9502,8 @@ void EmulatorWindow::RefreshPatchesTab() {
         ++file_count;
         std::vector<const xe::patcher::PatchInfoEntry*> entries;
         for (const auto& patch : file.patch_info) {
-          if (PatchCategoryOf(file.file_path, patch.patch_name,
-                              patch.patch_desc) == category) {
+          if (patch_categories_.Of(file.file_path, patch.patch_name,
+                                   patch.patch_desc) == category) {
             entries.push_back(&patch);
           }
         }
@@ -10182,8 +9587,9 @@ void EmulatorWindow::RefreshPatchesTab() {
                   patcher->patch_db()->Reload(true);
                 }
                 std::vector<std::string> dropped;
-                if (ok && on) {
-                  dropped = DisableConflictingPatches(path, name);
+                if (ok && on && emulator_->patcher()) {
+                  dropped = DisableConflictingPatches(
+                      *emulator_->patcher()->patch_db(), path, name);
                 }
                 std::string message =
                     ok ? (emulator_->is_title_open()
@@ -10226,7 +9632,7 @@ void EmulatorWindow::RefreshPatchesTab() {
                     .c_str());
             AttachSettingsCallback(
                 move, "clicked", [this, path, name, target](GtkWidget*) {
-                  SetPatchCategory(path, name, target);
+                  patch_categories_.Set(path, name, target);
                   // The click's widget is inside the list this rebuilds, so
                   // do it once the signal has returned.
                   PostToUIThread([this]() { RefreshPatchesTab(); });
@@ -10365,59 +9771,9 @@ void EmulatorWindow::LookupCommunityPatches() {
   gtk_label_set_text(GTK_LABEL(community_status_), "Looking up...");
   std::thread([this]() {
     xe::threading::set_name("Patch lookup");
-    int code = 0;
-    std::string json = RunCommandCapture(
-        fmt::format("curl -sSfL --max-time 60 -H 'User-Agent: xenia-canary' "
-                    "-H 'Accept: application/vnd.github+json' {} 2>&1",
-                    ShellQuote(kCommunityPatchesTreeUrl)),
-        &code);
     std::vector<CommunityPatchFile> files;
     std::string error;
-    if (code != 0) {
-      error = fmt::format("curl failed ({}): {}", code, json.substr(0, 200));
-    } else {
-      size_t pos = 0;
-      const std::string key = "\"path\":\"";
-      while ((pos = json.find(key, pos)) != std::string::npos) {
-        pos += key.size();
-        std::string raw;
-        size_t end = pos;
-        while (end < json.size() && json[end] != '"') {
-          if (json[end] == '\\' && end + 1 < json.size()) {
-            raw += json[end];
-            raw += json[end + 1];
-            end += 2;
-            continue;
-          }
-          raw += json[end++];
-        }
-        std::string path = JsonUnescape(raw);
-        size_t sha_pos = json.find("\"sha\":\"", end);
-        std::string sha =
-            sha_pos == std::string::npos ? "" : json.substr(sha_pos + 7, 40);
-        pos = end;
-        const std::string prefix = "patches/";
-        const std::string suffix = ".patch.toml";
-        if (path.rfind(prefix, 0) != 0 || path.size() < suffix.size() ||
-            path.compare(path.size() - suffix.size(), suffix.size(), suffix) !=
-                0) {
-          continue;
-        }
-        std::string name = path.substr(prefix.size());
-        if (name.size() < 8) {
-          continue;
-        }
-        CommunityPatchFile file;
-        file.name = name;
-        file.sha = sha;
-        file.title_id =
-            uint32_t(strtoul(name.substr(0, 8).c_str(), nullptr, 16));
-        files.push_back(std::move(file));
-      }
-      if (files.empty()) {
-        error = "No patch files in the reply: " + json.substr(0, 200);
-      }
-    }
+    FetchCommunityPatchList(&files, &error);
     PostToUIThread([this, files, error]() {
       community_lookup_running_ = false;
       if (!error.empty()) {
@@ -10428,10 +9784,6 @@ void EmulatorWindow::LookupCommunityPatches() {
         return;
       }
       community_patch_files_ = files;
-      std::sort(community_patch_files_.begin(), community_patch_files_.end(),
-                [](const CommunityPatchFile& a, const CommunityPatchFile& b) {
-                  return a.name < b.name;
-                });
       community_looked_up_ = true;
       XELOGI("Patches: community list has {} files", files.size());
       RefreshCommunityPatchList();
@@ -10439,6 +9791,7 @@ void EmulatorWindow::LookupCommunityPatches() {
   }).detach();
 }
 
+#if XE_PLATFORM_LINUX
 // Updating an AppImage from the couch.
 //
 // A Steam Deck has no comfortable way to fetch a new build: the installer
@@ -10845,65 +10198,49 @@ void EmulatorWindow::InstallUpdate() {
   }).detach();
 }
 
+#endif  // XE_PLATFORM_LINUX
+
 void EmulatorWindow::DownloadCommunityPatch(const std::string& name) {
   std::filesystem::path folder = emulator_->storage_root() / "patches";
   std::error_code ec;
   std::filesystem::create_directories(folder, ec);
   std::filesystem::path target = folder / name;
   std::filesystem::path temp = folder / (name + ".download");
-  std::string url = kCommunityPatchesRawUrl + UrlEncodeComponent(name);
   ++community_downloads_running_;
   RefreshCommunityPatchList();
-  std::thread([this, name, url, target, temp]() {
+  std::thread([this, name, target, temp]() {
     xe::threading::set_name("Patch download");
-    int code = 0;
-    std::string out = RunCommandCapture(
-        fmt::format("curl -sSfL --max-time 60 -H 'User-Agent: xenia-canary' "
-                    "-o {} {} 2>&1",
-                    ShellQuote(temp.string()), ShellQuote(url)),
-        &code);
-    PostToUIThread([this, name, target, temp, code, out]() {
+    std::string error;
+    bool ok = app::DownloadCommunityPatch(name, temp, &error);
+    PostToUIThread([this, name, target, temp, ok, error]() {
       --community_downloads_running_;
       std::error_code ec;
-      if (code != 0) {
-        XELOGE("Patches: download of {} failed ({}): {}", name, code, out);
+      if (!ok) {
+        XELOGE("Patches: download of {} failed: {}", name, error);
         std::filesystem::remove(temp, ec);
         if (community_status_) {
           gtk_label_set_text(
               GTK_LABEL(community_status_),
-              fmt::format("Download of {} failed: {}", name, out).c_str());
+              fmt::format("Download of {} failed: {}", name, error).c_str());
         }
         return;
       }
-      // Keep what was enabled in the old copy.
-      std::vector<std::string> enabled;
-      auto* patcher = emulator_->patcher();
-      if (patcher && std::filesystem::exists(target)) {
-        auto old = patcher->patch_db()->ReadPatchFile(target);
-        for (const auto& patch : old.patch_info) {
-          if (patch.is_enabled) {
-            enabled.push_back(patch.patch_name);
-          }
-        }
-      }
-      std::filesystem::rename(temp, target, ec);
-      if (ec) {
-        XELOGE("Patches: cannot move {} into place: {}", name, ec.message());
-        return;
-      }
-      for (const std::string& patch_name : enabled) {
-        SetPatchEnabledInFile(target, patch_name, true);
-      }
+      std::string sha;
       for (const CommunityPatchFile& file : community_patch_files_) {
         if (file.name == name) {
-          RecordCommunitySha(emulator_->storage_root(), name, file.sha);
+          sha = file.sha;
           break;
         }
       }
+      auto* patcher = emulator_->patcher();
+      int kept =
+          InstallCommunityPatch(patcher ? patcher->patch_db() : nullptr, temp,
+                                target, emulator_->storage_root(), name, sha);
+      if (kept < 0) {
+        return;
+      }
       XELOGI("Patches: downloaded {}{}", name,
-             enabled.empty() ? ""
-                             : fmt::format(" ({} previously enabled kept)",
-                                           enabled.size()));
+             kept ? fmt::format(" ({} previously enabled kept)", kept) : "");
       if (patcher) {
         patcher->patch_db()->Reload(true);
       }
@@ -11360,4 +10697,4 @@ void EmulatorWindow::BuildConsoleTab(void* notebook_ptr) {
 
 }  // namespace app
 }  // namespace xe
-#endif  // XE_PLATFORM_LINUX
+#endif  // XE_UI_GTK

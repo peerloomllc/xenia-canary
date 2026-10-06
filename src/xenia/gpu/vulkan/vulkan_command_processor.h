@@ -25,6 +25,7 @@
 #include "xenia/base/hash.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/draw_util.h"
+#include "xenia/gpu/fmv_replacement.h"
 #include "xenia/gpu/registers.h"
 #include "xenia/gpu/spirv_shader_translator.h"
 #include "xenia/gpu/vulkan/deferred_command_buffer.h"
@@ -154,6 +155,11 @@ class VulkanCommandProcessor final : public CommandProcessor {
   bool CaptureEdramSnapshot(std::vector<uint8_t>& out) override;
   bool RestoreEdramSnapshotSized(const void* data, size_t size,
                                  uint32_t scale_x, uint32_t scale_y) override;
+  bool CaptureGpuMemorySnapshot(
+      std::vector<GpuMemorySnapshotRange>& out) override;
+  bool RestoreGpuMemorySnapshot(
+      const std::vector<GpuMemorySnapshotRange>& ranges, uint32_t scale_x,
+      uint32_t scale_y) override;
 
   void PollCompletedSubmission() override;
 
@@ -299,6 +305,13 @@ class VulkanCommandProcessor final : public CommandProcessor {
   XE_FORCEINLINE
   virtual void WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
                                      uint32_t num_registers) override;
+  void WriteRegisterRangeFromRing(xe::RingBuffer* ring, uint32_t base,
+                                  uint32_t num_registers) override;
+  // Writes of shader constants, which games do in bulk, with the bookkeeping
+  // of WriteRegister done once for the range. False if the range isn't only
+  // float or only fetch constants (then nothing is written).
+  bool WriteConstantRange(uint32_t start_index, const uint32_t* values,
+                          uint32_t count);
 
   void OnGammaRamp256EntryTableValueWritten() override;
   void OnGammaRampPWLValueWritten() override;
@@ -387,14 +400,19 @@ class VulkanCommandProcessor final : public CommandProcessor {
     explicit PipelineLayout(
         VkPipelineLayout pipeline_layout,
         VkDescriptorSetLayout descriptor_set_layout_textures_vertex_ref,
-        VkDescriptorSetLayout descriptor_set_layout_textures_pixel_ref)
+        VkDescriptorSetLayout descriptor_set_layout_textures_pixel_ref,
+        VkPipelineLayout round_7e3_alpha_pipeline_layout = VK_NULL_HANDLE)
         : pipeline_layout_(pipeline_layout),
+          round_7e3_alpha_pipeline_layout_(round_7e3_alpha_pipeline_layout),
           descriptor_set_layout_textures_vertex_ref_(
               descriptor_set_layout_textures_vertex_ref),
           descriptor_set_layout_textures_pixel_ref_(
               descriptor_set_layout_textures_pixel_ref) {}
     VkPipelineLayout GetPipelineLayout() const override {
       return pipeline_layout_;
+    }
+    VkPipelineLayout GetRound7e3AlphaPipelineLayout() const override {
+      return round_7e3_alpha_pipeline_layout_;
     }
     VkDescriptorSetLayout descriptor_set_layout_textures_vertex_ref() const {
       return descriptor_set_layout_textures_vertex_ref_;
@@ -405,6 +423,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
    private:
     VkPipelineLayout pipeline_layout_;
+    VkPipelineLayout round_7e3_alpha_pipeline_layout_;
     VkDescriptorSetLayout descriptor_set_layout_textures_vertex_ref_;
     VkDescriptorSetLayout descriptor_set_layout_textures_pixel_ref_;
   };
@@ -750,6 +769,33 @@ class VulkanCommandProcessor final : public CommandProcessor {
       constants_transient_descriptors_used_;
   std::vector<VkDescriptorSet> constants_transient_descriptors_free_;
 
+  // The constant buffers are dynamic uniform buffers, all covering
+  // constants_dynamic_range_ bytes from the start of their upload pages
+  // (uniform_buffer_pool_ keeps that much free at the end of every page), so
+  // a draw only changes the dynamic offsets, and there is one descriptor set
+  // per combination of pages, written once.
+  uint32_t constants_dynamic_range_ = 0;
+  struct ConstantsDescriptorSetKey {
+    VkBuffer buffers[SpirvShaderTranslator::kConstantBufferCount];
+    bool operator==(const ConstantsDescriptorSetKey& other) const {
+      return !std::memcmp(buffers, other.buffers, sizeof(buffers));
+    }
+    struct Hasher {
+      size_t operator()(const ConstantsDescriptorSetKey& key) const {
+        return size_t(XXH3_64bits(key.buffers, sizeof(key.buffers)));
+      }
+    };
+  };
+  std::unordered_map<ConstantsDescriptorSetKey, VkDescriptorSet,
+                     ConstantsDescriptorSetKey::Hasher>
+      constants_descriptor_sets_;
+  std::vector<VkDescriptorPool> constants_descriptor_pools_;
+  uint32_t constants_descriptor_pool_sets_left_ = 0;
+  uint32_t current_constant_buffer_dynamic_offsets_
+      [SpirvShaderTranslator::kConstantBufferCount] = {};
+  VkDescriptorSet GetConstantsDescriptorSet();
+  void ClearConstantsDescriptorSets();
+
   ui::vulkan::LinkedTypeDescriptorSetAllocator
       transient_descriptor_allocator_textures_;
   std::deque<UsedTextureTransientDescriptorSet>
@@ -796,6 +842,43 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // host-visible.
   VkDeviceMemory gamma_ramp_upload_buffer_memory_ = VK_NULL_HANDLE;
   VkBuffer gamma_ramp_upload_buffer_ = VK_NULL_HANDLE;
+
+  // FMV replacement (fmv_replacement.h): the replacement frame, uploaded in
+  // place of the swap texture.
+  VkImageView UploadFmvFrame(const FmvReplacement::Frame& frame,
+                             uint32_t dst_width, uint32_t dst_height);
+  void DestroyFmvResources();
+  VkImage fmv_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory fmv_image_memory_ = VK_NULL_HANDLE;
+  VkImage fmv_scaled_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory fmv_scaled_image_memory_ = VK_NULL_HANDLE;
+  VkImageView fmv_scaled_image_view_ = VK_NULL_HANDLE;
+  uint32_t fmv_scaled_width_ = 0;
+  uint32_t fmv_scaled_height_ = 0;
+  bool fmv_scaled_written_ = false;
+  bool fmv_linear_blit_ = true;
+  uint64_t fmv_last_draw_count_ = 0;
+  // A thumbnail of the guest's own frame, read back for the picture match.
+  void CaptureFmvThumbnail(VkImage guest_image, uint32_t guest_width,
+                           uint32_t guest_height);
+  VkImage fmv_thumb_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory fmv_thumb_memory_ = VK_NULL_HANDLE;
+  uint32_t fmv_thumb_memory_type_ = UINT32_MAX;
+  VkDeviceSize fmv_thumb_memory_size_ = 0;
+  VkDeviceSize fmv_thumb_row_pitch_ = 0;
+  void* fmv_thumb_mapping_ = nullptr;
+  uint64_t fmv_thumb_submission_ = 0;
+  bool fmv_thumb_pending_ = false;
+  bool fmv_thumb_unusable_ = false;
+  VkBuffer fmv_upload_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory fmv_upload_memory_ = VK_NULL_HANDLE;
+  uint32_t fmv_upload_memory_type_ = UINT32_MAX;
+  VkDeviceSize fmv_upload_memory_size_ = 0;
+  void* fmv_upload_mapping_ = nullptr;
+  uint32_t fmv_width_ = 0;
+  uint32_t fmv_height_ = 0;
+  uint64_t fmv_frame_id_ = 0;
+  bool fmv_image_written_ = false;
   VkDeviceSize gamma_ramp_upload_memory_size_;
   uint32_t gamma_ramp_upload_memory_type_;
   // Mapping of either gamma_ramp_buffer_memory_ (if it's host-visible) or
@@ -921,6 +1004,9 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // primitive processor for the current draw. Not a register, so changes
   // between draws invalidate the buffer separately from WriteRegister.
   xenos::Endian current_tessellation_index_endian_ = xenos::Endian::kNone;
+  // A source register of the tessellation constant buffer was written since
+  // it was last invalidated.
+  bool tessellation_constants_stale_ = true;
   VkDescriptorSet current_graphics_descriptor_sets_
       [SpirvShaderTranslator::kDescriptorSetCount];
   // Whether descriptor sets in current_graphics_descriptor_sets_ point to
@@ -942,6 +1028,114 @@ class VulkanCommandProcessor final : public CommandProcessor {
       SpirvShaderTranslator::kDescriptorSetCount <=
           sizeof(current_graphics_descriptor_sets_bound_up_to_date_) * CHAR_BIT,
       "Bit fields storing descriptor set validity must be large enough");
+
+  // The last draw that can be repeated with only VGT_INDX_OFFSET changed
+  // (fast_draw_valid_ in CommandProcessor says whether it still can be).
+  bool TryFastRepeatDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
+                         IndexBufferInfo* index_buffer_info,
+                         bool major_mode_explicit);
+  // k_2_10_10_10_FLOAT alpha rounding (VulkanRenderTargetCache::
+  // Round7e3Alpha) of draws that don't overlap, waiting until something may
+  // read those pixels.
+  void FlushPendingRound7e3Alpha();
+  static constexpr uint32_t kMaxPendingRound7e3Alpha = 64;
+  VkRect2D pending_round_7e3_alpha_rects_[kMaxPendingRound7e3Alpha];
+  uint32_t pending_round_7e3_alpha_count_ = 0;
+  uint32_t pending_round_7e3_alpha_rt_mask_ = 0;
+  uint32_t pending_round_7e3_alpha_surface_info_ = 0;
+  uint32_t pending_round_7e3_alpha_color_info_[xenos::kMaxColorRenderTargets] =
+      {};
+
+  // Records the index offset push constant for the next guest draw if it is
+  // not the last value pushed.
+  void PushVertexBaseIndex();
+  int32_t pushed_vertex_base_index_ = 0;
+  uint64_t pushed_vertex_base_index_generation_ = UINT64_MAX;
+
+  struct FastDraw {
+    xenos::PrimitiveType prim_type;
+    uint32_t index_count;
+    bool major_mode_explicit;
+    bool indexed;
+    IndexBufferInfo index_buffer_info;
+    uint64_t submission;
+    Shader* active_vertex_shader;
+    Shader* active_pixel_shader;
+    VulkanShader* vertex_shader;
+    VulkanShader* pixel_shader;
+    VulkanPipelineCache::Pipeline* pipeline;
+    PrimitiveProcessor::ProcessingResult primitive_processing_result;
+    // Fetch constant slots the shaders sample textures from.
+    uint32_t texture_fetch_mask;
+    uint32_t vfetch_count;
+    uint8_t vfetch_indices[96];
+    uint32_t vfetch_addresses[96];
+    uint32_t vfetch_sizes[96];
+    // For the batched variant of the draw (see DrawBatch).
+    uint64_t vertex_shader_modification;
+    uint64_t pixel_shader_modification;
+    reg::RB_DEPTHCONTROL normalized_depth_control;
+    uint32_t normalized_color_mask;
+    VulkanRenderTargetCache::RenderPassKey render_pass_key;
+    // 0 - not looked up yet, 1 - batch_pipeline is set, 2 - can't be batched.
+    uint8_t batch_pipeline_state;
+    VulkanPipelineCache::Pipeline* batch_pipeline;
+  };
+  FastDraw fast_draw_;
+
+  // A run of draws that repeat the remembered one with the same state apart
+  // from the vertex count, the pixel shader float constants and the address
+  // of the one vertex fetch constant, at or after that of the run's first
+  // draw (Blue Dragon draws thousands of small water quads like this). The run
+  // is drawn with a variant of the pipeline whose pixel shader takes its float
+  // constants from an array indexed by the instance, and every draw of the run
+  // is recorded as one host draw of one instance, with the instance index
+  // selecting its constants and the first vertex selecting its vertex data, so
+  // no constants or descriptors are updated between them.
+  struct DrawBatch {
+    bool active = false;
+    uint64_t submission;
+    VkPipeline pipeline;
+    uint32_t instance_count;
+    uint32_t capacity;
+    uint32_t vfetch_index;
+    // Of the first draw's vertex data, in dwords.
+    uint32_t base_address;
+    // In dwords.
+    uint32_t stride;
+    // Vertices from base_address the batch's fetch constant covers.
+    uint32_t window_vertices;
+    xenos::Endian vfetch_endian;
+    uint32_t vertex_base_index;
+    uint32_t pixel_float_constant_count;
+    uint8_t* pixel_float_constants;
+    // The texture fetch constants, which may change only in the base address
+    // (another texture of the same format and sampling) within the batch.
+    uint32_t fetch_constants[xenos::kTextureFetchConstantCount * 6];
+    // What the texture-dependent system constants were made from.
+    uint32_t texture_host_swizzles[xenos::kTextureFetchConstantCount];
+    uint32_t texture_signs_and_scaling[xenos::kTextureFetchConstantCount];
+    uint32_t texture_integer_scale_bits[xenos::kTextureFetchConstantCount];
+  };
+  // Whether the active textures give the texture-dependent system constants
+  // the batch was started with.
+  bool AreBatchTextureConstantsSame() const;
+  void SaveBatchTextureConstants();
+  DrawBatch draw_batch_;
+  // Appends the draw to the current batch or starts one; false if it can't
+  // be batched.
+  bool TryBatchDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
+                    IndexBufferInfo* index_buffer_info,
+                    bool major_mode_explicit);
+  // Before anything else draws: the batch's constant buffers must not be
+  // reused by other draws.
+  void EndDrawBatch();
+
+  // What was last written into each stage's texture descriptor set (vertex,
+  // pixel), to reuse the set while the draws keep the same bindings.
+  std::vector<VkDescriptorImageInfo> texture_set_written_infos_[2];
+  VkDescriptorSetLayout texture_set_written_layout_[2] = {};
+  uint64_t texture_set_written_submission_[2] = {};
 
   // Float constant usage masks of the last draw call.
   uint64_t current_float_constant_map_vertex_[4];

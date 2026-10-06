@@ -19,6 +19,10 @@
 #include "xenia/ui/virtual_key.h"
 #include "xenia/ui/windowed_app_context_win.h"
 
+#if XE_UI_GTK
+#include <glib.h>
+#endif
+
 #include <Dbt.h>
 #include <ShellScalingApi.h>
 #include <dwmapi.h>
@@ -45,6 +49,12 @@ Win32Window::Win32Window(WindowedAppContext& app_context,
 
 Win32Window::~Win32Window() {
   EnterDestructor();
+#if XE_UI_GTK
+  if (paint_idle_source_) {
+    g_source_remove(paint_idle_source_);
+    paint_idle_source_ = 0;
+  }
+#endif
   if (cursor_auto_hide_timer_) {
     DeleteTimerQueueTimer(nullptr, cursor_auto_hide_timer_, nullptr);
     cursor_auto_hide_timer_ = nullptr;
@@ -556,7 +566,32 @@ std::unique_ptr<Surface> Win32Window::CreateSurfaceImpl(
   return nullptr;
 }
 
-void Win32Window::RequestPaintImpl() { InvalidateRect(hwnd_, nullptr, false); }
+void Win32Window::RequestPaintImpl() {
+#if XE_UI_GTK
+  // With GTK running the UI thread runs a GLib main loop, and GDK's event
+  // source dispatches Win32 messages until the queue is empty. A window that
+  // is invalidated again from each of its paints, as the presenter does
+  // every frame, never lets it empty, so GLib's timeouts and idles, GTK's
+  // drawing among them, would never run. Invalidate from a GLib idle
+  // instead, which gives the rest of the loop a turn between paints.
+  if (static_cast<Win32WindowedAppContext&>(app_context()).gtk_available()) {
+    if (!paint_idle_source_) {
+      paint_idle_source_ = g_idle_add(
+          [](gpointer data) -> gboolean {
+            auto* window = static_cast<Win32Window*>(data);
+            window->paint_idle_source_ = 0;
+            if (window->hwnd_) {
+              InvalidateRect(window->hwnd_, nullptr, false);
+            }
+            return G_SOURCE_REMOVE;
+          },
+          this);
+    }
+    return;
+  }
+#endif
+  InvalidateRect(hwnd_, nullptr, false);
+}
 
 BOOL Win32Window::AdjustWindowRectangle(RECT& rect, DWORD style, BOOL menu,
                                         DWORD ex_style, UINT dpi) const {
@@ -925,6 +960,20 @@ bool Win32Window::HandleKeyboard(
       break;
     case WM_KEYUP:
       OnKeyUp(e, destruction_receiver);
+      break;
+    // Windows sends F10 as a system key (it activates the menu bar), so a
+    // hotkey on it, the load state one by default, never fired. Pass it on
+    // like any key; if nothing handles it, it still opens the menu. Alt
+    // combinations stay with Windows.
+    case WM_SYSKEYDOWN:
+      if (wParam == VK_F10 && !(GetKeyState(VK_MENU) & 0x80)) {
+        OnKeyDown(e, destruction_receiver);
+      }
+      break;
+    case WM_SYSKEYUP:
+      if (wParam == VK_F10 && !(GetKeyState(VK_MENU) & 0x80)) {
+        OnKeyUp(e, destruction_receiver);
+      }
       break;
     case WM_CHAR:
       OnKeyChar(e, destruction_receiver);

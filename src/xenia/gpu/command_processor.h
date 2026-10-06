@@ -219,8 +219,33 @@ class CommandProcessor {
   // Uploads the snapshot Restore() read, if any; worker thread.
   void RestoreSavedEdramSnapshot();
 
+  // Save states (format 10): memory that only the GPU holds. Resolves and
+  // memexport write the host GPU's copy of guest memory (or, with a
+  // resolution scale, the scaled resolve buffers) and not guest memory
+  // unless readback_resolve is on, so a restore that reloads guest memory
+  // loses them. `scaled` ranges carry length * scale_x * scale_y bytes.
+  struct GpuMemorySnapshotRange {
+    uint32_t start = 0;
+    uint32_t length = 0;
+    bool scaled = false;
+    std::vector<uint8_t> data;
+  };
+  virtual bool CaptureGpuMemorySnapshot(
+      std::vector<GpuMemorySnapshotRange>& out) {
+    return false;
+  }
+  virtual bool RestoreGpuMemorySnapshot(
+      const std::vector<GpuMemorySnapshotRange>& ranges, uint32_t scale_x,
+      uint32_t scale_y) {
+    return false;
+  }
+  // Uploads the ranges Restore() read, if any; worker thread, after the
+  // caches were cleared.
+  void RestoreSavedGpuMemorySnapshot();
+
   bool Save(ByteStream* stream);
-  bool Restore(ByteStream* stream, bool has_edram_snapshot);
+  bool Restore(ByteStream* stream, bool has_edram_snapshot,
+               bool has_gpu_memory_snapshot);
 
  protected:
   struct IndexBufferInfo {
@@ -532,6 +557,28 @@ class CommandProcessor {
   }
 
  protected:
+  // Set by a backend after a draw it can repeat cheaply; cleared by any
+  // register write other than VGT_INDX_OFFSET and the shader constants and by
+  // any packet other than draws and constant writes, so a following draw that
+  // only moved the index offset or changed constants can skip the full state
+  // setup.
+  bool fast_draw_valid_ = false;
+  // Shader constant changes since that draw, noted by the backend when a
+  // write changes a value: vertex fetch constants (bit per vertex fetch
+  // constant, 3 per fetch constant slot), used vertex shader float constants,
+  // bool and loop constants. Pixel shader float constants aren't noted.
+  uint32_t fast_draw_vfetch_changed_[3] = {};
+  bool fast_draw_vertex_float_changed_ = false;
+  bool fast_draw_bool_loop_changed_ = false;
+  void SetFastDrawValid() {
+    fast_draw_valid_ = true;
+    fast_draw_vfetch_changed_[0] = 0;
+    fast_draw_vfetch_changed_[1] = 0;
+    fast_draw_vfetch_changed_[2] = 0;
+    fast_draw_vertex_float_changed_ = false;
+    fast_draw_bool_loop_changed_ = false;
+  }
+
   // Scale area for the segment being closed.
   uint32_t GetZPDScaleArea() const {
     return zpd_active_segment_.scale_area
@@ -582,6 +629,7 @@ class CommandProcessor {
   std::vector<uint8_t> edram_snapshot_;
   uint32_t edram_snapshot_scale_x_ = 1;
   uint32_t edram_snapshot_scale_y_ = 1;
+  std::vector<GpuMemorySnapshotRange> gpu_memory_snapshot_;
 
   // By default (such as for tools), post-processing is disabled.
   // "Desired" is for the external thread managing the post-processing effect.

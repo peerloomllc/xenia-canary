@@ -123,6 +123,12 @@ void SpirvShaderTranslator::Reset() {
   builder_.reset();
 
   uniform_float_constants_ = spv::NoResult;
+  push_constants_ = spv::NoResult;
+
+  input_instance_index_ = spv::NoResult;
+  output_instance_index_ = spv::NoResult;
+  input_pixel_instance_index_ = spv::NoResult;
+  main_float_constant_instance_base_ = spv::NoResult;
 
   // Vertex shader inputs.
   input_vertex_index_ = spv::NoResult;
@@ -155,6 +161,7 @@ void SpirvShaderTranslator::Reset() {
   var_main_kill_pixel_ = spv::NoResult;
   var_main_fsi_color_written_ = spv::NoResult;
   std::ranges::fill(output_fragment_data_, spv::NoResult);
+  std::ranges::fill(output_fragment_data_companion_, spv::NoResult);
   output_or_var_fragment_depth_ = spv::NoResult;
   output_fragment_depth_ = spv::NoResult;
   main_fbo_depth_unbiased_ = spv::NoResult;
@@ -371,6 +378,23 @@ void SpirvShaderTranslator::StartTranslation() {
     main_interface_.push_back(uniform_system_constants_);
   }
 
+  if (IsSpirvVertexShader()) {
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(type_int_);
+    spv::Id type_push_constants =
+        builder_->makeStructType(id_vector_temp_, "XePushConstants");
+    builder_->addMemberName(type_push_constants, 0, "vertex_base_index");
+    builder_->addMemberDecoration(type_push_constants, 0, spv::DecorationOffset,
+                                  0);
+    builder_->addDecoration(type_push_constants, spv::DecorationBlock);
+    push_constants_ = builder_->createVariable(
+        spv::NoPrecision, spv::StorageClassPushConstant, type_push_constants,
+        "xe_push_constants");
+    if (features_.spirv_version >= spv::Spv_1_4) {
+      main_interface_.push_back(push_constants_);
+    }
+  }
+
   bool memexport_used = IsMemoryExportUsed();
 
   if (!is_depth_only_fragment_shader_) {
@@ -378,9 +402,15 @@ void SpirvShaderTranslator::StartTranslation() {
     uint32_t float_constant_count =
         current_shader().constant_register_map().float_count;
     if (float_constant_count) {
+      // With per-instance float constants, the blocks of all the instances.
+      uint32_t float_constant_array_length = float_constant_count;
+      if (is_pixel_shader() &&
+          GetSpirvShaderModification().pixel.float_constants_per_instance) {
+        float_constant_array_length = kFloatConstantsPerInstanceMaxVectors;
+      }
       id_vector_temp_.clear();
       id_vector_temp_.push_back(builder_->makeArrayType(
-          type_float4_, builder_->makeUintConstant(float_constant_count),
+          type_float4_, builder_->makeUintConstant(float_constant_array_length),
           sizeof(float) * 4));
       // Currently (as of October 24, 2020) makeArrayType only uses the stride
       // to check if deduplication can be done - the array stride decoration
@@ -1370,6 +1400,21 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
     builder_->addDecoration(input_vertex_index_, spv::DecorationBuiltIn,
                             static_cast<int>(spv::BuiltIn::VertexIndex));
     main_interface_.push_back(input_vertex_index_);
+    if (GetSpirvShaderModification().vertex.output_instance_index) {
+      input_instance_index_ =
+          builder_->createVariable(spv::NoPrecision, spv::StorageClassInput,
+                                   type_int_, "gl_InstanceIndex");
+      builder_->addDecoration(input_instance_index_, spv::DecorationBuiltIn,
+                              static_cast<int>(spv::BuiltIn::InstanceIndex));
+      main_interface_.push_back(input_instance_index_);
+      output_instance_index_ =
+          builder_->createVariable(spv::NoPrecision, spv::StorageClassOutput,
+                                   type_int_, "xe_out_instance_index");
+      builder_->addDecoration(output_instance_index_, spv::DecorationLocation,
+                              int(kInstanceIndexLocation));
+      builder_->addDecoration(output_instance_index_, spv::DecorationFlat);
+      main_interface_.push_back(output_instance_index_);
+    }
   }
 
   uint32_t output_location = 0;
@@ -1520,6 +1565,12 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
 
 void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
   Modification shader_modification = GetSpirvShaderModification();
+
+  if (output_instance_index_ != spv::NoResult) {
+    builder_->createStore(
+        builder_->createLoad(input_instance_index_, spv::NoPrecision),
+        output_instance_index_);
+  }
 
   // The edge flag isn't used for any purpose by the translator.
   if (current_shader().writes_point_size_edge_flag_kill_vertex() & 0b101) {
@@ -1955,14 +2006,13 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
           builder_->createUnaryOp(spv::OpBitcast, type_int_, vertex_index);
       // Add the base to the index.
       id_vector_temp_.clear();
-      id_vector_temp_.push_back(
-          builder_->makeIntConstant(kSystemConstantVertexBaseIndex));
+      id_vector_temp_.push_back(const_int_0_);
       vertex_index = builder_->createBinOp(
           spv::OpIAdd, type_int_, vertex_index,
-          builder_->createLoad(builder_->createAccessChain(
-                                   spv::StorageClassUniform,
-                                   uniform_system_constants_, id_vector_temp_),
-                               spv::NoPrecision));
+          builder_->createLoad(
+              builder_->createAccessChain(spv::StorageClassPushConstant,
+                                          push_constants_, id_vector_temp_),
+              spv::NoPrecision));
       // Write the index to r0.x as float.
       id_vector_temp_.clear();
       id_vector_temp_.push_back(const_int_0_);
@@ -2542,6 +2592,19 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
       }
     }
 
+    // Batched draws: the instance index for the float constants.
+    if (shader_modification.pixel.float_constants_per_instance &&
+        current_shader().constant_register_map().float_count) {
+      input_pixel_instance_index_ =
+          builder_->createVariable(spv::NoPrecision, spv::StorageClassInput,
+                                   type_int_, "xe_in_instance_index");
+      builder_->addDecoration(input_pixel_instance_index_,
+                              spv::DecorationLocation,
+                              int(kInstanceIndexLocation));
+      builder_->addDecoration(input_pixel_instance_index_, spv::DecorationFlat);
+      main_interface_.push_back(input_pixel_instance_index_);
+    }
+
     // Point coordinate input.
     if (shader_modification.pixel.param_gen_point) {
       if (param_gen_needed) {
@@ -2618,6 +2681,7 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
     // to the Output variables at the end.
     if (!edram_fragment_shader_interlock_) {
       std::ranges::fill(output_fragment_data_, spv::NoResult);
+      std::ranges::fill(output_fragment_data_companion_, spv::NoResult);
       static const char* const kFragmentDataOutputNames[] = {
           "xe_out_fragment_data_0",
           "xe_out_fragment_data_1",
@@ -2642,6 +2706,28 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
         builder_->addDecoration(output_fragment_data_rt,
                                 spv::DecorationInvariant);
         main_interface_.push_back(output_fragment_data_rt);
+      }
+      static const char* const kFragmentDataCompanionOutputNames[] = {
+          "xe_out_fragment_data_companion_0",
+          "xe_out_fragment_data_companion_1",
+          "xe_out_fragment_data_companion_2",
+          "xe_out_fragment_data_companion_3",
+      };
+      uint32_t companions_remaining =
+          shader_modification.pixel.color_7e3_alpha_companion
+              ? current_shader().writes_color_targets()
+              : 0;
+      while (xe::bit_scan_forward(companions_remaining, &color_target_index)) {
+        companions_remaining &= ~(UINT32_C(1) << color_target_index);
+        spv::Id output_companion = builder_->createVariable(
+            spv::NoPrecision, spv::StorageClassOutput, type_float4_,
+            kFragmentDataCompanionOutputNames[color_target_index]);
+        output_fragment_data_companion_[color_target_index] = output_companion;
+        builder_->addDecoration(
+            output_companion, spv::DecorationLocation,
+            int(xenos::kMaxColorRenderTargets + color_target_index));
+        builder_->addDecoration(output_companion, spv::DecorationInvariant);
+        main_interface_.push_back(output_companion);
       }
     }
   }
@@ -2677,6 +2763,14 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
 }
 
 void SpirvShaderTranslator::StartFragmentShaderInMain() {
+  if (input_pixel_instance_index_ != spv::NoResult) {
+    main_float_constant_instance_base_ = builder_->createBinOp(
+        spv::OpIMul, type_int_,
+        builder_->createLoad(input_pixel_instance_index_, spv::NoPrecision),
+        builder_->makeIntConstant(
+            int(current_shader().constant_register_map().float_count)));
+  }
+
   // TODO(Triang3l): With sample shading (for depth format conversion) only
   // for the bottom-right sample (unlike in Direct3D, the sample mask input
   // doesn't include covered samples of the primitive that correspond to other
@@ -3192,6 +3286,10 @@ spv::Id SpirvShaderTranslator::LoadOperandStorage(
       break;
     case InstructionStorageSource::kConstantFloat:
       assert_true(uniform_float_constants_ != spv::NoResult);
+      if (main_float_constant_instance_base_ != spv::NoResult) {
+        index = builder_->createBinOp(spv::OpIAdd, type_int_, index,
+                                      main_float_constant_instance_base_);
+      }
       id_vector_temp_util_.clear();
       // The first and the only structure member.
       id_vector_temp_util_.push_back(const_int_0_);

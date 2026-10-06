@@ -27,6 +27,16 @@ class SharedMemory {
   // Call in the implementation-specific ClearCache.
   virtual void ClearCache();
   virtual void SetSystemPageBlocksValidWithGpuDataWritten();
+  // clear_memory_page_state in one batch: RequestRange records the pages it
+  // is asked for while tracking is on; this invalidates like
+  // SetSystemPageBlocksValidWithGpuDataWritten and keeps the pages that were
+  // used since the last call and are not GPU-written, for
+  // UploadPendingRefresh to upload in one go before they are requested again
+  // (one upload at the start of a frame instead of one per draw, each of
+  // which would end the render pass).
+  void SetSystemPageBlocksValidWithGpuDataWrittenAndCollectUsed();
+  bool UploadPendingRefresh();
+  void set_track_page_use(bool track) { track_page_use_ = track; }
 
   typedef void (*GlobalWatchCallback)(
       const global_unique_lock_type& global_lock, void* context,
@@ -104,6 +114,9 @@ class SharedMemory {
   // the pages they touch, the CPU data is properly loaded to the unmodified
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
+  // Runs of pages that hold data written on the GPU, as (start, length) in
+  // bytes, ascending. For save states.
+  std::vector<std::pair<uint32_t, uint32_t>> GetGpuWrittenRanges();
 
  protected:
   SharedMemory(Memory& memory);
@@ -215,6 +228,12 @@ class SharedMemory {
 
   uint64_t *system_page_flags_valid_ = nullptr,
            *system_page_flags_valid_and_gpu_written_ = nullptr;
+  // Pages requested since the last batched invalidation, and the pages that
+  // invalidation left to upload.
+  std::vector<uint64_t> system_page_flags_used_;
+  std::vector<uint64_t> system_page_flags_pending_refresh_;
+  bool track_page_use_ = false;
+  bool pending_refresh_ = false;
   unsigned num_system_page_flags_ = 0;
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
       void* context_ptr, uint32_t physical_address_start, uint32_t length,

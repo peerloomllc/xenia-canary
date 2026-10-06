@@ -27,7 +27,11 @@ DeferredCommandBuffer::DeferredCommandBuffer(
   command_stream_.reserve(initial_size / sizeof(uintmax_t));
 }
 
-void DeferredCommandBuffer::Reset() { command_stream_.clear(); }
+void DeferredCommandBuffer::Reset() {
+  command_stream_.clear();
+  ++push_constants_generation_;
+  bound_index_buffer_ = VK_NULL_HANDLE;
+}
 
 void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES

@@ -15,6 +15,12 @@
 namespace xe {
 namespace vfs {
 
+// Called on every read of a disc image file with the file's name, the offset
+// in the file and the bytes read. Set by the emulator; null for none.
+using DiscReadObserver = void (*)(const std::string& name, uint64_t offset,
+                                  uint64_t length);
+void SetDiscReadObserver(DiscReadObserver observer);
+
 class DiscImageEntry;
 
 class DiscImageFile : public File {

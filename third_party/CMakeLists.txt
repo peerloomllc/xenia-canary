@@ -193,11 +193,6 @@ add_library(pugixml STATIC
 target_include_directories(pugixml PUBLIC pugixml/src)
 
 # ==============================================================================
-# qrcodegen (QR codes for the Support Development dialog; MIT, Project Nayuki)
-add_library(qrcodegen STATIC ${CMAKE_CURRENT_SOURCE_DIR}/qrcodegen/qrcodegen.cpp)
-target_include_directories(qrcodegen PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
-set_target_properties(qrcodegen PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
 # soundtouch (time-stretching for fast-forward audio)
 # ==============================================================================
 file(GLOB _soundtouch_sources ${CMAKE_CURRENT_SOURCE_DIR}/soundtouch/source/SoundTouch/*.cpp)
@@ -261,6 +256,13 @@ if(MSVC)
   target_compile_options(reshade-fx PRIVATE /Zc:char8_t-)
 endif()
 
+# The nested configures below generate headers into the submodules; a
+# cross-compile has to hand them the same toolchain.
+set(_xe_subconfigure_args)
+if(CMAKE_TOOLCHAIN_FILE)
+  list(APPEND _xe_subconfigure_args "-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}")
+endif()
+
 # snappy
 # ==============================================================================
 # Generate snappy-stubs-public.h if missing
@@ -272,6 +274,7 @@ if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/snappy/snappy-stubs-public.h")
   endif()
   execute_process(
     COMMAND ${CMAKE_COMMAND}
+      ${_xe_subconfigure_args}
       -DSNAPPY_BUILD_TESTS=OFF
       -DSNAPPY_BUILD_BENCHMARKS=OFF
       ${_snappy_avx_flag}
@@ -354,6 +357,7 @@ endforeach()
 if(_zlibng_needs_configure)
   execute_process(
     COMMAND ${CMAKE_COMMAND}
+      ${_xe_subconfigure_args}
       -DZLIB_ENABLE_TESTS=OFF
       -DWITH_GTEST=OFF
       ${CMAKE_CURRENT_SOURCE_DIR}/zlib-ng
@@ -400,7 +404,8 @@ else()
     X86_AVX512VNNI
     WITH_GZFILEOP
   )
-  if(NOT MSVC)
+  # clang-cl defines MSVC but, like GCC/Clang, needs the per-file ISA flags.
+  if(NOT MSVC OR CMAKE_C_COMPILER_ID STREQUAL "Clang")
     # GCC/Clang have native __builtin_ctz/__builtin_ctzll (MSVC gets these
     # from fallback_builtins.h). Defining these enables optimized compare256
     # and longest_match codepaths.
@@ -807,6 +812,23 @@ add_library(libavcodec STATIC
   FFmpeg/libavcodec/mpegaudiodec_fixed.c
   FFmpeg/libavcodec/mpegaudiodec_float.c
   FFmpeg/libavcodec/wmaprodec.c
+  FFmpeg/libavcodec/vp9.c
+  FFmpeg/libavcodec/vp9data.c
+  FFmpeg/libavcodec/vp9dsp.c
+  FFmpeg/libavcodec/vp9lpf.c
+  FFmpeg/libavcodec/vp9recon.c
+  FFmpeg/libavcodec/vp9block.c
+  FFmpeg/libavcodec/vp9prob.c
+  FFmpeg/libavcodec/vp9mvs.c
+  FFmpeg/libavcodec/vpx_rac.c
+  FFmpeg/libavcodec/vp9dsp_8bpp.c
+  FFmpeg/libavcodec/vp9dsp_10bpp.c
+  FFmpeg/libavcodec/vp9dsp_12bpp.c
+  FFmpeg/libavcodec/videodsp.c
+  FFmpeg/libavcodec/vp9_parser.c
+  FFmpeg/libavcodec/cbs.c
+  FFmpeg/libavcodec/cbs_vp9.c
+  FFmpeg/libavcodec/bsf/vp9_superframe_split.c
   FFmpeg/libavcodec/wma.c
   FFmpeg/libavcodec/wma_common.c
   FFmpeg/libavcodec/wmadec.c
@@ -887,6 +909,7 @@ add_library(libavformat STATIC
   FFmpeg/libavformat/demux_utils.c
   FFmpeg/libavformat/urldecode.c
   FFmpeg/libavformat/asf_tags.c
+  FFmpeg/libavformat/ivfdec.c
   FFmpeg/libavformat/to_upper4.c
 )
 if(WIN32)

@@ -657,6 +657,33 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(
 VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
     const VulkanShader::SamplerBinding& binding) const {
   const auto& regs = register_file();
+  const uint32_t* fetch_words =
+      &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 +
+                   binding.fetch_constant * 6];
+  uint32_t binding_bits = 0;
+  static_assert(sizeof(binding) <= sizeof(binding_bits));
+  std::memcpy(&binding_bits, &binding, sizeof(binding));
+  int32_t anisotropic_override = cvars::anisotropic_override;
+  SamplerParametersCacheEntry& cache_entry =
+      sampler_parameters_cache_[binding.fetch_constant];
+  if (cache_entry.valid && cache_entry.binding == binding_bits &&
+      cache_entry.anisotropic_override == anisotropic_override &&
+      !std::memcmp(cache_entry.fetch, fetch_words, sizeof(cache_entry.fetch))) {
+    return cache_entry.parameters;
+  }
+  SamplerParameters parameters = ComputeSamplerParameters(binding);
+  std::memcpy(cache_entry.fetch, fetch_words, sizeof(cache_entry.fetch));
+  cache_entry.binding = binding_bits;
+  cache_entry.anisotropic_override = anisotropic_override;
+  cache_entry.parameters = parameters;
+  cache_entry.valid = true;
+  return parameters;
+}
+
+VulkanTextureCache::SamplerParameters
+VulkanTextureCache::ComputeSamplerParameters(
+    const VulkanShader::SamplerBinding& binding) const {
+  const auto& regs = register_file();
   xenos::xe_gpu_texture_fetch_t fetch =
       regs.GetTextureFetch(binding.fetch_constant);
 
@@ -971,7 +998,7 @@ uint64_t VulkanTextureCache::GetSubmissionToAwaitOnSamplerOverflow(
 
 VkImageView VulkanTextureCache::RequestSwapTexture(
     uint32_t& width_scaled_out, uint32_t& height_scaled_out,
-    xenos::TextureFormat& format_out) {
+    xenos::TextureFormat& format_out, VkImage* image_out) {
   const auto& regs = register_file();
   xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(0);
   TextureKey key;
@@ -990,6 +1017,9 @@ VkImageView VulkanTextureCache::RequestSwapTexture(
       false);
   if (texture_view == VK_NULL_HANDLE) {
     return VK_NULL_HANDLE;
+  }
+  if (image_out) {
+    *image_out = texture->image();
   }
   if (!LoadTextureData(*texture)) {
     XELOGE("Failed to load texture data for swap texture");
@@ -1708,13 +1738,15 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   } else {
     // Same layout/usage but another upload may have written the image earlier
     // in this submission - emit a TRANSFER_WRITE -> TRANSFER_WRITE barrier so
-    // the next CmdCopyBufferToImage is ordered after any prior copy.
+    // the next CmdCopyBufferToImage is ordered after any prior copy. Its source
+    // and destination masks are equal, so it must not be skipped as a no-op.
     command_processor_.PushImageMemoryBarrier(
         vulkan_texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
+        VK_QUEUE_FAMILY_IGNORED, false);
   }
   command_processor_.SubmitBarriers(true);
   VkBufferImageCopy* copy_regions = command_buffer.CmdCopyBufferToImageEmplace(

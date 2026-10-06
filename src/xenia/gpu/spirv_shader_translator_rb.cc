@@ -1498,6 +1498,11 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
         }
 
         builder_->createStore(color, out_color);
+        spv::Id out_companion =
+            output_fragment_data_companion_[color_target_index];
+        if (out_companion != spv::NoResult) {
+          builder_->createStore(color, out_companion);
+        }
       }
     }
   }

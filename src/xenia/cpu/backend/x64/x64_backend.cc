@@ -866,6 +866,7 @@ HostToGuestThunk X64HelperEmitter::EmitHostToGuestThunk() {
   func_info.prolog_stack_alloc_offset =
       code_offsets.prolog_stack_alloc - code_offsets.prolog;
   func_info.stack_size = stack_size;
+  func_info.is_host_to_guest_thunk = true;
 
   void* fn = Emplace(func_info);
   return (HostToGuestThunk)fn;
@@ -1792,6 +1793,13 @@ void X64HelperEmitter::EmitSaveVolatileRegs() {
   vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[3])], xmm3);
   vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[4])], xmm4);
   vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[5])], xmm5);
+#if !XE_PLATFORM_WIN32
+  // System V has no nonvolatile XMM registers.
+  for (int i = 6; i < 16; ++i) {
+    vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[0]) + i * 16],
+            Xbyak::Xmm(i));
+  }
+#endif
 }
 
 void X64HelperEmitter::EmitLoadVolatileRegs() {
@@ -1813,6 +1821,12 @@ void X64HelperEmitter::EmitLoadVolatileRegs() {
   vmovups(xmm3, qword[rsp + offsetof(StackLayout::Thunk, xmm[3])]);
   vmovups(xmm4, qword[rsp + offsetof(StackLayout::Thunk, xmm[4])]);
   vmovups(xmm5, qword[rsp + offsetof(StackLayout::Thunk, xmm[5])]);
+#if !XE_PLATFORM_WIN32
+  for (int i = 6; i < 16; ++i) {
+    vmovups(Xbyak::Xmm(i),
+            qword[rsp + offsetof(StackLayout::Thunk, xmm[0]) + i * 16]);
+  }
+#endif
 }
 
 void X64HelperEmitter::EmitSaveNonvolatileRegs() {

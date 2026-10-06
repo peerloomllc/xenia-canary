@@ -36,6 +36,10 @@ class ImGuiDialog {
 
   bool IsClosing() const { return has_close_pending_; }
 
+  // A passive overlay (status lines, banners) as opposed to a panel the user
+  // opened and interacts with.
+  virtual bool IsOverlay() const { return false; }
+
  protected:
   ImGuiDialog(ImGuiDrawer* imgui_drawer);
 

@@ -56,6 +56,9 @@ class SDLInputDriver final : public InputDriver {
     X_INPUT_CAPABILITIES caps;
     X_INPUT_STATE state;
     bool state_changed;
+    // A guitar that SDL reports as a pad but whose USB ids are on the list
+    // in controller_subtype.cc. Worked out once, when it is connected.
+    bool known_guitar;
   };
 
   enum class RepeatState {
