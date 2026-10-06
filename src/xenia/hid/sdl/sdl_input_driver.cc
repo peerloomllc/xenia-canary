@@ -584,8 +584,11 @@ bool KnownGuitarInDeviceTree(const char* path) {
   instance.resize(interface_guid);
   std::replace(instance.begin(), instance.end(), '#', '\\');
   DEVINST node;
-  if (CM_Locate_DevNodeA(&node, instance.data(), CM_LOCATE_DEVNODE_NORMAL) !=
-      CR_SUCCESS) {
+  const CONFIGRET located =
+      CM_Locate_DevNodeA(&node, instance.data(), CM_LOCATE_DEVNODE_NORMAL);
+  if (located != CR_SUCCESS) {
+    XELOGI("SDL HID: no device node for '{}' (CONFIGRET {})", instance,
+           located);
     return false;
   }
   // The HID device, the Xbox one it belongs to, then the USB device.
