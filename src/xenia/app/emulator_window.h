@@ -564,6 +564,10 @@ class EmulatorWindow {
   bool DashboardShown() const;
   void ToggleDashboard();
   void UpdateDashboardForPanels();
+  // A week after the first run, a one-time dialog that asks for a donation
+  // (first_run_time, donation_reminder_shown).
+  void MaybeShowDonationReminder();
+  void ShowDonationReminder();
 
  public:
   bool DashboardRowVisible(void* model, void* iter);  // GTK filter callback

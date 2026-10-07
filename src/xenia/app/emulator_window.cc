@@ -145,6 +145,14 @@ DEFINE_string(ui_experiment_dialog, "",
 DEFINE_string(support_page_url, "https://peerloomllc.com/about/",
               "Help > Support development: the page it opens in the browser.",
               "UI");
+DEFINE_int64(first_run_time, 0,
+             "Unix time of the first run, set automatically. The donation "
+             "reminder appears once, a week after it.",
+             "UI");
+DEFINE_bool(donation_reminder_shown, false,
+            "The one-time donation reminder has been shown. true: never show "
+            "it.",
+            "UI");
 DEFINE_int32(
     screenshot_burst_seconds, 0,
     "Diagnostic: from N seconds after launch, save every new frame's "
@@ -1555,6 +1563,10 @@ bool EmulatorWindow::Initialize() {
 #if XE_UI_GTK
           ToggleDashboard();
 #endif
+        } else if (which == "donation") {
+#if XE_UI_GTK
+          ShowDonationReminder();
+#endif
         } else if (which.rfind("open:", 0) == 0) {
           RunTitle(which.substr(5));
 #if XE_UI_GTK
@@ -1584,6 +1596,9 @@ bool EmulatorWindow::Initialize() {
 #if XE_UI_GTK
   BuildDashboard();
   ShowDashboard(!emulator_->is_title_open());
+  // After the window is up, so the reminder opens over it.
+  app_context().CallInUIThreadDeferred(
+      [this]() { MaybeShowDonationReminder(); });
 #endif
   // The status overlay (speed, mute, FPS) is an ImGui dialog; one made
   // before a title runs is not attached to the presenter, so (re)create it
@@ -8620,6 +8635,62 @@ void EmulatorWindow::LaunchLibraryIndex(int index) {
   // Deferred: RunTitle hides the dashboard, and the callers are its own
   // widget callbacks.
   app_context().CallInUIThreadDeferred([this, path]() { RunTitle(path); });
+}
+
+void EmulatorWindow::MaybeShowDonationReminder() {
+  const int64_t now = static_cast<int64_t>(std::time(nullptr));
+  if (cvars::first_run_time <= 0) {
+    OVERRIDE_CVar(first_run_time, int64_t, now);
+    config::SaveConfig();
+    return;
+  }
+  constexpr int64_t kWeek = 7 * 24 * 60 * 60;
+  // Not over a game started from the command line; the next start shows it.
+  if (cvars::donation_reminder_shown || now - cvars::first_run_time < kWeek ||
+      emulator_->is_title_open()) {
+    return;
+  }
+  ShowDonationReminder();
+}
+
+void EmulatorWindow::ShowDonationReminder() {
+  // Shown once, whichever button closes it, as in the Pear apps.
+  OVERRIDE_bool(donation_reminder_shown, true);
+  config::SaveConfig();
+  GtkWidget* dialog =
+      gtk_message_dialog_new(nullptr, GTK_DIALOG_MODAL, GTK_MESSAGE_OTHER,
+                             GTK_BUTTONS_NONE, "Enjoying Xenia?");
+  gtk_window_set_title(GTK_WINDOW(dialog), "Support development");
+  gtk_message_dialog_format_secondary_text(
+      GTK_MESSAGE_DIALOG(dialog), "%s",
+      "This build of Xenia is free and open source with no ads, accounts or "
+      "subscriptions. If you've received value from it, consider returning "
+      "value to support development.");
+#if XE_PLATFORM_LINUX
+  if (auto* gtk_main = dynamic_cast<ui::GTKWindow*>(window_.get())) {
+    gtk_window_set_transient_for(GTK_WINDOW(dialog),
+                                 GTK_WINDOW(gtk_main->window()));
+  }
+#elif XE_PLATFORM_WIN32
+  if (auto* main = dynamic_cast<ui::Win32Window*>(window_.get())) {
+    gtk_widget_realize(dialog);
+    HWND hwnd = static_cast<HWND>(
+        gdk_win32_window_get_handle(gtk_widget_get_window(dialog)));
+    SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT,
+                      reinterpret_cast<LONG_PTR>(main->hwnd()));
+  }
+#endif
+  gtk_dialog_add_button(GTK_DIALOG(dialog), "Already donated",
+                        GTK_RESPONSE_REJECT);
+  gtk_dialog_add_button(GTK_DIALOG(dialog), "Maybe later", GTK_RESPONSE_CANCEL);
+  gtk_dialog_add_button(GTK_DIALOG(dialog), "Donate", GTK_RESPONSE_ACCEPT);
+  gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_ACCEPT);
+  gint response = gtk_dialog_run(GTK_DIALOG(dialog));
+  gtk_widget_destroy(dialog);
+  XELOGI("Donation reminder closed, response {}", response);
+  if (response == GTK_RESPONSE_ACCEPT) {
+    LaunchWebBrowser(cvars::support_page_url);
+  }
 }
 
 void EmulatorWindow::ShowDashboard(bool show) {
