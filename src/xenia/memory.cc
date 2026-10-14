@@ -1897,6 +1897,15 @@ bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment,
     parent_heap_->Release(parent_address);
     return false;
   }
+
+  // Pages that were not committed may still be valid in the GPU's copy of
+  // memory: with gpu_allow_invalid_upload_range the GPU uploads from no-access
+  // pages without watching them (EnableAccessCallbacksInner skips those), so
+  // nothing would tell it when the guest fills the new allocation. Eternal
+  // Sonata drew textures loaded this way black until a save-state load reset
+  // the caches. Release explains why this goes to every heap's callbacks.
+  TriggerCallbacks(std::move(global_lock), address, size, true, true, false,
+                   true);
   *out_address = address;
   return true;
 }
@@ -1947,6 +1956,10 @@ bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size,
     parent_heap_->Release(parent_base_address);
     return false;
   }
+
+  // See Alloc.
+  TriggerCallbacks(std::move(global_lock), address, size, true, true, false,
+                   true);
 
   return true;
 }
@@ -2017,6 +2030,10 @@ bool PhysicalHeap::AllocRange(uint32_t low_address, uint32_t high_address,
     parent_heap_->Release(parent_address);
     return false;
   }
+
+  // See Alloc.
+  TriggerCallbacks(std::move(global_lock), address, size, true, true, false,
+                   true);
   *out_address = address;
   return true;
 }
