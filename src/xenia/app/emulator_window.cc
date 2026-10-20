@@ -169,6 +169,9 @@ DEFINE_int32(reshade_capture_seconds, 0,
              "UI");
 DEFINE_string(reshade_capture_path, "",
               "Where --reshade_capture_seconds writes its PNG.", "UI");
+DEFINE_int32(screenshot_burst_stride, 1,
+             "Diagnostic: keep every Nth frame for --screenshot_burst_seconds.",
+             "Display");
 DEFINE_string(screenshot_burst_dir, "",
               "Diagnostic: folder for --screenshot_burst_seconds (default "
               "<exe folder>/screenshots/<title id>/burst).",
@@ -1399,11 +1402,13 @@ bool EmulatorWindow::Initialize() {
       captured.reserve(cvars::screenshot_burst_frames);
       while (saved < cvars::screenshot_burst_frames) {
         uint64_t now = gs->command_processor()->swap_count();
-        if (now == last) {
+        if (now == last || (cvars::screenshot_burst_stride > 1 &&
+                            now % uint64_t(cvars::screenshot_burst_stride))) {
+          last = now;
           std::this_thread::sleep_for(std::chrono::microseconds(500));
           if (std::chrono::steady_clock::now() - t0 >
-              std::chrono::seconds(30)) {
-            XELOGW("SCREENSHOT BURST: gave up after 30 s, {} frames saved",
+              std::chrono::seconds(120)) {
+            XELOGW("SCREENSHOT BURST: gave up after 120 s, {} frames saved",
                    saved);
             return;
           }
